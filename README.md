@@ -6,13 +6,16 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/tasmota/user_config_override.h
 - TasmotaProjekt/platformio_tasmota_cenv.ini
 
-### Zum Kompilieren unter Gitpod den passenden Befehl in die Console eingeben:
+### Kompilieren
+unter Gitpod den passenden Befehl in die Console eingeben:
+```
 platformio run -e tasmota32_ottelo          (Generic ESP32)
 platformio run -e tasmota32s2_ottelo
 platformio run -e tasmota32s3_ottelo
 platformio run -e tasmota32c3_ottelo
 platformio run -e tasmota32c6_ottelo
 platformio run -e tasmota32solo1_ottelo (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)
+```
 
 ### Infos
 Mehr Infos bzgl. ESP32 Versionen:
