@@ -58,4 +58,5 @@ Hat man das Image selbst kompiliert, so kann man in der .map Datei nach der Adre
 `extra_scripts           = ${env:tasmota32_base.extra_scripts}`  
 `                          post:pio-tools/obj-dump.py`  
   
-Die extrem große Datei liegt unter `\.pio\build\tasmota32xxx\firmware.asm`. Dort kann man dann exakt nach der Adresse suchen.
+Die extrem große Datei liegt unter `\.pio\build\tasmota32xxx\firmware.asm`. Dort kann man dann exakt nach der Adresse suchen.  
+Für den C6 muss man aber noch die `obj-dump.py` anpassen, da der C6 dort fehlt. Ich habe einfach die Zeile vom C3 kopiert.
