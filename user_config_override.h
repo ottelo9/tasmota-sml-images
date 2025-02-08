@@ -244,7 +244,7 @@
 
 //----------------------------------------------------------------------------
 
-// (3) Aktivierte zusätzliche Features (SML, Script, TCP, Ethernet, ...)
+// (3) Aktivierte zusätzliche Features (SML, Scripting, TCP, Ethernet, ...)
 
 //-- Stack size erhöhen (Empfehlung: seit Core3 wird mehr benötigt)
 #undef SET_ESP32_STACK_SIZE
@@ -254,6 +254,8 @@
 //-- Möglicher Rebootfix - Testen!
 #undef SCRIPT_MAXSSIZE
 #define SCRIPT_MAXSSIZE 128
+//#undef SCRIPT_WS_LINE_SIZE
+//#define SCRIPT_WS_LINE_SIZE 512
 
 //-- enables to use 4096 in stead of 256 bytes buffer for variable names
 #define SCRIPT_LARGE_VNBUFF
