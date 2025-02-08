@@ -19,6 +19,10 @@ unter Gitpod den passenden Befehl in die Console eingeben:
 `platformio run -e tasmota32c6_ottelo`  
 `platformio run -e tasmota32solo1_ottelo` (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 
+### (Factory)Image übertragen / flashen
+[Tasmota Web Installer](https://tasmota.github.io/install/) (nur für die factory Images)  
+Die Non-Factory Images überträgt ihr via OTA (Firmware Upgrade -> Use file upload)  
+
 ### Passende SML Scripte
 Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
@@ -35,7 +39,9 @@ https://tasmota.github.io/docs/Compile-your-build/#enabling-a-feature-in-tasmota
 Hier ist eine Übersicht aller Features/Treiber:  
 https://github.com/arendst/Tasmota/blob/development/tasmota/my_user_config.h
 
-Wenn beim Kompilieren eine Standard Tasmota Variante verwendet wird (z.B. `-e tasmota32c3`), dann werden Features/Treiber für diese Konfiguration (siehe https://github.com/arendst/Tasmota/blob/development/platformio_tasmota_env32.ini z.B. [env:tasmota32c3]) verwendet und die deaktivierten Features, die ihr in der `user_config_override.h` eingetragen habt, überschrieben und somit doch verwendet! Wenn Features/Treiber (de)aktivieren werden sollen, dann eine eigene Variante in `platformio_tasmota_cenv.ini` erstellen und `-DFIRMWARE_TASMOTA32` entfernen, da wie bereits oben erwähnt, ESP32 Standard Features wie Berry usw verwendet werden (siehe `FIRMWARE_TASMOTA32` in `tasmota_configuration_ESP32.h`). Siehe auch https://tasmota.github.io/docs/Compile-your-build/#customize-your-build
+Wenn beim Kompilieren eine Standard Tasmota Variante verwendet wird (z.B. `-e tasmota32c3`), dann werden Features/Treiber für diese Konfiguration (siehe https://github.com/arendst/Tasmota/blob/development/platformio_tasmota_env32.ini z.B. [env:tasmota32c3]) verwendet und die deaktivierten Features, die ihr in der `user_config_override.h` eingetragen habt, überschrieben und somit doch verwendet! Wenn Features/Treiber (de)aktivieren werden sollen, dann eine eigene Variante in `platformio_tasmota_cenv.ini` erstellen und `-DFIRMWARE_TASMOTA32` entfernen, da wie bereits oben erwähnt, ESP32 Standard Features wie Berry usw verwendet werden (siehe `FIRMWARE_TASMOTA32` in `tasmota_configuration_ESP32.h`). Siehe auch https://tasmota.github.io/docs/Compile-your-build/#customize-your-build  
 
 Noch eine Info:  
-Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren
+Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren  
+
+[Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)
