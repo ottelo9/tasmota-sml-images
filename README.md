@@ -6,6 +6,9 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/tasmota/user_config_override.h
 - TasmotaProjekt/platformio_tasmota_cenv.ini
 
+Eine ausführliche Anleitung und weitere Details findet ihr auf meinem Blog:
+[https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
+
 ### Kompilieren
 unter Gitpod den passenden Befehl in die Console eingeben:
 
@@ -16,6 +19,8 @@ unter Gitpod den passenden Befehl in die Console eingeben:
 `platformio run -e tasmota32c6_ottelo`  
 `platformio run -e tasmota32solo1_ottelo` (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 
+### Passende SML Scripte
+Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
 ### Infos
 Mehr Infos bzgl. ESP32 Versionen:  
