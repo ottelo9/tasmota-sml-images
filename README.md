@@ -45,3 +45,17 @@ Noch eine Info:
 Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren  
 
 [Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)
+
+### Debugging
+Falls Tasmota mal ab und zu aus unbekannten Gründen neustarten (Reboots) sollte, gibt es mehrere Möglichkeiten die Ursache des Problems festzustellen.
+
+ESP via USB mit dem PC verbinden und ein Terminalprogramm (putty oder MobaXterm) laufen (loggen) lassen bis der Reboot passiert. Tasmota gibt dann beim Crash/Reboot ein Crash Dump aus. Das könnte z.B. so aussehen:  
+
+`Guru Meditation Error: Core  0 panic'ed (Stack protection fault).`
+`Detected in task "loopTask" at 0x42023fee`
+
+Hat man das Image selbst kompiliert, so kann man in der .map Datei nach der Adresse 0x42023fee bzw. 0x42023* suchen. Die map Datei liegt unter `\.pio\build\tasmota32xxx\firmware.map`. Dort findet man dann die Funktion, in der das Problem (in diesem Fall Buffer Overflow) aufgetaucht ist. Die genaue Stelle kann man nur herausfinden, wenn man die firmware.asm Datei hat. Die wird erst erstellt, wenn man folgendes mit in die [platformio_tasmota_cenv.ini](platformio_tasmota_cenv.ini) einfügt:  
+`extra_scripts           = ${env:tasmota32_base.extra_scripts}`  
+`                          post:pio-tools/obj-dump.py`  
+  
+Die extrem große Datei liegt unter `\.pio\build\tasmota32xxx\firmware.asm`. Dort kann man dann exakt nach der Adresse suchen.
