@@ -69,9 +69,9 @@
 \*****************************************************************************************************/
 
 //siehe platformio_tasmota_cenv.ini
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO) || defined(TASMOTA32C6_OTTELO) || defined(TASMOTA32_ETH_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO) || defined(TASMOTA32C6_OTTELO) || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) )
 
-// Folgende Features (siehe my_user_config.h) habe ich für das Image deaktiviert, um die Reboot-Probleme beim C3/C6 zu beheben und es schlank zu halten.
+// (1) Folgende Features (siehe my_user_config.h) habe ich für das Image deaktiviert, um die Reboot-Probleme beim C3/C6 zu beheben und es schlank zu halten.
 #undef USE_DOMOTICZ       //https://tasmota.github.io/docs/Domoticz/ MQTT
 #undef USE_EMULATION_HUE
 #undef USE_EMULATION_WEMO
@@ -132,7 +132,7 @@
 
 //----------------------------------------------------------------------------
 
-// ESP32 Features aus "tasmota_configuration_ESP32.h" wenn build_flags = -DFIRMWARE_TASMOTA32
+// (2) ESP32 Features aus "tasmota_configuration_ESP32.h" wenn build_flags = -DFIRMWARE_TASMOTA32
 /*#define USE_MATTER_DEVICE
 #define USE_INFLUXDB                             // Enable influxdb support (+5k code)
 #define USE_ENHANCED_GUI_WIFI_SCAN
@@ -244,6 +244,8 @@
 
 //----------------------------------------------------------------------------
 
+// (3) Aktivierte zusätzliche Features (SML, Script, TCP, Ethernet, ...)
+
 //-- Stack size erhöhen (Empfehlung: seit Core3 wird mehr benötigt)
 #undef SET_ESP32_STACK_SIZE
 #define SET_ESP32_STACK_SIZE (12 * 1024)
@@ -290,7 +292,7 @@
 #define USE_SCRIPT_SERIAL
 
 //-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)
-#ifdef TASMOTA32_ETH_OTTELO
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) )
   #define USE_ETHERNET          // Add support for ethernet (+20k code)
   #define USE_WT32_ETH01
   #define ETH_TYPE          0
