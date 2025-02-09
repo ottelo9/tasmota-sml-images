@@ -44,7 +44,7 @@ Wenn beim Kompilieren eine Standard Tasmota Variante verwendet wird (z.B. `-e ta
 Noch eine Info:  
 Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren  
 
-[Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)
+[Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)  
 
 ### Debugging
 Falls Tasmota mal ab und zu aus unbekannten Gründen neustarten (Reboots) sollte, gibt es mehrere Möglichkeiten die Ursache des Problems festzustellen.
@@ -60,3 +60,6 @@ Hat man das Image selbst kompiliert, so kann man in der .map Datei nach der Adre
   
 Die extrem große Datei liegt unter `\.pio\build\tasmota32xxx\firmware.asm`. Dort kann man dann exakt nach der Adresse suchen.  
 Für den C6 muss man aber noch die `obj-dump.py` anpassen, da der C6 dort fehlt. Ich habe einfach die Zeile vom C3 kopiert.
+
+------------------
+Bedanken möchte ich mich besonders bei [gemu2015](https://github.com/gemu2015), der das Tasmota Scripting und SML entwickelt hat und mir immer sofort bei Problemen geholfen hat. Und natürlich beim restlichen [Tasmota Entwickler-Team](https://tasmota.github.io/docs/About/), für das grandiose Tasmota :).
