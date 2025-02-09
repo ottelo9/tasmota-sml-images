@@ -277,9 +277,8 @@
 #define USE_SCRIPT_WEB_DISPLAY
 
 //-- enables authentication, this is not needed by most energy meters. M,=so5
-/*#ifndef USE_SML_AUTHKEY
 #define USE_SML_AUTHKEY
-#endif*/
+#define USE_TLS
 
 //-- Verwende Home Assistant API
 #define USE_HOME_ASSISTANT  //(+12k code, +6 bytes mem)
