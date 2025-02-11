@@ -251,11 +251,8 @@
 #define SET_ESP32_STACK_SIZE (12 * 1024)
 
 //-- Optional: Für mein SML Simulator Script (max String Länge = 128). Im Script >D 128
-//-- Möglicher Rebootfix - Testen!
 #undef SCRIPT_MAXSSIZE
 #define SCRIPT_MAXSSIZE 128
-//#undef SCRIPT_WS_LINE_SIZE
-//#define SCRIPT_WS_LINE_SIZE 512
 
 //-- enables to use 4096 in stead of 256 bytes buffer for variable names
 #define SCRIPT_LARGE_VNBUFF
@@ -282,9 +279,6 @@
 
 //-- Verwende Home Assistant API
 #define USE_HOME_ASSISTANT  //(+12k code, +6 bytes mem)
-
-//-- Optionale Features beim ESP32-C6 deaktivieren (Rebootproblem)
-//#ifndef TASMOTA32C6_OTTELO
 
 //-- Software Serial für ESP32 (nur RX), Pin mit dem Zeichen '-' in der SML Sektion definieren (bei mehr als 2/3-Leseköpfen, je nach ESP32 Variante)
 #define USE_ESP32_SW_SERIAL
