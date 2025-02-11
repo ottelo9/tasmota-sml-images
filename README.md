@@ -3,8 +3,9 @@ In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#defi
 
 ### Wie verwenden?
 Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben).
-- TasmotaProjekt/tasmota/user_config_override.h
-- TasmotaProjekt/platformio_tasmota_cenv.ini
+- TasmotaProjekt/`tasmota/user_config_override.h`
+- TasmotaProjekt/`platformio_tasmota_cenv.ini`
+- TasmotaProjekt/`platformio_tasmota32.ini`  <- habe ich nur als Referenz mit hochgeladen. Bei [core32] platform sollte immer das neuste framework verwendet werden!
 
 Eine ausführliche Anleitung und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
