@@ -1,5 +1,5 @@
-# Tasmota Image erstellen - Anleitung für ESP32 (ESP8266 folgt)
-In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP32 Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion habt und ihr die schönen Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Andernfalls verwendet einfach die originalen Images. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.
+# Tasmota Image erstellen - Anleitung für ESP32 / ESP8266
+In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.
 
 ### Wie verwenden?
 Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben).
@@ -7,22 +7,28 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/`platformio_tasmota_cenv.ini`
 - TasmotaProjekt/`platformio_tasmota32.ini`  <- habe ich nur als Referenz mit hochgeladen. Bei [core32] platform sollte immer das neuste framework verwendet werden!
 
-Eine ausführliche Anleitung und weitere Details findet ihr auf meinem Blog:
+Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
 ### Kompilieren
-unter Gitpod den passenden Befehl in die Console eingeben:
+Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben:  
 
-`platformio run -e tasmota32_ottelo`          (Generic ESP32)  
+ESP32:  
+`platformio run -e tasmota32_ottelo`      (Generic ESP32)  
 `platformio run -e tasmota32s2_ottelo`  
 `platformio run -e tasmota32s3_ottelo`  
 `platformio run -e tasmota32c3_ottelo`  
-`platformio run -e tasmota32c6_ottelo`  
+`platformio run -e tasmota32c6_ottelo ` 
 `platformio run -e tasmota32solo1_ottelo` (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 
+ESP8266:  
+`platformio run -e tasmota_ottelo`        ( = 1M Flash)  
+`platformio run -e tasmota_energy_ottelo` ( = 1M Flash, Update nur über minimal da Img zu groß. für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2)  
+`platformio run -e tasmota4m_ottelo`      (>= 4M Flash)  
+
 ### (Factory)Image übertragen / flashen
-[Tasmota Web Installer](https://tasmota.github.io/install/) (nur für die factory Images)  
-Die Non-Factory Images überträgt ihr via OTA (Firmware Upgrade -> Use file upload)  
+[Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
+Die ESP32 Non-Factory Images überträgt ihr via OTA (Firmware Upgrade -> Use file upload)  
 
 ### Passende SML Scripte
 Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
