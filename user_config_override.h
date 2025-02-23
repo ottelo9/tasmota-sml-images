@@ -160,6 +160,7 @@
   #define EEP_SCRIPT_SIZE 8192
 #else
 //-- ESP8266 4M+ Flash / ESP32
+  #define USE_SCRIPT_FATFS_EXT //https://tasmota.github.io/docs/Scripting-Language/#extended-commands-09k-flash
   #define USE_UFILESYS
   #undef UFSYS_SIZE
   #if defined(TASMOTA4M_OTTELO)
