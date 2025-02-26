@@ -1,3 +1,7 @@
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/ottelo9/tasmota-sml-images?style=for-the-badge)](https://github.com/ottelo9/tasmota-sml-images/releases/latest)
+[![GitHub All Releases](https://img.shields.io/github/downloads/ottelo9/tasmota-sml-images/total?logo=github&style=for-the-badge)](https://github.com/ottelo9/tasmota-sml-images/releases/latest)
+
+
 # Tasmota Image erstellen - Anleitung für ESP32 / ESP8266
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.
 
