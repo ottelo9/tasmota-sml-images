@@ -34,6 +34,8 @@ ESP8266:
 [Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
 Die ESP32 Non-Factory Images überträgt ihr via OTA (Firmware Upgrade -> Use file upload)  
 
+Der ESP32-S2 hat einen integrierten USB-Controller und ist direkt mit der USB-Buchse verbunden. Den Treiber dafür könnt ihr hier herunterladen: https://zadig.akeo.ie/
+
 ### Passende SML Scripte
 Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
