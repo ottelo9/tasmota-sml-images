@@ -129,7 +129,6 @@
 #undef USE_BERRY          //https://tasmota.github.io/docs/Berry/
 #undef USE_AUTOCONF       //https://tasmota.github.io/docs/ESP32/#autoconf
 #undef USE_CSE7761
-
 //----------------------------------------------------------------------------
 
 // (2) Welche ESP32 / ESP8266 Features aktiv sind, wenn mit "build_flags = -DFIRMWARE_TASMOTA32" bzw
@@ -197,7 +196,7 @@
 #define USE_SCRIPT_SERIAL
 
 //-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) )
   #define USE_ETHERNET          // Add support for ethernet (+20k code)
   #define USE_WT32_ETH01
   #define ETH_TYPE          0
@@ -221,6 +220,9 @@
 
 //-- Optional: Verwende globale Variablen im Script
 #define USE_SCRIPT_GLOBVARS
+
+//-- Optional: >J Sektion aktivieren https://tasmota.github.io/docs/Scripting-Language/#j
+#define USE_SCRIPT_JSON_EXPORT
 
 #endif // TASMOTA32 OTTELO
 

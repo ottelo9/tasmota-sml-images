@@ -49,7 +49,7 @@ keywords if then else endif, or, and are better readable for beginners (others m
 // float = 4, double = 8 bytes
 
 
-const uint8_t SCRIPT_VERS[2] = {5, 3};
+const uint8_t SCRIPT_VERS[2] = {5, 4};
 
 #define SCRIPT_DEBUG 0
 
@@ -98,6 +98,9 @@ const uint8_t SCRIPT_VERS[2] = {5, 3};
 #define MAX_SCRIPT_CMDBUFFER 4096
 
 #define SPI_FLASH_2SEC_SIZE SPI_FLASH_SEC_SIZE*2
+
+#define UNIX_TS_OFFSET 0
+//1740389573 
 
 #define SCRIPT_EOL '\n'
 #define SCRIPT_FLOAT_PRECISION 2
@@ -188,7 +191,10 @@ char *Get_esc_char(char *cp, char *esc_chr);
 #ifdef ESP32
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 #endif
+
 
 
 #ifdef SCRIPT_FULL_OPTIONS
@@ -248,6 +254,10 @@ char *Get_esc_char(char *cp, char *esc_chr);
 
 #endif
 
+#ifndef NO_SCRIPT_FATFS_EXT
+#undef USE_SCRIPT_FATFS_EXT
+#define USE_SCRIPT_FATFS_EXT
+#endif
 
 #ifdef USE_SCRIPT_TIMER
 #include <Ticker.h>
@@ -278,6 +288,7 @@ void Script_ticker4_end(void) {
 #define HARDWARE_FALLBACK          2
 #endif
 
+
 // EEPROM MACROS
 // i2c eeprom
 #define EEP_WRITE(A,B,C) eeprom_writeBytes(A, B, (uint8_t*)C);
@@ -303,6 +314,7 @@ void Script_ticker4_end(void) {
 #define SPEC_SCRIPT_FLASH 0x000F2000
 
 uint32_t eeprom_block;
+
 
 // these support only one 4 k block below EEPROM (eeprom @0x402FB000) this steals 4k of application area
 uint32_t alt_eeprom_init(uint32_t size) {
@@ -949,6 +961,36 @@ uint32_t Script_Find_Vars(char *sp) {
   return (svars << 16) | numvars;
 }
 
+// get integer with math
+int32_t get_math_intval(char *cp) {
+  int32_t result = strtol(cp, &cp, 10);
+  while (*cp) {
+    while (*cp == ' ') cp++;
+    if (*cp == SCRIPT_EOL) { break; }
+    switch (*cp) {
+      case '+':
+        cp++;
+        result += strtol(cp, &cp, 10);
+        break;
+      case '-':
+        cp++;
+        result -= strtol(cp, &cp, 10);
+        break;
+      case '*':
+        cp++;
+        result *= strtol(cp, &cp, 10);
+        break;
+      case '/':
+        cp++;
+        result /= strtol(cp, &cp, 10);
+        break;
+    }
+  }
+  return result;
+  //return atoi(cp);
+}
+
+
 // allocates all variables and presets them
 int16_t Init_Scripter(void) {
 char *script;
@@ -1175,7 +1217,8 @@ char *script;
                       uint16_t flen = 1;
                       if (isdigit(*op)) {
                         // lenght define follows
-                        flen = atoi(op);
+                        //flen = atoi(op);
+                        flen = get_math_intval(op);
                         if (flen > MAX_ARRAY_SIZE) {
                           // limit array size
                           flen = MAX_ARRAY_SIZE;
@@ -3473,6 +3516,70 @@ extern void W8960_SetGain(uint8_t sel, uint16_t value);
           }
           goto nfuncexit;
         }
+#ifdef ESP32
+        if (!strncmp_XP(lp, XPSTR("ds("), 3)) {
+          lp = GetNumericArgument(lp + 3, OPER_EQU, &fvar, gv);
+          if (fvar == -1) {
+            fvar = esp_sleep_get_wakeup_cause();
+          } else {
+            if (fvar > 0) {
+              esp_sleep_enable_timer_wakeup(fvar * 1000000);
+            }
+            SCRIPT_SKIP_SPACES 
+            if (*lp != ')') {
+              lp = GetNumericArgument(lp, OPER_EQU, &fvar, gv);
+              if (fvar != -1) {
+                gpio_num_t gpio_num = (gpio_num_t)fvar;
+                lp = GetNumericArgument(lp, OPER_EQU, &fvar, gv);
+#if SOC_PM_SUPPORT_EXT1_WAKEUP   
+                if (fvar == 0) {
+                  esp_sleep_enable_ext1_wakeup_io(1 << gpio_num, ESP_EXT1_WAKEUP_ANY_HIGH);
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+                  rtc_gpio_pullup_dis(gpio_num);
+                  rtc_gpio_pulldown_en(gpio_num);
+#else
+_Pragma("GCC warning \"'rtc io' not supported\"") 
+#endif
+                } else {
+#if CONFIG_IDF_TARGET_ESP32
+                  esp_sleep_enable_ext1_wakeup_io(1 << gpio_num, ESP_EXT1_WAKEUP_ALL_LOW);
+#else
+                  esp_sleep_enable_ext1_wakeup_io(1 << gpio_num, ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+                  rtc_gpio_pullup_en(gpio_num);
+                  rtc_gpio_pulldown_dis(gpio_num);
+#else
+_Pragma("GCC warning \"'rtc io' not supported\"")
+#endif
+                }
+#else
+_Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
+
+                const gpio_config_t config = {
+                  .pin_bit_mask = BIT(gpio_num),
+                  .mode = GPIO_MODE_INPUT,
+                  .pull_up_en = (gpio_pullup_t)!fvar,
+                  .pull_down_en = (gpio_pulldown_t)fvar 
+
+                };
+                gpio_config(&config);
+
+                if (fvar == 0) {
+                  esp_deep_sleep_enable_gpio_wakeup(1 << gpio_num, ESP_GPIO_WAKEUP_GPIO_LOW);
+                } else {
+                  esp_deep_sleep_enable_gpio_wakeup(1 << gpio_num, ESP_GPIO_WAKEUP_GPIO_HIGH);
+                }
+
+#endif // SOC_PM_SUPPORT_EXT1_WAKEUP
+              }
+            }
+            SettingsSaveAll();
+            esp_deep_sleep_start();
+          }
+          goto nfuncexit;
+        }
+#endif // ESP32
         break;
       case 'e':
         if (!strncmp_XP(vname, XPSTR("epoch"), 5)) {
@@ -3892,7 +3999,7 @@ extern void W8960_SetGain(uint8_t sel, uint16_t value);
         if (!strncmp_XP(lp, XPSTR("fmt("), 4)) {
           lp = GetNumericArgument(lp + 4, OPER_EQU, &fvar, gv);
           if (!fvar) {
-            LittleFS.format();
+            fvar = LittleFS.format();
           } else {
             //SD.format();
           }
@@ -5806,13 +5913,15 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
                   mbp++;
                   crc = 0;
                 }
-                crc = MBUS_calculateCRC(mbp, mbp[2] + 3, crc);
+                uint8_t pos = 6; // mbp[2] + 3
+                crc = MBUS_calculateCRC(mbp, pos, crc);
+                //AddLog(LOG_LEVEL_INFO,PSTR("SCR: >> %04x"), crc);
                 if (opts == 1) {
-                  if ((mbp[mbp[2] + 3] != highByte(crc)) || (mbp[mbp[2] + 4] != lowByte(crc))) {
+                  if ((mbp[pos] != highByte(crc)) || (mbp[pos + 1] != lowByte(crc))) {
                     fvar = -2;
                   }
                 } else {
-                  if ((mbp[mbp[2] + 3] != lowByte(crc)) || (mbp[mbp[2] + 4] != highByte(crc))) {
+                  if ((mbp[pos] != lowByte(crc)) || (mbp[pos + 1] != highByte(crc))) {
                     fvar = -2;
                   }
                 }
@@ -5847,13 +5956,15 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
             if (nvals > alend) {
               nvals = alend;
             }
-
+            TS_FLOAT code = 4;
+            if (*lp != ')') {
+              lp = GetNumericArgument(lp, OPER_EQU, &code, 0);
+            }
             uint8_t modbus_response[128];
-
             uint8_t mb_index = 0;
             modbus_response[mb_index] = addr;
             mb_index++;
-            modbus_response[mb_index] = 4;
+            modbus_response[mb_index] = code;
             mb_index++;
 
             if (mode == 0) {
@@ -6055,13 +6166,24 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
           len = 0;
           goto strexit;
         }
+
+       
 #ifdef USE_FEXTRACT
         if (!strncmp_XP(lp, XPSTR("s2t("), 4)) {
           lp = GetNumericArgument(lp + 4, OPER_EQU, &fvar, 0);
           char str[SCRIPT_MAX_SBSIZE];
-          s2tstamp(str, SCRIPT_MAX_SBSIZE, fvar, 0);
+          while (*lp == ' ') lp++;
+          if (*lp == 'i') {
+            uint32_t secs = *(uint32_t*)&fvar;
+            s2tstamp(str, SCRIPT_MAX_SBSIZE, secs, 0);
+            lp++;
+          } else {
+            uint32_t secs = (uint32_t)fvar + (uint32_t)glob_script_mem.epoch_offset;
+            s2tstamp(str, SCRIPT_MAX_SBSIZE, secs, 0);
+          }
           if (sp) strlcpy(sp, str, glob_script_mem.max_ssize);
           len = 0;
+          lp++;
           goto strexit;
         }
 #endif // USE_FEXTRACT
@@ -6230,7 +6352,14 @@ void tmod_directModeOutput(uint32_t pin);
         if (!strncmp_XP(lp, XPSTR("tsn("), 4)) {
           char str[SCRIPT_MAX_SBSIZE];
           lp = GetStringArgument(lp + 4, OPER_EQU, str, 0);
-          fvar = tstamp2l(str);
+          while (*lp == ' ') lp++;
+          if (*lp == 'i') {
+            lp++;
+            uint32_t result = tstamp2l(str);
+            fvar = *(float*)&result;
+          } else {
+            fvar = tstamp2l(str) - (uint32_t)glob_script_mem.epoch_offset;
+          }
           goto nfuncexit;
         }
 #endif
@@ -10763,7 +10892,7 @@ void ScriptServeFile82(void) {
       if (ufsp->exists(cp)) {
 #endif
         if (glob_script_mem.download82_busy == true) {
-          AddLog(LOG_LEVEL_INFO, PSTR("UFS: 82 Download is busy"));
+          AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "82 Download is busy"));
           return;
         }
         glob_script_mem.download82_busy = true;
@@ -10867,7 +10996,7 @@ int32_t SendFile(char *fname) {
 #ifdef ESP32
 #ifdef USE_DLTASK
   if (glob_script_mem.script_download_busy == true) {
-    AddLog(LOG_LEVEL_INFO, PSTR("UFS: Download is busy"));
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "Download is busy"));
     return -1;
   }
   glob_script_mem.script_download_busy = true;
@@ -14053,9 +14182,6 @@ bool Xdrv10(uint32_t function) {
 #ifdef USE_SCRIPT_ALT_DOWNLOAD
       WebServer82Loop();
 #endif
-      break;
-
-    case FUNC_NETWORK_UP:
       break;
     
     case FUNC_ACTIVE:
