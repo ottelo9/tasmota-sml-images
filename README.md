@@ -16,7 +16,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | tasmota32x_ottelo      | ESP32-x | ESP32 Variante z.B. c3, s3 (solo1, s3 mit Ethernet Support) |
 | tasmota1m_ottelo       | ESP8266 | ESP mit 1M Flash |
 | tasmota4m_ottelo       | ESP8266 | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung) |
-| tasmota_energy_ottelo  | ESP8266 | ESP mit 1M Flash für Steckdosen mit Energiemessung (Web-Upgrade nur über tasmota-minimal!) |
+| tasmota_energy_ottelo  | ESP8266 | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2 (Web-Upgrade nur über tasmota-minimal!) |
 | tasmota-minimal.bin.gz | ESP8266 | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
 Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. In den ZIP-Archiven für den ESP8266 befindet sich einmal das .bin und bin.gz. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden.
