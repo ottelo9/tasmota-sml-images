@@ -8,7 +8,18 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 [Download Statistik](https://tooomm.github.io/github-release-stats/?username=ottelo9&repository=tasmota-sml-images)  
 [ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
+### Welches Image (Firmware Binary) für welchen ESP?
+| Imagename | ESP | Beschreibung |
+| ------------- | ------------- | ------------- |
+| tasmota32_ottelo       | ESP32 | Generic ESP32, keine Variante, mit Ethernet Support |
+| tasmota32berry_ottelo  | ESP32 | Generic ESP32, wie tasmota32_ottelo aber mit Berry Scripting Support |
+| tasmota32x_ottelo      | ESP32-x | ESP32 Variante z.B. c3, s3 (solo1, s3 mit Ethernet Support) |
+| tasmota1m_ottelo       | ESP8266 | ESP mit 1M Flash |
+| tasmota4m_ottelo       | ESP8266 | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung) |
+| tasmota_energy_ottelo  | ESP8266 | ESP mit 1M Flash für Steckdosen mit Energiemessung (Web-Upgrade nur über tasmota-minimal!) |
+| tasmota-minimal.bin.gz | ESP8266 | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
+Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. In den ZIP-Archiven für den ESP8266 befindet sich einmal das .bin und bin.gz. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden.
 
 # Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.
