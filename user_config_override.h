@@ -49,6 +49,7 @@
  * Zum Kompilieren unter Gitpod den passenden Befehl in die Console eingeben:
  * ESP32:
  * platformio run -e tasmota32_ottelo      (Generic ESP32)
+ * platformio run -e tasmota32berry_ottelo (Generic ESP32 mit Berry Support)
  * platformio run -e tasmota32s2_ottelo
  * platformio run -e tasmota32s3_ottelo
  * platformio run -e tasmota32c3_ottelo
@@ -58,7 +59,8 @@
  * 
  * ESP8266:
  * platformio run -e tasmota1m_ottelo        ( = 1M Flash)
- * platformio run -e tasmota1m_energy_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2)
+ * platformio run -e tasmota1m_energy_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)
+ * platformio run -e tasmota1m_shelly_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Mit Shelly Pro 3EM Emulation als Meter für smarte Akkus wie z.B. Marstek Venus / Jupiter)
  * platformio run -e tasmota4m_ottelo        (>= 4M Flash)
  * 
  * für weitere ESPs siehe: https://github.com/arendst/Tasmota/blob/development/platformio_override_sample.ini bei default_envs
@@ -66,7 +68,7 @@
 
 //siehe platformio_tasmota_cenv.ini
 #if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO) || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || \
-      defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO)   || defined(TASMOTA32_BERRY_OTTELO) )
+      defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO)   || defined(TASMOTA32_BERRY_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
 //     dort müssen mindestens 12k RAM für einen stabilen Betrieb frei sein (inkl. Script).
@@ -82,7 +84,7 @@
 #undef USE_SONOFF_IFAN
 #undef USE_BUZZER
 #undef USE_ARILUX_RF
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_DEEPSLEEP //1KB
 #endif
 #undef USE_DEEPSLEEP
@@ -111,7 +113,7 @@
 #undef USE_SERIAL_BRIDGE  //https://tasmota.github.io/docs/Serial-to-TCP-Bridge/#serial-to-tcp-bridge
 #undef USE_ENERGY_DUMMY
 
-#if defined(TASMOTA1M_OTTELO)
+#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO))
   #undef USE_I2C            // I2C ist für die nachfolgenden Treiber erforderlich.
   #undef USE_ENERGY_SENSOR  // Ist für die nachfolgenden Treiber erforderlich.
   #undef USE_HLW8012        // SonOff POW / Gosund EP2 (ESP8266)
@@ -129,7 +131,7 @@
 #undef USE_GPIO_VIEWER
 #undef USE_ADC
 #undef USE_NETWORK_LIGHT_SCHEMES
-#if !defined(TASMOTA32_BERRY_OTTELO)
+#if ( !defined(TASMOTA32_BERRY_OTTELO) )
   #undef USE_BERRY          //https://tasmota.github.io/docs/Berry/
 #endif
 #undef USE_AUTOCONF       //https://tasmota.github.io/docs/ESP32/#autoconf
@@ -159,13 +161,16 @@
 //-- enables to use 4096 in stead of 256 bytes buffer for variable names
 #define SCRIPT_LARGE_VNBUFF
 
-
 //-- Skriptgröße (max Anzahl an Zeichen) https://tasmota.github.io/docs/Scripting-Language/#script-buffer-size
 //-- ESP8266 1M Flash
-#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) )
+#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_EEPROM
   #undef EEP_SCRIPT_SIZE
-  #define EEP_SCRIPT_SIZE 8192
+  #if ( defined(TASMOTA1M_SHELLY_OTTELO) )
+    #define EEP_SCRIPT_SIZE 4096
+  #else
+    #define EEP_SCRIPT_SIZE 8192
+  #endif
 #else
 //-- ESP8266 4M+ Flash / ESP32
   #define USE_SCRIPT_FATFS_EXT //https://tasmota.github.io/docs/Scripting-Language/#extended-commands-09k-flash
@@ -178,10 +183,7 @@
   #endif
 #endif
 
-//-- benötigt USE_HOME_ASSISTANT
-#define USE_WEBCLIENT_HTTPS
-
-//-- SML, Script und Google Chart Support
+//-- SML, Script, Google Chart Support und Home Assistant
 #define USE_SCRIPT        //(+36k code, +1k mem)
 #define USE_SML_M
 #define USE_SML_CRC       //enables CRC support for binary SML. Must still be enabled via line like "1,=soC,1024,15". https://tasmota.github.io/docs/Smart-Meter-Interface/#special-commands
@@ -189,7 +191,9 @@
 #define USE_GOOGLE_CHARTS
 #define LARGE_ARRAYS
 #define USE_SCRIPT_WEB_DISPLAY
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+#define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
+#define USE_WEBCLIENT_HTTPS //für HA benötigt
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ANGLE_FUNC //~2KB
 #endif
 
@@ -197,12 +201,9 @@
 #define USE_SML_AUTHKEY
 #define USE_TLS
 
-//-- Verwende Home Assistant API
-#define USE_HOME_ASSISTANT  //(+12k code, +6 bytes mem)
-
 //-- Software Serial für ESP32 (nur RX), Pin mit dem Zeichen '-' in der SML Sektion definieren (bei mehr als 2/3-Leseköpfen, je nach ESP32 Variante)
 //-- Optional: Serielle Schnittstelle (RX/TX RS232) im Script verwenden
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ESP32_SW_SERIAL
   #define USE_SCRIPT_SERIAL //3KB
 #endif
@@ -217,7 +218,7 @@
 #endif
 
 //-- Optional: TCP-Server Script Support
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_SCRIPT_TCP_SERVER
   #define USE_SCRIPT_TASK
 #endif
