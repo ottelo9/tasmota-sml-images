@@ -67,7 +67,7 @@
 \*****************************************************************************************************/
 
 //siehe platformio_tasmota_cenv.ini
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO) || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || \
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || \
       defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO)   || defined(TASMOTA32_BERRY_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
@@ -119,13 +119,13 @@
   #undef USE_HLW8012        // SonOff POW / Gosund EP2 (ESP8266)
   #undef USE_CSE7766        // SonOff POW R2 (ESP8266)
   #undef USE_BL09XX         // SonOff Dual R3 v2 (ESP8266) / Shelly Plus Plug S (ESP32) / Gosund EP2 (ESP8266)
+  #undef USE_DHT            // DHT11, AM2301 (DHT21, DHT22, AM2302, AM2321) and SI7021 Temperature and Humidity sensor (1k6 code)
 #endif
 
 #undef USE_PZEM004T
 #undef USE_PZEM_AC
 #undef USE_PZEM_DC
 #undef USE_MCP39F501
-#undef USE_DHT
 #undef USE_IR_REMOTE
 //ESP32 only features
 #undef USE_GPIO_VIEWER
@@ -193,8 +193,9 @@
 #define USE_SCRIPT_WEB_DISPLAY
 #define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
 #define USE_WEBCLIENT_HTTPS //für HA benötigt
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ANGLE_FUNC //~2KB
+  #define USE_FEXTRACT //~8KB cts()
 #endif
 
 //-- enables authentication, this is not needed by most energy meters. M,=so5
