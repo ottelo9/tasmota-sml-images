@@ -16,11 +16,11 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | tasmota32berry_ottelo  | Generic ESP32, wie tasmota32_ottelo aber mit Berry Scripting Support |
 | tasmota32x_ottelo      | ESP32 Variante z.B. c3, s3 (solo1, s3 mit Ethernet Support) |
 | | |
-| **ESP8266 Images:** | **tasmota8266_ottelo.zip** |
+| **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | tasmota1m_ottelo         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf |
 | tasmota4m_ottelo         | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung) |
 | tasmota1m_energy_ottelo  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Web-Upgrade nur über tasmota-minimal! |
-| tasmota1m_shelly_ottelo  | ESP mit 1M Flash. Mit Shelly Pro 3EM Emulation als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Es funktioniert nur ein kleines Script ohne Charts, [Beispielscript mit Shelly Emu](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
+| tasmota1m_shelly_ottelo  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Es funktioniert nur ein kleines Script ohne Charts, [Beispielscript mit Shelly Emu](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
 | tasmota-minimal          | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
 Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. Im ZIP-Archiv für den ESP8266 befinden sich alle Varianten gesammelt im bin.gz Format. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden. Zum erstmaligen Flashen via USB-Flasher muss die .gz entpackt werden.

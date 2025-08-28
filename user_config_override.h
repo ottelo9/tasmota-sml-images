@@ -60,7 +60,7 @@
  * ESP8266:
  * platformio run -e tasmota1m_ottelo        ( = 1M Flash)
  * platformio run -e tasmota1m_energy_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)
- * platformio run -e tasmota1m_shelly_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Mit Shelly Pro 3EM Emulation als Meter für smarte Akkus wie z.B. Marstek Venus / Jupiter)
+ * platformio run -e tasmota1m_shelly_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Mit Shelly Pro 3EM / EcoTracker Emulation als Meter für smarte Akkus wie z.B. Marstek Venus / Jupiter)
  * platformio run -e tasmota4m_ottelo        (>= 4M Flash)
  * 
  * für weitere ESPs siehe: https://github.com/arendst/Tasmota/blob/development/platformio_override_sample.ini bei default_envs
