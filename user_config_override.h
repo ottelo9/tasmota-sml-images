@@ -67,8 +67,8 @@
 \*****************************************************************************************************/
 
 //siehe platformio_tasmota_cenv.ini
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || \
-      defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO)   || defined(TASMOTA32_BERRY_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32_BERRY_OTTELO) || \
+      defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
 //     dort müssen mindestens 12k RAM für einen stabilen Betrieb frei sein (inkl. Script).
@@ -84,7 +84,7 @@
 #undef USE_SONOFF_IFAN
 #undef USE_BUZZER
 #undef USE_ARILUX_RF
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
   #define USE_DEEPSLEEP //1KB
 #endif
 #undef USE_DEEPSLEEP
@@ -113,7 +113,7 @@
 #undef USE_SERIAL_BRIDGE  //https://tasmota.github.io/docs/Serial-to-TCP-Bridge/#serial-to-tcp-bridge
 #undef USE_ENERGY_DUMMY
 
-#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO))
+#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA4M_OTTELO))
   #undef USE_I2C            // I2C ist für die nachfolgenden Treiber erforderlich.
   #undef USE_ENERGY_SENSOR  // Ist für die nachfolgenden Treiber erforderlich.
   #undef USE_HLW8012        // SonOff POW / Gosund EP2 (ESP8266)
@@ -150,16 +150,13 @@
 #undef SET_ESP32_STACK_SIZE
 #define SET_ESP32_STACK_SIZE (12 * 1024)
 
-//-- Optional: Für mein SML Simulator Script + shellypro3em emulieren (z.B. für Marstek Venus E >D 250). Im Script z.B. mit >D x final festlegen
-#undef SCRIPT_MAXSSIZE
-#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA4M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) )
-  #define SCRIPT_MAXSSIZE 128
-#else
-  #define SCRIPT_MAXSSIZE 255
-#endif
+//-- Max String Size: default 255. Wird nun aber im Script mit >D xx definiert !
+//#define SCRIPT_MAXSSIZE 128
 
 //-- enables to use 4096 in stead of 256 bytes buffer for variable names
-#define SCRIPT_LARGE_VNBUFF
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
+  #define SCRIPT_LARGE_VNBUFF
+#endif
 
 //-- Skriptgröße (max Anzahl an Zeichen) https://tasmota.github.io/docs/Scripting-Language/#script-buffer-size
 //-- ESP8266 1M Flash
@@ -177,7 +174,7 @@
   #define USE_UFILESYS
   #undef UFSYS_SIZE
   #if defined(TASMOTA4M_OTTELO)
-    #define UFSYS_SIZE 8192  //ESP8266
+    #define UFSYS_SIZE 8192  //ESP8266 +4M
   #else
     #define UFSYS_SIZE 16384 //ESP32
   #endif
@@ -225,8 +222,8 @@
 #endif
 
 //-- Optional: shellypro3em emulieren (z.B. für Marstek Venus E)
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
-  #define USE_SCRIPT_MDNS //14KB
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+  #define USE_SCRIPT_MDNS //14KB !!
 #endif
 
 //-- Optional: globale Variablen im Script + shellypro3em emulieren (z.B. für Marstek Venus E)
