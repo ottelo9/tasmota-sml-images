@@ -18,7 +18,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | tasmota1m_ottelo         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf |
-| tasmota4m_ottelo         | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung) |
+| tasmota4m_ottelo         | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung und mit Shelly, EcoTracker Emulation (+mDNS)) |
 | tasmota1m_energy_ottelo  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Web-Upgrade nur über tasmota-minimal! |
 | tasmota1m_shelly_ottelo  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Es funktioniert nur ein kleines Script ohne Charts, [Beispielscript mit Shelly Emu](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
 | tasmota-minimal          | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
