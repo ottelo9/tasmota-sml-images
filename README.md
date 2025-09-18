@@ -53,10 +53,10 @@ ESP32:
 `platformio run -e tasmota32solo1_ottelo` (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 
 ESP8266:  
-`platformio run -e tasmota_ottelo`        ( = 1M Flash)  
-`platformio run -e tasmota_energy_ottelo` ( = 1M Flash, Update nur über minimal da Image zu groß. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)  
-`platformio run -e tasmota_shelly_ottelo` ( = 1M Flash, Update nur über minimal da Image zu groß. Mit Shelly Pro 3EM Emulation als Meter für smarte Akkus wie z.B. Marstek Venus / Jupiter)  
-`platformio run -e tasmota4m_ottelo`      (>= 4M Flash)  
+`platformio run -e tasmota1m_ottelo`        ( = 1M Flash)  
+`platformio run -e tasmota1m_energy_ottelo` ( = 1M Flash, Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)  
+`platformio run -e tasmota1m_shelly_ottelo` ( = 1M Flash, Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
+`platformio run -e tasmota4m_ottelo`        (>= 4M Flash)  
 
 ### (Factory)Image übertragen / flashen
 [Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
