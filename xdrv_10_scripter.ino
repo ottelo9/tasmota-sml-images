@@ -445,6 +445,7 @@ typedef union {
     uint8_t global : 1;
     uint8_t hchanged : 1;
     uint8_t integer : 1;
+    uint8_t shadow : 1;
   };
 } SCRIPT_TYPE;
 
@@ -519,7 +520,7 @@ typedef union {
       uint8_t nutu7 : 1;
       uint8_t nutu6 : 1;
       uint8_t nutu5 : 1;
-      uint8_t nutu4 : 1;
+      uint8_t x_used : 1;
       uint8_t ignore_line : 1;
       bool fsys : 1;
       bool eeprom : 1;
@@ -1214,6 +1215,7 @@ char *script;
     char init = 0;
     uint8_t pflg = 0;
     uint16_t pmem = 0;
+    uint16_t numshadow = 0;
     while (1) {
         // check line
         // skip leading spaces
@@ -1232,6 +1234,13 @@ char *script;
             if (op) {
                 vtypes[vars].bits.data = 0;
                 // found variable definition
+#ifdef USE_SHADOW_X
+                if (*lp == 'x' && *(lp + 1) == ':') {
+                    vtypes[vars].bits.shadow = 1;
+                    lp += 2;
+                    numshadow += 1;
+                }
+#endif
                 if (*lp == 'p' && *(lp + 1) == ':') {
                     lp += 2;
                     if (numperm < SCRIPT_MAXPERM) {
@@ -1418,6 +1427,18 @@ char *script;
         lp++;
     }
 
+#ifdef USE_SHADOW_X
+    if (!numshadow) {
+      numshadow = nvars;
+      glob_script_mem.FLAGS.x_used = 0;
+    } else {
+      glob_script_mem.FLAGS.x_used = 1;
+    }
+#else
+    numshadow = nvars;
+    glob_script_mem.FLAGS.x_used = 0;
+#endif
+
     uint16_t fsize = 0;
     for (count = 0; count < numflt; count++) {
       fsize += sizeof(struct M_FILT) + ((mfilt[count].numvals & AND_FILT_MASK) - 1) * sizeof(TS_FLOAT);
@@ -1431,7 +1452,7 @@ char *script;
     uint32_t script_mem_size =
     // number and number shadow vars
     (sizeof(TS_FLOAT)*nvars) +
-    (sizeof(TS_FLOAT)*nvars) +
+    (sizeof(TS_FLOAT)*numshadow) +
     // var names
     (vnames_p-vnames) +
     // vars offsets
@@ -1467,7 +1488,7 @@ char *script;
     memcpy(script_mem, fvalues, size);
     script_mem += size;
     glob_script_mem.s_fvars = (TS_FLOAT*)script_mem;
-    size = sizeof(TS_FLOAT) * nvars;
+    size = sizeof(TS_FLOAT) * numshadow;
     memcpy(script_mem, fvalues, size);
     script_mem += size;
 
@@ -1540,7 +1561,7 @@ char *script;
 
     // variables usage info
     uint32_t tot_mem = sizeof(glob_script_mem) + glob_script_mem.script_mem_size + glob_script_mem.script_size + index;
-    AddLog(LOG_LEVEL_INFO, PSTR("SCR: nv=%d, tv=%d, vns=%d, vmem=%d, smem=%d, gmem=%d, pmem=%d, tmem=%d"), nvars, svars, index, glob_script_mem.script_mem_size, glob_script_mem.script_size, sizeof(glob_script_mem), pmem, tot_mem);
+    AddLog(LOG_LEVEL_INFO, PSTR("SCR: nv=%d, tv=%d, vns=%d, vmem=%d, smem=%d, gmem=%d, pmem=%d, tmem=%d, xvars=%d"), nvars, svars, index, glob_script_mem.script_mem_size, glob_script_mem.script_size, sizeof(glob_script_mem), pmem, tot_mem, numshadow);
 
     // copy string variables
     char *cp1 = glob_script_mem.glob_snp;
@@ -3100,7 +3121,6 @@ char *isvar(char *lp, uint8_t *vtype, struct T_INDEX *tind, TS_FLOAT *fp, char *
       // isnumber
         if (fp) {
           if (*lp == '0' && *(lp + 1) == 'x') {
-
             lp += 2;
             *fp = strtoll(lp, &lp, 16);
           } else {
@@ -3601,10 +3621,18 @@ chknext:
           uint8_t vtype;
           lp = isvar(lp + 4, &vtype, &ind, 0, 0, gv);
           if (!ind.bits.constant) {
-            if (!glob_script_mem.FLAGS.ignore_line) {
-              uint16_t index = glob_script_mem.type[ind.index].index;
-              fvar = glob_script_mem.fvars[index] != glob_script_mem.s_fvars[index];
-              glob_script_mem.s_fvars[index] = glob_script_mem.fvars[index];
+#ifdef USE_SHADOW_X
+            if (!glob_script_mem.FLAGS.x_used || ind.bits.shadow) {
+#else
+            if (1) {
+#endif
+              if (!glob_script_mem.FLAGS.ignore_line) {
+                uint16_t index = glob_script_mem.type[ind.index].index;
+                fvar = glob_script_mem.fvars[index] != glob_script_mem.s_fvars[index];
+                glob_script_mem.s_fvars[index] = glob_script_mem.fvars[index];
+              }
+            } else {
+              fvar = 0;
             }
           } else {
             fvar = 0;
@@ -3766,9 +3794,17 @@ extern void W8960_SetGain(uint8_t sel, uint16_t value);
           uint8_t vtype;
           lp = isvar(lp + 5, &vtype, &ind, 0, 0, gv);
           if (!ind.bits.constant) {
-            uint16_t index = glob_script_mem.type[ind.index].index;
-            fvar = glob_script_mem.fvars[index] - glob_script_mem.s_fvars[index];
-            glob_script_mem.s_fvars[index] = glob_script_mem.fvars[index];
+#ifdef USE_SHADOW_X
+            if (!glob_script_mem.FLAGS.x_used || ind.bits.shadow) {
+#else
+            if (1) {
+#endif
+              uint16_t index = glob_script_mem.type[ind.index].index;
+              fvar = glob_script_mem.fvars[index] - glob_script_mem.s_fvars[index];
+              glob_script_mem.s_fvars[index] = glob_script_mem.fvars[index];
+            } else {
+              fvar = 0;
+            }
           } else {
             fvar = 0;
           }
@@ -8479,6 +8515,8 @@ startline:
 
             glob_script_mem.FLAGS.ignore_line = 0;
 
+            if ((swflg & 3) == 2) goto chk_switch;
+
             if (!strncmp(lp, "if", 2)) {
                 lp += 2;
                 if (ifstck < IF_NEST - 1) ifstck++;
@@ -8644,7 +8682,7 @@ getnext:
                 }
               }
             }
-
+chk_switch:
             if (!strncmp(lp, "switch", 6)) {
               lp += 6;
               SCRIPT_SKIP_SPACES
@@ -9835,8 +9873,7 @@ void Scripter_save_pvars(void) {
 #define WEB_HANDLE_SCRIPT "s10"
 
 const char HTTP_BTN_MENU_RULES[] PROGMEM =
-  "<p><form action='" WEB_HANDLE_SCRIPT "' method='get'><button>" D_CONFIGURE_SCRIPT "</button></form></p>";
-
+  "<p></p><form action='" WEB_HANDLE_SCRIPT "' method='get'><button>" D_CONFIGURE_SCRIPT "</button></form>";
 
 const char HTTP_FORM_SCRIPT[] PROGMEM =
     "<fieldset><legend><b>&nbsp;" D_SCRIPT "&nbsp;</b></legend>"
@@ -11825,7 +11862,7 @@ uint32_t fsize;
 
 #ifdef SCRIPT_FULL_WEBPAGE
 const char HTTP_WEB_FULL_DISPLAY[] PROGMEM =
-  "<p><form action='sfd%1d' method='get'><button>%s</button></form></p>";
+  "<p></p><form action='sfd%1d' method='get'><button>%s</button></form>";
 
 const char HTTP_SCRIPT_FULLPAGE1[] PROGMEM =
     "var rfsh=1;"
@@ -12053,7 +12090,7 @@ const char SCRIPT_MSG_GTABLE[] PROGMEM =
   "<script type='text/javascript' src='https://www.gstatic.com/charts/loader.js'></script>"
   "<script type='text/javascript'>google.charts.load('current',{packages:['corechart']});</script>"
   "<style>.hRow{font-weight:bold;color:black;background-color:lightblue;}.hCol{font-weight:bold;color:black;background-color:lightblue;}.tCell{color:black}</style>"
-  "<style>#chart1{display: inline-block;margin: 0 auto;#timeline text{fill:magenta;}}</style>";
+  "<style>#chart1{display:inline-block;margin: 0 auto;#timeline text{fill:magenta;}}</style>";
 
 const char SCRIPT_MSG_TABLE[] PROGMEM =
   "<script type='text/javascript'>google.charts.load('current',{packages:['table']});</script>";
