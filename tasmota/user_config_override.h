@@ -201,9 +201,13 @@
 
 //-- Software Serial für ESP32 (nur RX), Pin mit dem Zeichen '-' in der SML Sektion definieren (bei mehr als 2/3-Leseköpfen, je nach ESP32 Variante)
 //-- Optional: Serielle Schnittstelle (RX/TX RS232) im Script verwenden
+//-- Optional: Full Webpage (für Untermenüs/Diagramme)
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ESP32_SW_SERIAL
   #define USE_SCRIPT_SERIAL //3KB
+  #define SCRIPT_FULL_WEBPAGE //1KB
+  #define USE_MQTT_TLS //3KB
+  #define USE_INFLUXDB //6KB
 #endif
 
 //-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)
@@ -231,6 +235,8 @@
 
 //-- Optional: >J Sektion aktivieren https://tasmota.github.io/docs/Scripting-Language/#j
 #define USE_SCRIPT_JSON_EXPORT //0KB
+
+#define SCRIPT_OTTELO_USE_SCRIPTLIST
 
 #endif // TASMOTA32 OTTELO
 

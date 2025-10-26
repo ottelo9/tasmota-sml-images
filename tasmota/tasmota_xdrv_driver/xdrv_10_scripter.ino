@@ -40,6 +40,14 @@ keywords if then else endif, or, and are better readable for beginners (others m
 
 \*********************************************************************************************/
 
+//ottelo.jimdo.de
+#ifdef SCRIPT_OTTELO_USE_SCRIPTLIST
+#include <scriptlist_ottelo.h>
+#else
+#define SCRIPT_OTTELO_SELECT_HANDLER
+#define SCRIPT_OTTELO_SELECT
+#endif
+
 #define XDRV_10             10
 
 #ifndef TS_FLOAT
@@ -47,7 +55,7 @@ keywords if then else endif, or, and are better readable for beginners (others m
 #endif
 // float = 4, double = 8 bytes
 
-const uint8_t SCRIPT_VERS[2] = {5, 5};
+const uint8_t SCRIPT_VERS[2] = {5, 6};
 
 #define SCRIPT_DEBUG 0
 
@@ -6787,7 +6795,7 @@ void tmod_directModeOutput(uint32_t pin);
           }
           if (sel == 1 && glob_script_mem.Script_PortUdp_1) {
             // rec from port
-            if (TasmotaGlobal.global_state.wifi_down) {
+            if (TasmotaGlobal.global_state.wifi_down && TasmotaGlobal.global_state.eth_down) {
               if (sp) *sp = 0;
             } else {
               int32_t packetSize = glob_script_mem.Script_PortUdp_1->parsePacket();
@@ -9882,11 +9890,13 @@ const char HTTP_FORM_SCRIPT[] PROGMEM =
 const char HTTP_FORM_SCRIPT1[] PROGMEM =
     "<div style='text-align:right' id='charNum'> </div>"
     "<label><input style='width:3%%;' id='c%d' name='c%d' type='checkbox'%s><b>" D_SCRIPT_ENABLE "</b></label><br/>"
+    SCRIPT_OTTELO_SELECT
     "<br><textarea  id='t1' name='t1' rows='8' cols='80' maxlength='%d' style='font-size: 12pt' >";
 
 const char HTTP_FORM_SCRIPT1b[] PROGMEM =
     "</textarea>"
     "<script type='text/javascript'>"
+    SCRIPT_OTTELO_SELECT_HANDLER
     "eb('charNum').innerHTML='-';"
     "var ta=eb('t1');"
     "ta.addEventListener('keydown',function(e){"
@@ -11013,39 +11023,66 @@ const char kScriptCommands[] PROGMEM = D_CMND_SCRIPT "|" D_CMND_SUBSCRIBE "|" D_
 #endif
 ;
 
-void list_var(char *lp) {
+void list_var(char *lp, WiFiClient *client) {
 TS_FLOAT fvar;
 char str[SCRIPT_MAX_SBSIZE];
+String wbuffer = "";
+
   glob_script_mem.glob_error = 0;
   if (check_varname(lp) == NUM_ARRAY_RES && !strchr(lp, '[')) {
     TS_FLOAT *fpd = 0;
     uint16_t alend;
     char *cp = get_array_by_name(lp, &fpd, &alend, 0);
-    ResponseAppend_P(PSTR("\"%s\":["), lp);
+    if (!client) ResponseAppend_P(PSTR("\"%s\":["), lp);
+    else {
+      ext_snprintf_P(str, sizeof(str), PSTR("\"%s\":["), lp);
+      wbuffer += str;
+    }
+
     for (uint16_t cnt = 0; cnt < alend; cnt++) {
         TS_FLOAT tvar = *fpd++;
         ext_snprintf_P(str, sizeof(str), PSTR("%*_f"), -glob_script_mem.script_dprec, &tvar);
         if (cnt) {
-          ResponseAppend_P(PSTR(",%s"), str);
+          if (!client) ResponseAppend_P(PSTR(",%s"), str);
+          else  {
+            wbuffer += ',';
+            wbuffer += str;
+          }
         } else {
-          ResponseAppend_P(PSTR("%s"), str);
+          if (!client) ResponseAppend_P(PSTR("%s"), str);
+          else {
+            wbuffer += str;
+          }
+        }
+        if (client) {
+          if (wbuffer.length() >= 1024) {
+            client->print(wbuffer);
+            wbuffer = "";
+          } 
         }
     }
-    ResponseAppend_P(PSTR("]"));
+    if (!client) ResponseAppend_P(PSTR("]"));
+    else {
+      wbuffer += ']';
+      client->print(wbuffer);
+    }
   } else {
     glob_script_mem.glob_error = 0;
     glob_script_mem.var_not_found = 0;
     GetNumericArgument(lp, OPER_EQU, &fvar, 0);
     if (glob_script_mem.var_not_found) {
-      ResponseAppend_P(PSTR("\"%s\":\"???\""), lp);
+     if (!client) ResponseAppend_P(PSTR("\"%s\":\"???\""), lp);
+     else client->printf_P(PSTR("\"%s\":\"???\""), lp);
     } else {
       if (glob_script_mem.glob_error == 1) {
         // was string, not number
         GetStringArgument(lp, OPER_EQU, str, 0);
-        ResponseAppend_P(PSTR("\"%s\":\"%s\""), lp, str);
+        if (!client) ResponseAppend_P(PSTR("\"%s\":\"%s\""), lp, str);
+        else client->printf_P(PSTR("\"%s\":\"%s\""), lp, str);
       } else {
         ext_snprintf_P(str, sizeof(str), PSTR("%*_f"), -glob_script_mem.script_dprec, &fvar);
-        ResponseAppend_P(PSTR("\"%s\":%s"), lp, str);
+        if (!client) ResponseAppend_P(PSTR("\"%s\":%s"), lp, str);
+        else client->printf_P(PSTR("\"%s\":%s"), lp, str);
       }
     }
   }
@@ -11110,16 +11147,17 @@ bool ScriptCommand(void) {
           char *cp = strchr(lp, ';');
           if (cp) {
             *cp = 0;
-            list_var(lp);
+            list_var(lp, 0);
             ResponseAppend_P(PSTR(","));
             lp = cp + 1;
           } else {
-            list_var(lp);
+            list_var(lp, 0);
             ResponseAppend_P(PSTR("}"));
             break;
           }
         }
         ResponseAppend_P(PSTR("}"));
+        return serviced;
       }
       return serviced;
     }
@@ -11533,6 +11571,33 @@ void ScriptServeFile(void) {
 
   if (cp) {
     cp += 4;
+    char *lp = cp + 1;
+    if (*lp == '$') {
+        lp++;
+        WiFiClient wclient;
+        wclient = Webserver->client();
+        WiFiClient *client = &wclient;
+        client->printf_P(PSTR("HTTP/1.1 200 OK\r\n"));
+        client->printf_P(PSTR("Content-type:text/html\r\n\r\n"));
+        client->printf_P(PSTR("{\"script\":{"));
+        while (1) {
+          while (*lp==' ') lp++;
+          char *cp = strchr(lp, ';');
+          if (cp) {
+            *cp = 0;
+            list_var(lp, client);
+            client->printf_P(PSTR(","));
+            lp = cp + 1;
+          } else {
+            list_var(lp, client);
+            client->printf_P(PSTR("}"));
+            break;
+          }
+        }
+        client->printf_P(PSTR("}"));
+        client->flush();
+        return;
+    }
     if (ufsp) {
       if (strstr_P(cp, PSTR("scrdmp.bmp"))) {
         SendFile(cp);
