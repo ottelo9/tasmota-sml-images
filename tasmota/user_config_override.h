@@ -190,6 +190,7 @@
 #define USE_SCRIPT_WEB_DISPLAY
 #define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
 #define USE_WEBCLIENT_HTTPS //für HA benötigt
+#define USE_HTML_CALLBACK //für Smartmeter Descriptor dropdown list smlpd()
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ANGLE_FUNC //~2KB
   #define USE_FEXTRACT //~8KB cts()
@@ -236,7 +237,11 @@
 //-- Optional: >J Sektion aktivieren https://tasmota.github.io/docs/Scripting-Language/#j
 #define USE_SCRIPT_JSON_EXPORT //0KB
 
-#define SCRIPT_OTTELO_USE_SCRIPTLIST
+//-- Scriptliste
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
+  #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/smartmeter_test/scripts/"
+  #define SCRIPT_LIST "scripts.json"
+#endif
 
 #endif // TASMOTA32 OTTELO
 

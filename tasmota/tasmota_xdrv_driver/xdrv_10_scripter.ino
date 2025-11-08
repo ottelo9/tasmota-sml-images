@@ -40,14 +40,6 @@ keywords if then else endif, or, and are better readable for beginners (others m
 
 \*********************************************************************************************/
 
-//ottelo.jimdo.de
-#ifdef SCRIPT_OTTELO_USE_SCRIPTLIST
-#include <scriptlist_ottelo.h>
-#else
-#define SCRIPT_OTTELO_SELECT_HANDLER
-#define SCRIPT_OTTELO_SELECT
-#endif
-
 #define XDRV_10             10
 
 #ifndef TS_FLOAT
@@ -211,6 +203,7 @@ char *Get_esc_char(char *cp, char *esc_chr);
 #include "esp_sleep.h"
 #endif
 
+#include "WiFiClientSecureLightBearSSL.h"
 
 #ifdef SCRIPT_FULL_OPTIONS
 
@@ -413,7 +406,7 @@ extern FS *ffsp;
 
 #define SSIZE_PSTORE (uint16_t *) (glob_script_mem.script_pram + glob_script_mem.script_pram_size - 2)
 
-#define FAT_SCRIPT_NAME "/script.txt"
+#define FAT_SCRIPT_NAME F("/script.txt")
 
 #endif // USE_UFILESYS
 
@@ -1417,7 +1410,7 @@ char *script;
                 }
             }
         } else {
-            if (!strncmp(lp, ">D", 2)) {
+            if (!strncmp_P(lp, PSTR(">D"), 2)) {
               /* lp += 2;
               SCRIPT_SKIP_SPACES
               if (isdigit(*lp)) {
@@ -4255,10 +4248,16 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
           SCRIPT_SKIP_SPACES
           char *url;
           lp = GetLongIString(lp, &url);
+          char *path = 0;
+          SCRIPT_SKIP_SPACES
+          if (*lp != ')') {
+            lp = GetLongIString(lp, &path);
+          }
           if (url) {
-            fvar = url2file(fvar, url);
+            fvar = url2file(fvar, url, path );
           }
           if (url) free(url);
+          if (path) free(path);
           goto nfuncexit;
         }
 #endif
@@ -6014,6 +6013,13 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
             fvar = smlp->sml_getv(fvar);
           }
           goto nfuncexit;
+        }
+        
+        if (!strncmp_XP(lp, XPSTR("ssav"), 4)) {
+          // save and restart
+          SaveScript();
+          //SaveScriptEnd();
+          goto exit;
         }
 #endif //USE_SML_M
 
@@ -8648,8 +8654,8 @@ startline:
                     }
                   }
               } else {
-                      // error
-                  toLogEOL("for error", lp);
+                // error
+                AddLog(LOG_LEVEL_INFO, PSTR("SCR: for error: %s"), lp);
               }
             } else if (!strncmp(lp, "next", 4)) {
 getnext:
@@ -9134,7 +9140,9 @@ chk_switch:
                         switch (lastop) {
                           case OPER_EQU:
                               if (glob_script_mem.var_not_found) {
-                                if (!gv || !gv->jo) toLogEOL("var not found: ",lp);
+                                if (!gv || !gv->jo) {
+                                  AddLog(LOG_LEVEL_INFO, PSTR("SCR: var not found: %s"), lp);
+                                }
                                 goto next_line;
                               }
                               *dfvar = fvar;
@@ -9177,7 +9185,9 @@ chk_switch:
                         switch (lastop) {
                           case OPER_EQU:
                               if (glob_script_mem.var_not_found) {
-                                if (!gv || !gv->jo) toLogEOL("var not found: ",lp);
+                                if (!gv || !gv->jo) {
+                                  AddLog(LOG_LEVEL_INFO, PSTR("SCR: var not found: %s"), lp);
+                                }
                                 goto next_line;
                               }
                               *dfvar = fvar;
@@ -9876,7 +9886,42 @@ void Scripter_save_pvars(void) {
 }
 
 // works only with webserver
+// scriptlist at page "edit script"
+// requires following defines (user_config_override.h) and external files, e.g.:
+// #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/smartmeter_test/scripts/"
+// #define SCRIPT_LIST "scripts.json"
+// scripts.json example:
+//{
+//	"script": [
+//		{ "label": "script 1", "filename": "script_1.tas" },
+//		{ "label": "script 2", "filename": "script_2.tas" }
+//	]
+//}
+
 #ifdef USE_WEBSERVER
+#if defined(USE_SML_SCRIPT_CMD) && defined(SCRIPT_LIST_DOWNLOAD_URL) && defined(SCRIPT_LIST)
+#define SCRIPT_LIST_SELECT_OPTIONS "" \
+    "<option value='sm_0'>--- Select Script ---</option>"
+#define SCRIPT_LIST_SELECT_FUNCTION "" \
+    "if(selScript.value=='sm_0'){ta.innerHTML=''}" \
+    "else{ta.innerHTML='';fetch('" SCRIPT_LIST_DOWNLOAD_URL "'+selScript.value,{cache:'no-store'}).then(response=>response.text()).then(content=>{ta.innerHTML=content;});}"
+#define SCRIPT_LIST_SELECT "" \
+    "<p><select id='idselScript'>" SCRIPT_LIST_SELECT_OPTIONS "</select></p>"
+#define SCRIPT_LIST_SELECT_HANDLER "" \
+    "var selScript=eb('idselScript');" \
+    "selScript.onchange=function(){" SCRIPT_LIST_SELECT_FUNCTION "};" \
+    "fetch('" SCRIPT_LIST_DOWNLOAD_URL SCRIPT_LIST "',{cache:'no-store'}).then(response=>response.json()).then(data=>{" \
+    "if(data && data.script && data.script.length){" \
+    "while(selScript.options.length>1){selScript.options.remove(1);}" \
+    "for(let n=0;n<data.script.length;n++){" \
+    "let o=document.createElement('option');o.value=data.script[n].filename;o.text=data.script[n].label;selScript.options.add(o);" \
+    "}}});"
+#else
+  #define SCRIPT_LIST_SELECT
+  #define SCRIPT_LIST_SELECT_HANDLER
+#endif
+
+
 
 #define WEB_HANDLE_SCRIPT "s10"
 
@@ -9890,13 +9935,13 @@ const char HTTP_FORM_SCRIPT[] PROGMEM =
 const char HTTP_FORM_SCRIPT1[] PROGMEM =
     "<div style='text-align:right' id='charNum'> </div>"
     "<label><input style='width:3%%;' id='c%d' name='c%d' type='checkbox'%s><b>" D_SCRIPT_ENABLE "</b></label><br/>"
-    SCRIPT_OTTELO_SELECT
+    SCRIPT_LIST_SELECT
     "<br><textarea  id='t1' name='t1' rows='8' cols='80' maxlength='%d' style='font-size: 12pt' >";
 
 const char HTTP_FORM_SCRIPT1b[] PROGMEM =
     "</textarea>"
     "<script type='text/javascript'>"
-    SCRIPT_OTTELO_SELECT_HANDLER
+    SCRIPT_LIST_SELECT_HANDLER
     "eb('charNum').innerHTML='-';"
     "var ta=eb('t1');"
     "ta.addEventListener('keydown',function(e){"
@@ -10122,13 +10167,100 @@ uint8_t DownloadFile(char *file) {
 void HandleScriptTextareaConfiguration(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
+#if 0
+  String message = "Number of args received:";
+  message += Webserver->args();
+  message += "\n";
+  for (int i = 0; i < Webserver->args(); i++) {
+    message += "Arg n" + (String)i + " –> ";
+    message += Webserver->argName(i) + ": ";
+    message += Webserver->arg(i) + "\n";
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR(">>>> %s"), message.c_str());
+#endif
+
+#ifdef USE_SML_SCRIPT_CMD
+  //if (Webserver->hasArg("smlsav")) {  // strange on esp32 not available ???
+  if (Webserver->hasArg("plain")) {
+    String str = Webserver->arg("plain");
+    if (*str.c_str()) {
+      str.replace("\r\n", "\n");
+      str.replace("\r", "\n");
+      // special script copy
+      char *smlp = (char*)str.c_str();
+      char *cp = strstr_P(smlp, PSTR(">M"));
+      if (cp) {
+        // replace >M section
+        // find >M in script
+#ifndef USE_SCRIPT_FATFS
+        char *lp = strstr_P(glob_script_mem.script_ram, PSTR(">M"));
+        uint16_t doffset;
+        char *xp;
+        if (lp) {
+          // contains >M section
+          doffset = (uint32_t)lp - (uint32_t)glob_script_mem.script_ram;
+          xp = strstr_P(lp, PSTR("\n#"));
+          xp += 2;
+        } else {
+          // no >M section, append to end
+          doffset = strlen(glob_script_mem.script_ram);
+          lp = glob_script_mem.script_ram + doffset;
+          xp = glob_script_mem.script_ram + doffset;
+        }
+        char *ep = strstr_P(cp, PSTR("\n#"));
+        if (!ep) {
+          ep = cp + strlen(cp);
+        } else {
+          ep += 2;
+        }
+        if (xp && ep) {
+          uint16_t scriptsize = glob_script_mem.script_size;
+          uint16_t dlen = (uint32_t)xp - (uint32_t)lp;
+          uint16_t slen = (uint32_t)ep - (uint32_t)cp;
+          memcpy(lp, lp + dlen, scriptsize - doffset - dlen);
+          // now find source len
+          memmove(lp + slen, lp, scriptsize - doffset - slen);
+          memcpy(lp, cp, slen);
+          glob_script_mem.event_handeled = 1;
+#ifdef USE_HTML_CALLBACK
+          if (glob_script_mem.html_script) Run_Scripter1(glob_script_mem.html_script, 0, 0);
+#else
+          if (glob_script_mem.event_script) Run_Scripter1(glob_script_mem.event_script, 0, 0);
+#endif
+        }
+      }
+#else
+        // copy to file
+        char fname[16]; 
+        strcpy_P(fname, PSTR("/sml_meter.def"));
+        char *ep = strstr_P(cp, PSTR("\n#"));
+        if (ep) {
+          ep += 2;
+          uint16_t slen = (uint32_t)ep - (uint32_t)cp;
+          File file = ufsp->open(fname, FS_FILE_WRITE);
+          file.write((const uint8_t*)cp, slen);
+          file.close();
+          glob_script_mem.event_handeled = 1;
+#ifdef USE_HTML_CALLBACK
+          if (glob_script_mem.html_script) Run_Scripter1(glob_script_mem.html_script, 0, 0);
+#else
+          if (glob_script_mem.event_script) Run_Scripter1(glob_script_mem.event_script, 0, 0);
+#endif
+        }
+      }
+#endif
+    }
+    HandleManagement();
+    return;
+  }
+#endif // USE_SML_SCRIPT_CMD
+
   if (Webserver->hasArg("save")) {
     ScriptSaveSettings();
     HandleManagement();
     return;
   }
 }
-
 
 void HandleScriptConfiguration(void) {
 
@@ -10149,7 +10281,6 @@ void HandleScriptConfiguration(void) {
     WSContentSendStyle();
     WSContentSend_P(HTTP_FORM_SCRIPT);
 
-
 #ifdef xSCRIPT_STRIP_COMMENTS
     uint16_t ssize = glob_script_mem.script_size;
     if (bitRead(Settings->rule_enabled, 1)) ssize *= 2;
@@ -10158,7 +10289,7 @@ void HandleScriptConfiguration(void) {
     WSContentSend_P(HTTP_FORM_SCRIPT1,1,1,bitRead(Settings->rule_enabled,0) ? PSTR(" checked") : "",glob_script_mem.script_size);
 #endif // xSCRIPT_STRIP_COMMENTS
 
-    // script is to large for WSContentSend_P
+    // script is too large for WSContentSend_P
     if (glob_script_mem.script_ram[0]) {
       WSContentFlush();
       _WSContentSend(glob_script_mem.script_ram);
@@ -12069,7 +12200,7 @@ void Script_Check_HTML_Setvars(void) {
     strncpy(vname, cp, sizeof(vname));
     *cp1 = '=';
     cp1++;
-
+    
     if (is_int_var(vname)) {
       memmove(cp1 + 1, cp1, strlen(cp1));
       *cp1++ = '#';
@@ -12083,7 +12214,7 @@ void Script_Check_HTML_Setvars(void) {
       uint8_t tlen = strlen(cp1);
       memmove(cp1 + 1, cp1, tlen);
       *cp1 = '\"';
-      *(cp1 + tlen +1 ) = '\"';
+      *(cp1 + tlen + 1 ) = '\"';
     }
     //toLog(cmdbuf);
     execute_script(cmdbuf);
@@ -12149,6 +12280,38 @@ const char SCRIPT_MSG_TEXTINP_U[] PROGMEM =
 const char SCRIPT_MSG_NUMINP[] PROGMEM =
   "%s<label><b>%s</b><input  min='%s' max='%s' step='%s' value='%s' type='number' style='width:%dpx' onfocusin='pr(0)' onfocusout='pr(1)' onchange='siva(value,\"%s\")'></label>";
 
+
+#ifdef USE_SML_SCRIPT_CMD
+const char SML_PD[] PROGMEM =
+  "</p><label for='idSelSM'>%s</label><select id='idSelSM'></select></p>";
+
+const char SML_SCRIPT_TEXT[] PROGMEM =
+  "<script>"
+  "var selSM=eb('idSelSM');"
+  "var text;"
+  "selSM.onchange=function(){"
+  "var index=selSM.selectedIndex;"
+  "pr(1);"
+  "var path='%s/'+selSM.value;"
+  "text=fetch(path,{cache:'no-store'}).then(response=>response.text()).then(content=>{text=content;smlp(text,index)});"
+  "};"
+  "fetch('%s'+'/smartmeter.json',{cache:'no-store'}).then(response=>response.json()).then(data=>{"
+  "if(data && data.smartmeter && data.smartmeter.length){"
+  "while(selSM.options.length>1){selSM.options.remove(1);}"
+  "for(let n=0;n<data.smartmeter.length;n++){"
+  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;selSM.options.add(o);"
+  "if (n==%d) {o.setAttribute('selected', true);}"
+  "}}});"
+  "function smlp(txt,index){"
+  "x=new XMLHttpRequest();"
+  "x.open('POST', '/ta?smlsav');"
+  "x.setRequestHeader('Accept','application/text');"
+  "x.setRequestHeader('Content-Type','application/text');"
+  "x.send(txt);"
+  "setTimeout(seva, 500, index, '%s');"
+  "}"
+  "</script>";
+#endif // USE_SML_SCRIPT_CMD
 
 #ifdef USE_GOOGLE_CHARTS
 const char SCRIPT_MSG_GTABLE[] PROGMEM =
@@ -12596,16 +12759,17 @@ const char *gc_str;
       char label[SCRIPT_MAX_SBSIZE];
       lp = GetStringArgument(lp, OPER_EQU, label, 0);
       const char *cp;
+      char option[20];
       uint8_t uval;
       if (val>0) {
-        cp = "checked='checked'";
+        strcpy_P(option, PSTR("checked='checked'"));
         uval = 0;
       } else {
-        cp = "";
+        option[0] = 0;
         uval = 1;
       }
       WCS_DIV(glob_script_mem.specopt);
-      WSContentSend_P(SCRIPT_MSG_CHKBOX, center, label, (char*)cp, uval, vname);
+      WSContentSend_P(SCRIPT_MSG_CHKBOX, center, label, (char*)option, uval, vname);
       WCS_DIV(glob_script_mem.specopt | WSO_STOP_DIV);
       lp++;
     } else if (!strncmp(lin, "pd(", 3)) {
@@ -12642,35 +12806,48 @@ const char *gc_str;
       while (*lp) {
         SCRIPT_SKIP_SPACES
         lp = GetStringArgument(lp, OPER_EQU, pulabel, 0);
+        char option[10];
         if (index == 1 && pulabel[0] == '#') {
-          // number range
           char *cp = &pulabel[1];
-          uint8_t from = strtol(cp, &cp, 10);
-          uint8_t to = from;
-          if (*cp == '-') {
+          uint8_t flg = 0;
+          uint8_t from;
+          uint8_t to;
+          if (pulabel[1] == 'g') {
             cp++;
-            to = strtol(cp, &cp, 10);
+            flg = 1;
+            from = 0;
+            to = MAX_USER_PINS + MIN_FLASH_PINS - 1;
+          } else {
+            // number range
+            from = strtol(cp, &cp, 10);
+            to = from;
+            if (*cp == '-') {
+              cp++;
+              to = strtol(cp, &cp, 10);
+            }
           }
           for (uint32_t cnt = from; cnt <= to; cnt++) {
             sprintf(pulabel, "%d", cnt);
+            option[0] = 0;
             if (val == index) {
-              cp = (char*)"selected";
-            } else {
-              cp = (char*)"";
+              strcpy_P(option, PSTR("selected"));
             }
-            WSContentSend_P(SCRIPT_MSG_PULLDOWNb, cp, index, pulabel);
+
+            uint8_t disabled = FlashPin(cnt) || RedPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            if (flg && disabled) {
+              strcpy_P(option, PSTR("disabled"));
+            }
+            WSContentSend_P(SCRIPT_MSG_PULLDOWNb, option, index, pulabel);
             index++;
           }
           break;
         }
-
-        char *cp;
         if (val == index) {
-          cp = (char*)"selected";
+          strcpy_P(option, PSTR("selected"));
         } else {
-          cp = (char*)"";
+          option[0] = 0;
         }
-        WSContentSend_P(SCRIPT_MSG_PULLDOWNb, cp, index, pulabel);
+        WSContentSend_P(SCRIPT_MSG_PULLDOWNb, option, index, pulabel);
         SCRIPT_SKIP_SPACES
         if (*lp == ')') {
           lp++;
@@ -12714,6 +12891,7 @@ const char *gc_str;
         WSContentSend_P(SCRIPT_MSG_RADIOa, center, tsiz, pulabel);
       }
 
+      char option[10];
       // get pu labels
       uint8_t index = 1;
       while (*lp) {
@@ -12721,11 +12899,11 @@ const char *gc_str;
         lp = GetStringArgument(lp, OPER_EQU, pulabel, 0);
         char *cp;
         if (val == index) {
-          cp = (char*)"checked";
+          strcpy_P(option, PSTR("checked"));
         } else {
-          cp = (char*)"";
+          option[0] = 0;
         }
-        WSContentSend_P(SCRIPT_MSG_RADIOb, vname, index, vname, cp, pulabel);
+        WSContentSend_P(SCRIPT_MSG_RADIOb, vname, index, vname, option, pulabel);
         SCRIPT_SKIP_SPACES
         if (*lp == ')') {
           lp++;
@@ -12741,7 +12919,7 @@ const char *gc_str;
       uint8_t bcnt = 0;
       char *found = lin;
       while (bcnt < 4) {
-        found = strstr(found, "bu(");
+        found = strstr_P(found, PSTR("bu("));
         if (!found) break;
         found += 3;
         bcnt++;
@@ -12928,6 +13106,28 @@ const char *gc_str;
       WCS_DIV(glob_script_mem.specopt | WSO_STOP_DIV);
       lp++;
 
+#ifdef USE_SML_SCRIPT_CMD
+    } else if (!strncmp(lin, "smlpd(", 6)) {
+      // sml pulldown
+      char *lp = lin;
+      char *url;
+      lp = GetLongIString(lp + 6, &url);
+      char label[SCRIPT_MAX_SBSIZE];
+      lp = GetStringArgument(lp, OPER_EQU, label, 0);
+      SCRIPT_SKIP_SPACES
+      char *slp = lp;
+      TS_FLOAT sel;
+      lp = GetNumericArgument(lp, OPER_EQU, &sel, 0);
+      SCRIPT_SKIP_SPACES
+      char vname[16];
+      ScriptGetVarname(vname, slp, sizeof(vname));
+
+      WCS_DIV(glob_script_mem.specopt);
+      WSContentSend_P(SML_PD, label);
+      WSContentSend_P(SML_SCRIPT_TEXT, url, url, (uint32_t)sel, vname);
+      WCS_DIV(glob_script_mem.specopt | WSO_STOP_DIV);
+      if (url) free(url);
+#endif
     } else {
       if (glob_script_mem.specopt & WSO_FORCETAB) {
         WSContentSend_P(PSTR("{s}%s{e}"), lin);
@@ -13219,7 +13419,7 @@ exgc:
         int16_t divflg = 1;
         int16_t todflg = -1;
         uint8_t hmflg = 0;
-        if (!strncmp(label, "cnt", 3)) {
+        if (!strncmp_P(label, PSTR("cnt"), 3)) {
           char *cp = &label[3];
           if (*cp == 'h') {
             hmflg = 1;
@@ -13239,7 +13439,7 @@ exgc:
           }
         } else {
           char *lp = label;
-          if (!strncmp(label, "wdh:", 4)) {
+          if (!strncmp_P(label, PSTR("wdh:"), 4)) {
             // one week hours
             todflg = -2;
             lp += 4;
@@ -13466,7 +13666,7 @@ void ScriptJsonAppend(void) {
       }
       if (*lp!=';') {
         // send this line to mqtt
-        if (!strncmp(lp, "%=#", 3)) {
+        if (!strncmp_P(lp, PSTR("%=#"), 3)) {
           // subroutine
           lp = scripter_sub(lp + 1, 0);
         } else {
@@ -13689,45 +13889,102 @@ uint32_t scripter_create_task(uint32_t num, uint32_t time, uint32_t core, int32_
 
 
 #ifdef USE_UFILESYS
-// read http content to file
-int32_t url2file(uint8_t fref, char *url) {
-  WiFiClient http_client;
-  HTTPClient http;
+// read http(s) content to file
+int32_t url2file(uint8_t fref, char *url, char *path) {
   int32_t httpCode = 0;
-  String weburl = "http://"+UrlEncode(url);
+  if (strstr_P(url, PSTR("https://"))) {
+    String xurl = url;
+    if (path) {
+      xurl += String("/") + path;
+    }
 
-  for (uint32_t retry = 0; retry < 3; retry++) {
-    http.begin(http_client, weburl);
-    delay(100);
-    httpCode = http.GET();
-    if (httpCode >= 0) {
-      break;
-    }
-  }
-  if (httpCode < 0) {
-    AddLog(LOG_LEVEL_INFO,PSTR("SCR: HTTP error %d = %s"), httpCode, http.errorToString(httpCode).c_str());
-  }
-  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-    WiFiClient *stream = http.getStreamPtr();
-    int32_t len = http.getSize();
-    if (len < 0) len = 99999999;
-    uint8_t buff[512];
-    while (http.connected() && (len > 0)) {
-      size_t size = stream->available();
-      if (size) {
-        if (size > sizeof(buff)) {
-          size = sizeof(buff);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+    HTTPClientLight http;
+    if (http.begin(UrlEncode(xurl))) {
+#else // HTTP only
+#if 1
+    WiFiClient http_client;
+#else
+    WiFiClientSecure http_client;
+    http_client.setInsecure();
+#endif
+    HTTPClient http;
+    if (http.begin(http_client, UrlEncode(xurl))) {
+#endif
+      httpCode = http.GET();
+      if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+          WiFiClient *stream = http.getStreamPtr();
+          int32_t len = http.getSize();
+          if (len < 0) len = 99999999;
+          uint8_t buff[512];
+          if (buff) {
+            while (http.connected() && (len > 0)) {
+              size_t size = stream->available();
+              if (size) {
+                if (size > sizeof(buff)) {
+                  size = sizeof(buff);
+                }
+                int read = stream->readBytes(buff, size);
+                glob_script_mem.files[fref].write(buff, read);
+                len -= read;
+              }
+              delayMicroseconds(1);
+            }
+          }
         }
-        uint32_t read = stream->readBytes(buff, size);
-        glob_script_mem.files[fref].write(buff, read);
-        len -= read;
-        AddLog(LOG_LEVEL_DEBUG,PSTR("SCR: HTTP read %d"), len);
+      } else {
+        AddLog(LOG_LEVEL_INFO,PSTR("SCR: https error: %s"), http.errorToString(httpCode).c_str());
       }
-      delayMicroseconds(1);
+      http.end();                             // Clean up connection data
+    } else {
+      AddLog(LOG_LEVEL_INFO,PSTR("SCR: https begin failed"));
     }
+  } else {
+    // HTTP
+    WiFiClient http_client;
+    HTTPClient http;
+    
+    String weburl = "";
+    if (!strstr_P(url, PSTR("http"))) {
+      weburl += "http://"+UrlEncode(url);
+    } else {
+      weburl = UrlEncode(url);
+    }
+
+    for (uint32_t retry = 0; retry < 3; retry++) {
+      http.begin(http_client, weburl);
+      delay(100);
+      httpCode = http.GET();
+      if (httpCode >= 0) {
+        break;
+      }
+    }
+    if (httpCode < 0) {
+      AddLog(LOG_LEVEL_INFO,PSTR("SCR: HTTP error %d = %s"), httpCode, http.errorToString(httpCode).c_str());
+    }
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+      WiFiClient *stream = http.getStreamPtr();
+      int32_t len = http.getSize();
+      if (len < 0) len = 99999999;
+      uint8_t buff[512];
+      while (http.connected() && (len > 0)) {
+        size_t size = stream->available();
+        if (size) {
+          if (size > sizeof(buff)) {
+            size = sizeof(buff);
+          }
+          uint32_t read = stream->readBytes(buff, size);
+          glob_script_mem.files[fref].write(buff, read);
+          len -= read;
+          AddLog(LOG_LEVEL_DEBUG,PSTR("SCR: HTTP read %d"), len);
+        }
+        delayMicroseconds(1);
+      }
+    }
+    http.end();
+    http_client.stop();
   }
-  http.end();
-  http_client.stop();
   return httpCode;
 }
 #endif
@@ -13876,7 +14133,7 @@ int32_t call2pwl(const char *url) {
 
 
 //#ifdef ESP8266
-#include "WiFiClientSecureLightBearSSL.h"
+
 //#else
 //#include <WiFiClientSecure.h>
 //#endif //ESP8266
@@ -13911,12 +14168,17 @@ uint32_t call2https(const char *host, const char *path) {
 
   String request;
 
+  // remove https:// from host
+  if (strstr(host, "https://")) {
+    host += 8;
+  }
+
   request = String("GET ") + path +
                     " HTTP/1.1\r\n" +
                     "Host: " + host +
                     "\r\n" + "Connection: close\r\n\r\n";
   httpsClient->print(request);
-//  AddLog(LOG_LEVEL_INFO,PSTR(">>> get request %s"),(char*)request.c_str());
+  //AddLog(LOG_LEVEL_INFO,PSTR(">>> get request %s"),(char*)request.c_str());
 
   while (httpsClient->connected()) {
     String line = httpsClient->readStringUntil('\n');
@@ -13927,13 +14189,13 @@ uint32_t call2https(const char *host, const char *path) {
   String result;
   while (httpsClient->available()) {
     String line = httpsClient->readStringUntil('\n');
-    if (line!="") {
+    if (line != "") {
       result += line;
     }
   }
   httpsClient->stop();
   delete httpsClient;
-//  AddLog(LOG_LEVEL_INFO,PSTR(">>> response 2 %s"),(char*)result.c_str());
+  //AddLog(LOG_LEVEL_INFO,PSTR(">>> response %s"),(char*)result.c_str());
   Run_Scripter(">jp", 3, (char*)result.c_str());
   return 0;
 }
