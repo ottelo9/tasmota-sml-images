@@ -41,7 +41,14 @@ Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details find
 [https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
 ### Kompilieren
-Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben:  
+Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben: 
+
+Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `platformio run -e tasmota32-safeboot`.  
+
+Um alle gleichzeitig zu erstellen:  
+`platformio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot`
+
+Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output):  
 
 ESP32:  
 `platformio run -e tasmota32_ottelo`      (Generic ESP32)  
@@ -57,6 +64,9 @@ ESP8266:
 `platformio run -e tasmota1m_energy_ottelo` ( = 1M Flash, Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)  
 `platformio run -e tasmota1m_shelly_ottelo` ( = 1M Flash, Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
 `platformio run -e tasmota4m_ottelo`        (>= 4M Flash)  
+
+Um alle gleichzeitig zu erstellen:  
+`platformio run $(pio project config --json-output | jq -r '.env | keys[] | select(contains("ottelo"))' | sed 's/^/-e /')`
 
 ### (Factory)Image übertragen / flashen
 [Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
