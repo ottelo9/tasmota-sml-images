@@ -66,7 +66,7 @@ ESP8266:
 `platformio run -e tasmota4m_ottelo`        (>= 4M Flash)  
 
 Um alle gleichzeitig zu erstellen:  
-`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("ottelo")) | sub("env:";"-e ")')`
+`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("ottelo")) | select(test("ottelo_base") | not) | sub("env:"; "-e ")')`
 
 
 ### (Factory)Image übertragen / flashen
