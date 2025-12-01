@@ -66,7 +66,8 @@ ESP8266:
 `platformio run -e tasmota4m_ottelo`        (>= 4M Flash)  
 
 Um alle gleichzeitig zu erstellen:  
-`platformio run $(pio project config --json-output | jq -r '.env | keys[] | select(contains("ottelo"))' | sed 's/^/-e /')`
+`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("ottelo")) | sub("env:";"-e ")')`
+
 
 ### (Factory)Image übertragen / flashen
 [Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
