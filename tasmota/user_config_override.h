@@ -67,8 +67,9 @@
 \*****************************************************************************************************/
 
 //siehe platformio_tasmota_cenv.ini
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32C3_OTTELO)      || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32_BERRY_OTTELO) || \
-      defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO)       || defined(TASMOTA32C3_OTTELO)       || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || \
+      defined(TASMOTA32SOLO1_OTTELO)  || defined(TASMOTA32_BERRY_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
+      defined(TASMOTA1M_OTTELO)       || defined(TASMOTA1M_SHELLY_OTTELO)  || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
 //     dort müssen mindestens 12k RAM für einen stabilen Betrieb frei sein (inkl. Script).
@@ -153,9 +154,10 @@
 //-- Max String Size: default 255. Wird nun aber im Script mit >D xx definiert !
 //#define SCRIPT_MAXSSIZE 128
 
-//-- enables to use 4096 in stead of 256 bytes buffer for variable names
+//-- 4096 statt 256 bytes für Variablennamen und größere Arrays (24h Diagramm)
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
   #define SCRIPT_LARGE_VNBUFF
+  #define MAX_ARRAY_SIZE 2000
 #endif
 
 //-- Skriptgröße (max Anzahl an Zeichen) https://tasmota.github.io/docs/Scripting-Language/#script-buffer-size
@@ -212,7 +214,7 @@
 #endif
 
 //-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32P4_OTTELO) )
   #define USE_ETHERNET          // Add support for ethernet (+20k code)
   #define USE_WT32_ETH01
   #define ETH_TYPE          0
@@ -239,9 +241,13 @@
 
 //-- Scriptliste
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
-  #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/smartmeter_test/scripts/"
+  #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/script-list-menu/scripts/"
   #define SCRIPT_LIST "scripts.json"
 #endif
+
+//-- Weiteres optionales
+//#define USE_DISPLAY_TM1621_SONOFF //4KB
+//#define USE_SENDMAIL
 
 #endif // TASMOTA32 OTTELO
 
