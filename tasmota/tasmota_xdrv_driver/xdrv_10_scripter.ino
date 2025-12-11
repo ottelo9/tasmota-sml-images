@@ -2645,6 +2645,30 @@ uint32_t res = 0;
   return res;
 }
 
+#ifdef USE_CW_CALC
+uint32_t calc_cw(void) {
+			TS_FLOAT a = floor((14 - RtcTime.month) / 12);
+			TS_FLOAT y = RtcTime.year + 4800 - a;
+			TS_FLOAT m = RtcTime.month + (12 * a) - 3;
+			TS_FLOAT jd = RtcTime.day_of_month + floor(((153 * m) + 2) / 5) +
+				(365 * y) + floor(y / 4) - floor(y / 100) +
+				floor(y / 400) - 32045;
+			TS_FLOAT d4 = (uint32_t)(jd + 31741 - ((uint32_t)jd % 7)) % 146097 % 36524 %
+				1461;
+			TS_FLOAT L = floor(d4 / 1460);
+			TS_FLOAT d1 = ((uint32_t)(d4 - L) % 365) + L;
+			// Kalenderwoche ermitteln
+			int calendarWeek = (int) floor(d1 / 7) + 1;
+			// Das Jahr der Kalenderwoche ermitteln
+			int year = RtcTime.year;
+			if (calendarWeek == 1 && RtcTime.month == 12)
+				year++;
+			if (calendarWeek >= 52 && RtcTime.month == 1)
+				year--;
+			// Die ermittelte Kalenderwoche zurückgeben
+			return calendarWeek;
+}
+#endif
 
 uint8_t script_hexnibble(char chr) {
   uint8_t rVal = 0;
@@ -3788,6 +3812,12 @@ extern void W8960_SetGain(uint8_t sel, uint16_t value);
           fvar = TasmotaGlobal.tele_period;
           goto exit;
         }
+#ifdef USE_CW_CALC
+        if (!strncmp_XP(vname, XPSTR("cw"), 2)) {
+          fvar = calc_cw();
+          goto exit;
+        }
+#endif
         break;
       case 'd':
         if (!strncmp_XP(vname, XPSTR("day"), 3)) {
@@ -10033,7 +10063,7 @@ void Scripter_save_pvars(void) {
     "if(data && data.script && data.script.length){" \
     "while(selScript.options.length>1){selScript.options.remove(1);}" \
     "for(let n=0;n<data.script.length;n++){" \
-    "let o=document.createElement('option');o.value=data.script[n].filename;o.text=data.script[n].label;selScript.options.add(o);" \
+    "let o=document.createElement('option');o.value=data.script[n].filename;o.text=data.script[n].label;if(data.script[n].filename==''){o.disabled=true;};selScript.options.add(o);" \
     "}}});"
 #else
   #define SCRIPT_LIST_SELECT
@@ -12508,7 +12538,7 @@ const char SML_SCRIPT_TEXT[] PROGMEM =
   "if(data && data.smartmeter && data.smartmeter.length){"
   "while(selSM.options.length>1){selSM.options.remove(1);}"
   "for(let n=0;n<data.smartmeter.length;n++){"
-  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;selSM.options.add(o);"
+  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;if(data.smartmeter[n].filename==''){o.disabled=true;};selSM.options.add(o);"
   "if (n==%d) {o.setAttribute('selected', true);}"
   "}}});"
   "function smlp(txt,index){"

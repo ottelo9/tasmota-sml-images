@@ -190,6 +190,7 @@
 #define USE_GOOGLE_CHARTS
 #define LARGE_ARRAYS
 #define USE_SCRIPT_WEB_DISPLAY
+#define USE_CW_CALC //Kalenderwochen via Variable cw
 #define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
 #define USE_WEBCLIENT_HTTPS //für HA benötigt
 #define USE_HTML_CALLBACK //für Smartmeter Descriptor dropdown list smlpd()
