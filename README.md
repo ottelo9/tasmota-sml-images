@@ -68,6 +68,9 @@ ESP8266:
 Um alle gleichzeitig zu erstellen:  
 `platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("ottelo")) | select(test("ottelo_base") | not) | sub("env:"; "-e ")')`
 
+Linux Script um danach alle Images in zip-Archive zu packen:
+[make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)
+
 
 ### (Factory)Image übertragen / flashen
 [Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
