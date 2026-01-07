@@ -17,6 +17,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | tasmota32x_ottelo      | ESP32 Variante z.B. c3, s3 (solo1, s3 mit Ethernet Support) |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
+| Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! |
 | tasmota1m_ottelo         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf |
 | tasmota4m_ottelo         | ESP mit 4M+ Flash (auch für Steckdosen mit Energiemessung und mit Shelly, EcoTracker Emulation (+mDNS)) |
 | tasmota1m_energy_ottelo  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Web-Upgrade nur über tasmota-minimal! |
