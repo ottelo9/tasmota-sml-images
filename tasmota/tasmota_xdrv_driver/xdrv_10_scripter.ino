@@ -817,6 +817,7 @@ typedef struct {
 #ifdef USE_PLAY_WAVE
 #ifdef ESP32
   i2s_chan_handle_t tx_handle;
+  i2s_chan_handle_t rx_handle;
 #endif
 #endif
 
@@ -2861,6 +2862,9 @@ int32_t fetch_jpg(uint32_t sel, char *url, uint32_t xp, uint32_t yp, uint32_t sc
       // resume drawing
       glob_script_mem.jpg_task.draw = true;
       break;
+    case 5:
+      return glob_script_mem.jpg_task.http.connected();
+
   }
   return 0;
 }
@@ -5198,7 +5202,7 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
                 fvar = fetch_jpg(0, url, xp, yp, scale);
               }
               break;
-            case 1:
+            case 6:
               {
                 char file[SCRIPT_MAX_SBSIZE];
                 lp = GetStringArgument(lp, OPER_EQU, file, 0);
@@ -5704,13 +5708,8 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
         if (!strncmp_XP(lp, XPSTR("rr("), 3)) {
           lp += 4;
           len = 0;
-          const char *cp = GetResetReason().c_str();
           if (sp) {
-              if (cp) {
-                strlcpy(sp, cp, glob_script_mem.max_ssize);
-              } else {
-                strlcpy(sp, "-", glob_script_mem.max_ssize);
-              }
+            strlcpy(sp, GetResetReason().c_str(), glob_script_mem.max_ssize);
           }
           goto strexit;
         }
@@ -6637,7 +6636,18 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
           goto strexit;
         }
 #endif // USE_FEXTRACT
-
+        if (!strncmp_XP(vname, XPSTR("sota("), 5)) {
+          char *ota;
+          SCRIPT_SKIP_SPACES
+          lp = GetLongIString(lp + 5, &ota);
+          if (*ota == 0) {
+            fvar = SettingsUpdateText(SET_OTAURL, PSTR(OTA_URL));
+          } else {
+            fvar = SettingsUpdateText(SET_OTAURL, ota);
+          }
+          free(ota);
+          goto nfuncexit;
+        }
         break;
 
       case 't':
@@ -7574,7 +7584,7 @@ int32_t play_wave(char *path) {
     uint8_t mode = strtol(cp, &cp, 10);
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, &glob_script_mem.tx_handle, NULL);
+    i2s_new_channel(&chan_cfg, &glob_script_mem.tx_handle, nullptr);
 
     i2s_std_slot_config_t slot_cfg;
     switch (mode) {
@@ -7597,7 +7607,7 @@ int32_t play_wave(char *path) {
           .bclk = (gpio_num_t)bck,
           .ws = (gpio_num_t)ws,
           .dout = (gpio_num_t)dout,
-          .din = I2S_GPIO_UNUSED,
+          .din = (gpio_num_t)18, //I2S_GPIO_UNUSED,
           .invert_flags = {
             .mclk_inv = false,
             .bclk_inv = false,
@@ -7653,6 +7663,7 @@ int32_t play_wave(char *path) {
 
 #ifdef ESP32
   i2s_channel_enable(glob_script_mem.tx_handle);
+  i2s_channel_enable(glob_script_mem.rx_handle);
   while (wf.position() < fsize) {
     int numBytes = _min(sizeof(buffer), fsize - wf.position() - 1);
     int bytesread = wf.readBytes((char*)buffer, numBytes);
@@ -10078,7 +10089,6 @@ const char HTTP_BTN_MENU_RULES[] PROGMEM =
   "<p></p><form action='" WEB_HANDLE_SCRIPT "' method='get'><button>" D_CONFIGURE_SCRIPT "</button></form>";
 
 const char HTTP_FORM_SCRIPT[] PROGMEM =
-    "<fieldset><legend><b>&nbsp;" D_SCRIPT "&nbsp;</b></legend>"
     "<form method='post' action='" WEB_HANDLE_SCRIPT "'>";
 
 const char HTTP_FORM_SCRIPT1[] PROGMEM =
@@ -10486,6 +10496,7 @@ void HandleScriptConfiguration(void) {
 
     WSContentStart_P(PSTR(D_CONFIGURE_SCRIPT));
     WSContentSendStyle();
+    WSContentSend_P(HTTP_FIELDSET_LEGEND, PSTR(D_SCRIPT));
     WSContentSend_P(HTTP_FORM_SCRIPT);
 
 #ifdef xSCRIPT_STRIP_COMMENTS
@@ -12101,7 +12112,7 @@ uint32_t fsize;
       if (renderer->disp_bpp & 0x40) {
         dmflg = 1;
       }
-      int8_t bpp = renderer->disp_bpp & 0xbf;;
+      int8_t bpp = renderer->disp_bpp & 0xbf;
       uint8_t *lbp;
       uint8_t fileHeader[fileHeaderSize];
       createBitmapFileHeader(Settings->display_height , Settings->display_width , fileHeader);
@@ -13065,8 +13076,10 @@ const char *gc_str;
           uint8_t from;
           uint8_t to;
           if (pulabel[1] == 'g') {
-            cp++;
             flg = 1;
+            if (pulabel[2] == 'r') {
+              flg = 2;
+            }
             from = 0;
             to = MAX_USER_PINS + MIN_FLASH_PINS - 1;
           } else {
@@ -13084,8 +13097,12 @@ const char *gc_str;
             if (val == index) {
               strcpy_P(option, PSTR("selected"));
             }
-
-            uint8_t disabled = FlashPin(cnt) || RedPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            uint8_t disabled;
+            if (flg == 2) {
+              disabled = FlashPin(cnt) || RedPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            } else {
+              disabled = FlashPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            }
             if (flg && disabled) {
               strcpy_P(option, PSTR("disabled"));
             }
