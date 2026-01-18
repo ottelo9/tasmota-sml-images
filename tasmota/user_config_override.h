@@ -68,7 +68,7 @@
 
 //siehe platformio_tasmota_cenv.ini
 #if ( defined(TASMOTA32_OTTELO)       || defined(TASMOTA32C3_OTTELO)       || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || \
-      defined(TASMOTA32SOLO1_OTTELO)  || defined(TASMOTA32_BERRY_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
+      defined(TASMOTA32SOLO1_OTTELO)  || defined(TASMOTA32BERRY_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
       defined(TASMOTA1M_OTTELO)       || defined(TASMOTA1M_SHELLY_OTTELO)  || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
@@ -85,10 +85,6 @@
 #undef USE_SONOFF_IFAN
 #undef USE_BUZZER
 #undef USE_ARILUX_RF
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
-  #define USE_DEEPSLEEP //1KB
-#endif
-#undef USE_DEEPSLEEP
 #undef USE_SHUTTER
 #undef USE_EXS_DIMMER
 #undef USE_DEVICE_GROUPS
@@ -110,10 +106,10 @@
 #undef USE_LIGHT_PALETTE
 #undef USE_LIGHT_VIRTUAL_CT
 #undef USE_DGR_LIGHT_SEQUENCE
-#undef USE_DS18x20
 #undef USE_SERIAL_BRIDGE  //https://tasmota.github.io/docs/Serial-to-TCP-Bridge/#serial-to-tcp-bridge
 #undef USE_ENERGY_DUMMY
 
+// diese Treiber/Features sind !nicht! im ESP8266-1M,-4M und -1M-Shelly Image inkludiert, sondern nur 1M-Energy oder ESP32
 #if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA4M_OTTELO))
   #undef USE_I2C            // I2C ist für die nachfolgenden Treiber erforderlich.
   #undef USE_ENERGY_SENSOR  // Ist für die nachfolgenden Treiber erforderlich.
@@ -121,6 +117,10 @@
   #undef USE_CSE7766        // SonOff POW R2 (ESP8266)
   #undef USE_BL09XX         // SonOff Dual R3 v2 (ESP8266) / Shelly Plus Plug S (ESP32) / Gosund EP2 (ESP8266)
   #undef USE_DHT            // DHT11, AM2301 (DHT21, DHT22, AM2302, AM2321) and SI7021 Temperature and Humidity sensor (1k6 code)
+  #undef USE_DS18x20        // Temperature Sensoren z.B. DS18B20
+  #undef USE_DEEPSLEEP      // +1K https://tasmota.github.io/docs/DeepSleep/
+#else
+  #define USE_BMP           // +4K BMP085 BMP180 BMP280 BME280 BME680 (standardmäßig nicht enthalten)!
 #endif
 
 #undef USE_PZEM004T
@@ -128,6 +128,7 @@
 #undef USE_PZEM_DC
 #undef USE_MCP39F501
 #undef USE_IR_REMOTE
+#undef GV_USE_ESPINFO //ESP8266 info (+2k1 code) ab 15.2.0
 //ESP32 only features
 #undef USE_GPIO_VIEWER
 #undef USE_ADC
@@ -250,7 +251,35 @@
 //#define USE_DISPLAY_TM1621_SONOFF //4KB
 //#define USE_SENDMAIL
 
-#endif // TASMOTA32 OTTELO
+//-- OTA Urls
+#undef OTA_URL
+#if defined(TASMOTA32_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32_ottelo.bin"
+#elif defined(TASMOTA32C3_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c3_ottelo.bin"
+#elif defined(TASMOTA32C6_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c6_ottelo.bin"
+#elif defined(TASMOTA32S2_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s2_ottelo.bin"
+#elif defined(TASMOTA32S3_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_ottelo.bin"
+#elif defined(TASMOTA32SOLO1_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32solo1_ottelo.bin"
+#elif defined(TASMOTA32BERRY_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32berry_ottelo.bin"
+#elif defined(TASMOTA32P4_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4_ottelo.bin"
+#elif defined(TASMOTA1M_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota1m_ottelo.bin.gz"
+#elif defined(TASMOTA1M_SHELLY_OTTELO)
+  #define OTA_URL "Upgrade nur via minimal.bin moeglich!"
+#elif defined(TASMOTA1M_ENERGY_OTTELO)
+  #define OTA_URL "Upgrade nur via minimal.bin moeglich!"
+#elif defined(TASMOTA4M_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota4m_ottelo.bin.gz"
+#endif
+
+#endif // TASMOTA OTTELO
 
 
 #endif  // _USER_CONFIG_OVERRIDE_H_

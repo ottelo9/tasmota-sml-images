@@ -7701,8 +7701,10 @@ char *exfile(char *lp, TS_FLOAT *error) {
       if (script) {
         memset(script, 0, fsiz + 16);
         ef.read((uint8_t*)script, fsiz);
+        char *svbu = glob_script_mem.scriptptr_bu;
         glob_script_mem.scriptptr_bu = script;
         execute_script(script);
+        glob_script_mem.scriptptr_bu = svbu;
         free(script);
       }
     }
@@ -10436,9 +10438,9 @@ void HandleScriptTextareaConfiguration(void) {
             ep[0] = '>';
             ep[slen - 1] = '#';
             file.write((const uint8_t*)ep, slen);
+            file.close();
             // restore to enable >F find
             ep[slen - 1] = '>';
-            file.close();
           } else {
             ufsp->remove(fname);
           }
@@ -10447,7 +10449,6 @@ void HandleScriptTextareaConfiguration(void) {
           if (ep) {
             // has >F section
             slen = section_seek_end(ep + 2);
-            strcpy_P(fname, PSTR("/sml_stask.tas"));
             file = ufsp->open(fname, FS_FILE_WRITE);
             ep++;
             ep[0] = '>';

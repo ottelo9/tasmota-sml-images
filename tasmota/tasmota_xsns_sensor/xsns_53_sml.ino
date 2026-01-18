@@ -3419,7 +3419,7 @@ void SML_Init(void) {
           index = *lp1 & 7;
           lp1 += 2;
           if (index < 1 || index > sml_globs.meters_used) {
-            AddLog(LOG_LEVEL_INFO, PSTR("illegal meter number!"));
+            AddLog(LOG_LEVEL_INFO, PSTR("SML: illegal meter number!"));
             goto next_line;
           }
           index--;
@@ -3448,7 +3448,7 @@ void SML_Init(void) {
           } else {
             srcpin  = strtol(lp1, &lp1, 10);
             if (Gpio_used(abs(srcpin))) {
-              AddLog(LOG_LEVEL_INFO, PSTR("SML: Error: Duplicate GPIO %d defined. Not usable for RX in meter number %d"), abs(srcpin), index + 1);
+              AddLog(LOG_LEVEL_INFO, PSTR("SML: Duplicate GPIO %d defined. Not usable for RX in meter number %d"), abs(srcpin), index + 1);
 dddef_exit:
               if (sml_globs.script_meter) free(sml_globs.script_meter);
               sml_globs.script_meter = 0;
@@ -3598,7 +3598,6 @@ dddef_exit:
 				lp += SML_getlinelen(lp);
 #endif // SML_REPLACE_VARS
 
-        //AddLog(LOG_LEVEL_INFO, PSTR("%s"),dstbuf);
         if (*lp1 == '-' || isdigit(*lp1)) {
           //toLogEOL(">>",lp);
           // add meters line -1,1-0:1.8.0*255(@10000,H2OIN,cbm,COUNTER,4|
@@ -3854,11 +3853,19 @@ next_line:
 #endif // ESP8266
 
 #ifdef ESP32
-        // use hardware serial
-        if (mp->uart_index >= 0) {
-          uart_index = mp->uart_index;
+        if (mp->srcpin >= 0) {
+          // use hardware serial
+          if (mp->srcpin == mp->trxpin) {
+            AddLog(LOG_LEVEL_INFO, PSTR("SML: REC pin must not be equal to TRX pin"));
+            return;
+          }
+          if (mp->uart_index >= 0) {
+            uart_index = mp->uart_index;
+          }
+          AddLog(LOG_LEVEL_INFO, PSTR("SML: uart used: %d"),uart_index);
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("SML: software serial with pin: %d"),mp->srcpin);
         }
-        AddLog(LOG_LEVEL_INFO, PSTR("SML: uart used: %d"),uart_index);
 #ifdef USE_ESP32_SW_SERIAL
         mp->meter_ss = new SML_ESP32_SERIAL(uart_index);
         if (mp->srcpin >= 0) {
