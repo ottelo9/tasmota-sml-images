@@ -37,6 +37,8 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/`tasmota/user_config_override.h`
 - TasmotaProjekt/`platformio_tasmota_cenv.ini`
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino)
+- TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xsns_sensor/xsns_53_sml.ino)
+- TasmotaProjekt/boards/`esp32s3-qio.json` <- (optional) für ESP32-S3 Image (siehe `platformio_tasmota_cenv.ini`) ohne PSRAM Support, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32)
 
 Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
