@@ -5502,7 +5502,7 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
           fvar = script_mdns(name, mac, type);
           goto nfuncexit;
         }
-  #endif // USE_SCRIPT_MDNS
+#endif // USE_SCRIPT_MDNS
         break;
 
       case 'n':
@@ -5729,7 +5729,7 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
         }
         if (!strncmp_XP(lp, XPSTR("round("), 6)) {
           lp = GetNumericArgument(lp + 6, OPER_EQU, &fvar, gv);
-          fvar = floorf(fvar);
+          fvar = roundf(fvar);
           goto nfuncexit;
         }
 #endif
@@ -11924,7 +11924,8 @@ void WebServer82Init(void) {
 
 const char HTTP_SCRIPT_MIMES[] PROGMEM =
   "HTTP/1.1 200 OK\r\n"
-  "Content-disposition: inline; "
+  "Content-disposition: inline\r\n"
+  "Content-Length: %d\r\n"
   "Content-type: %s\r\n\r\n";
 
 void ScriptServeFile(void) {
@@ -12063,16 +12064,26 @@ uint32_t fsize;
 
   if (!buff[0]) return -2;
 
+#define fileHeaderSize 14
+#define infoHeaderSize 40
+
   if (!sflg) {
     if (!ufsp->exists(path)) {
       return -1;
     }
     file = ufsp->open(path, FS_FILE_READ);
     fsize = file.size();
+  } else {
+#ifdef USE_DISPLAY_DUMP
+    if (renderer && (renderer->framebuffer || renderer->rgb_fb)) {
+      fsize = Settings->display_width * Settings->display_height * 3;
+      fsize += fileHeaderSize + infoHeaderSize;
+    }
+#endif
   }
 
   if (0 == stype) {
-    WSContentSend_P(HTTP_SCRIPT_MIMES, buff);
+    WSContentSend_P(HTTP_SCRIPT_MIMES, fsize, buff);
     WSContentFlush();
     client = Webserver->client();
   } else {
@@ -12096,13 +12107,7 @@ uint32_t fsize;
 
   if (sflg) {
 #ifdef USE_DISPLAY_DUMP
-//#include <renderer.h>
-//extern Renderer *renderer;
-
     // screen copy
-    #define fileHeaderSize 14
-    #define infoHeaderSize 40
-
      if (renderer && (renderer->framebuffer || renderer->rgb_fb)) {
       uint8_t *bp = renderer->framebuffer;
       uint16_t *dwp = renderer->rgb_fb;
@@ -12110,10 +12115,14 @@ uint32_t fsize;
       memset(lbuf, 0, Settings->display_width * 3);
       if (!lbuf) return -3;
       uint8_t dmflg = 0;
-      if (renderer->disp_bpp & 0x40) {
-        dmflg = 1;
+      int8_t bpp = renderer->disp_bpp;
+      if (bpp > 0) {
+        if (bpp & 0x40) {
+          dmflg = 1;
+        }
+        bpp &= 0xbf;
       }
-      int8_t bpp = renderer->disp_bpp & 0xbf;
+
       uint8_t *lbp;
       uint8_t fileHeader[fileHeaderSize];
       createBitmapFileHeader(Settings->display_height , Settings->display_width , fileHeader);
@@ -12121,8 +12130,10 @@ uint32_t fsize;
       uint8_t infoHeader[infoHeaderSize];
       createBitmapInfoHeader(Settings->display_height, Settings->display_width, infoHeader );
       client.write((uint8_t *)infoHeader, infoHeaderSize);
+
       if (bpp < 0) {
-        for (uint32_t lins = Settings->display_height - 1; lins >= 0 ; lins--) {
+        // standard bw like sh1106, ,must set pixels to -1
+        for (int32_t lins = Settings->display_height - 1; lins >= 0 ; lins--) {
           lbp = lbuf;
           for (uint32_t cols = 0; cols < Settings->display_width; cols ++) {
             uint8_t pixel = 0;
@@ -12134,9 +12145,11 @@ uint32_t fsize;
             *lbp++ = pixel;
           }
           client.write((const char*)lbuf, Settings->display_width * 3);
+          client.flush();
         }
       } else {
         for (uint32_t lins = 0; lins < Settings->display_height; lins++) {
+          //AddLog(LOG_LEVEL_INFO, PSTR(">>> %d"), lins);
           lbp = lbuf + (Settings->display_width * 3);
           if (bpp == 4) {
             // 16 gray scales
@@ -12218,6 +12231,7 @@ uint32_t fsize;
           }
           client.write((const char*)lbuf, Settings->display_width * 3);
           client.flush();
+          yield();
         }
       }
       if (lbuf) free(lbuf);
@@ -12281,6 +12295,7 @@ uint32_t fsize;
       if (len > fsize) len = fsize;
       file.read((uint8_t *)buff, len);
       client.write((const char*)buff, len);
+      client.flush();
       fsize -= len;
     }
     file.close();
