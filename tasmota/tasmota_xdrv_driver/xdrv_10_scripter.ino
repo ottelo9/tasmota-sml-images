@@ -617,13 +617,6 @@ typedef struct {
 } ScriptOneWire;
 #endif // USE_SCRIPT_ONEWIRE
 
-typedef struct {
-    char shelly_name[26];
-    char shelly_gen[2];
-    char shelly_fw_id[32];
-    char type[16];
-} SCRIPT_MDNS;
-
 #define SFS_MAX 4
 // global memory
 typedef struct {
@@ -679,10 +672,6 @@ typedef struct {
     char *packet_buffer;
     uint16_t pb_size = SCRIPT_UDP_BUFFER_SIZE;
 #endif // USE_SCRIPT_GLOBVARS
-
-#ifdef USE_SCRIPT_MDNS
-    SCRIPT_MDNS mdns = {"","2","20241011-114455/1.4.4-g6d2a586",""};
-#endif // USE_SCRIPT_MDNS
 
     char web_mode;
     char *glob_script = 0;
@@ -909,87 +898,75 @@ char *exfile(char *lp, TS_FLOAT *error);
 #ifdef USE_SCRIPT_MDNS
 int32_t script_mdns(char *name, char *mac, char *xtype) {
 
-  strcpy(glob_script_mem.mdns.type, xtype);
-  char shelly_mac[13];
-  if (*name == '-'){
-    strcpy(glob_script_mem.mdns.shelly_name, TasmotaGlobal.hostname);
+  char mdns_type[16];
+  strcpy(mdns_type, xtype);
+
+  char mdns_mac[13];
+  if (*mac == '-') {
+    //MAC from tasmota
+    String strMac = NetworkMacAddress();  // "AA:BB:CC:DD:EE:FF" WiFi or Ethernet
+    strMac.toLowerCase();
+    strMac.replace(":", "");              // "aabbccddeeff"
+    strcpy(mdns_mac, strMac.c_str());
   } else {
-    strcpy(glob_script_mem.mdns.shelly_name, name);
-    if (*mac == '-') {
-      uint8_t mac[6];
-      WiFi.macAddress(mac);
-      sprintf(shelly_mac, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-      strcat(glob_script_mem.mdns.shelly_name, shelly_mac);
-    } else {
-      strcat(glob_script_mem.mdns.shelly_name, mac);
-    }
-  }
-  
-  uint8_t emu_choice;
-  if (!strcmp(xtype, "everhome")) {
-    emu_choice = 1;
-  } else {
-    emu_choice = 0; //default = shelly  
+    //MAC from script
+    strcpy(mdns_mac, mac);
   }
 
-  if (!MDNS.begin(glob_script_mem.mdns.shelly_name)) {
+  char mdns_name[26];
+  if (*name == '-') {
+    //mdns name from hostname (e.g. tasmota-MAC)
+    strcpy(mdns_name, NetworkHostname());
+  } else {
+    //mdns name from script and add MAC (e.g. shellypro3em-MAC)
+    strcpy(mdns_name, name);
+    strcat(mdns_name, mdns_mac);
+  }
+  
+  uint8_t emu_choice = 0;
+  if (!strcmp(mdns_type, "everhome")) {
+    emu_choice = 1; // ecotracker
+  } else if (!strcmp(mdns_type, "shelly")) {
+    emu_choice = 2; // shelly
+  }
+
+  if (!MDNS.begin(mdns_name)) {
     AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: Error setting up MDNS responder!"));
   }
 
-#ifdef ESP32
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addService((const char*)glob_script_mem.mdns.type, "tcp", 80);
+    if (emu_choice == 1) { // ecotracker
+      MDNS.addService("everhome", "tcp", 80);
+      // everhome TXT
+      MDNS.addServiceTxt("everhome", "tcp", "ip", NetworkAddress().toString().c_str());
+      MDNS.addServiceTxt("everhome", "tcp", "serial", (const char*)mdns_mac);
+      MDNS.addServiceTxt("everhome", "tcp", "productid", "1137");
+    } else if (emu_choice == 2) { //shelly
+      #define SCRIPT_MDNS_SHELLY_FW_ID "20241011-114455/1.4.4-g6d2a586"
+      #define SCRIPT_MDNS_SHELLY_ARCH  "esp8266"
+      #define SCRIPT_MDNS_SHELLY_GEN   "2"
+      #define SCRIPT_MDNS_SHELLY_ID    ""
 
-    if (emu_choice == 1) {
-      mdns_txt_item_t serviceTxtData[2] = {
-        { "name", glob_script_mem.mdns.shelly_name },
-        { "id", glob_script_mem.mdns.shelly_name }
-      };
-      mdns_service_instance_name_set("_http", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_http", "_tcp", serviceTxtData, 2);
-      mdns_service_instance_name_set("_shelly", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_everhome", "_tcp", serviceTxtData, 2);
-    } else {
-      mdns_txt_item_t serviceTxtData[4] = {
-        { "fw_id", glob_script_mem.mdns.shelly_fw_id },
-        { "arch", "esp8266" },
-        { "id", glob_script_mem.mdns.shelly_name },
-        { "gen", glob_script_mem.mdns.shelly_gen }
-      };
-      mdns_service_instance_name_set("_http", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_http", "_tcp", serviceTxtData, 4);
-      mdns_service_instance_name_set("_shelly", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_shelly", "_tcp", serviceTxtData, 4);
+      // _http._tcp
+      MDNS.addService("http", "tcp", 80);
+      // _shelly._tcp
+      MDNS.addService("shelly", "tcp", 80);
+      // http TXT
+      MDNS.addServiceTxt("http",   "tcp", "fw_id", SCRIPT_MDNS_SHELLY_FW_ID);
+      MDNS.addServiceTxt("http",   "tcp", "arch",  SCRIPT_MDNS_SHELLY_ARCH);
+      MDNS.addServiceTxt("http",   "tcp", "id",    SCRIPT_MDNS_SHELLY_ID);
+      MDNS.addServiceTxt("http",   "tcp", "gen",   SCRIPT_MDNS_SHELLY_GEN);
+      // shelly TXT
+      MDNS.addServiceTxt("shelly", "tcp", "fw_id", SCRIPT_MDNS_SHELLY_FW_ID);
+      MDNS.addServiceTxt("shelly", "tcp", "arch",  SCRIPT_MDNS_SHELLY_ARCH);
+      MDNS.addServiceTxt("shelly", "tcp", "id",    SCRIPT_MDNS_SHELLY_ID);
+      MDNS.addServiceTxt("shelly", "tcp", "gen",   SCRIPT_MDNS_SHELLY_GEN);
+    } else { //unknown service from Script (not shelly or everhome)
+      MDNS.addService((const char*)mdns_type, "tcp", 80);
+      MDNS.addServiceTxt(mdns_type, "tcp", "ip", NetworkAddress().toString().c_str());
+      MDNS.addServiceTxt(mdns_type, "tcp", "serial", (const char*)mdns_mac);
     }
-#else
-    hMDNSService = MDNS.addService(0, "http", "tcp", 80);
-    hMDNSService2 = MDNS.addService(0, glob_script_mem.mdns.type, "tcp", 80);
-    if (hMDNSService) {
-      MDNS.setServiceName(hMDNSService, glob_script_mem.mdns.shelly_name);
-      if (emu_choice == 1) {
-        MDNS.addServiceTxt(hMDNSService, "name", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService, "id", glob_script_mem.mdns.shelly_name);
-      } else {
-        MDNS.addServiceTxt(hMDNSService, "fw_id", glob_script_mem.mdns.shelly_fw_id);
-        MDNS.addServiceTxt(hMDNSService, "arch", "esp8266");
-        MDNS.addServiceTxt(hMDNSService, "id", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService, "gen", glob_script_mem.mdns.shelly_gen);
-      }
-    }
-    if (hMDNSService2) {
-      MDNS.setServiceName(hMDNSService2, glob_script_mem.mdns.shelly_name);
-      if (emu_choice == 1) {
-        MDNS.addServiceTxt(hMDNSService2, "name", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService2, "id", glob_script_mem.mdns.shelly_name);
-      } else {
-        MDNS.addServiceTxt(hMDNSService2, "fw_id", glob_script_mem.mdns.shelly_fw_id);
-        MDNS.addServiceTxt(hMDNSService2, "arch", "esp8266");
-        MDNS.addServiceTxt(hMDNSService2, "id", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService2, "gen", glob_script_mem.mdns.shelly_gen);
-      }
-    }
-#endif
-  AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: mDNS started with service tcp and %s. Hostname: %s"), glob_script_mem.mdns.type, glob_script_mem.mdns.shelly_name);
+
+  AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: mDNS started with service tcp and %s. Hostname: %s"), mdns_type, mdns_name);
   return 0;
 }
 #endif // USE_SCRIPT_MDNS
@@ -13022,7 +12999,7 @@ const char *gc_str;
       lp = GetStringArgument(lp, OPER_EQU, right, 0);
       SCRIPT_SKIP_SPACES
 
-      WSContentSend_P(SCRIPT_MSG_SLIDER, left, mid, right, (uint32_t)min, (uint32_t)max, (uint32_t)val, vname);
+      WSContentSend_P(SCRIPT_MSG_SLIDER, left, mid, right, (int32_t)min, (int32_t)max, (int32_t)val, vname);
       lp++;
 
     } else if (!strncmp_P(lin, PSTR("ck("), 3)) {
