@@ -1,7 +1,7 @@
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/ottelo9/tasmota-sml-images?style=for-the-badge)](https://github.com/ottelo9/tasmota-sml-images/releases/latest)
 [![GitHub All Releases](https://img.shields.io/github/downloads/ottelo9/tasmota-sml-images/total?logo=github&style=for-the-badge)](https://github.com/ottelo9/tasmota-sml-images/releases/latest)
 
-## Fertige Tasmota Images/Firmware mit SML/Script Support
+## Tasmota Images (Firmware) mit SML/Script Support [von Ottelo]
 Die fertigen Images findet ihr im Release Bereich. Einfach das korrekte Image für euren ESP herunterladen, entpacken und entweder über OTA oder über einen Flasher+Kabel übertragen.
 Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/). Welche Tasmota Features aktiviert/deaktiviert sind findet ihr im Release.  
   
