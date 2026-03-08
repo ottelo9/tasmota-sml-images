@@ -24,12 +24,27 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | tasmota1m_shelly_ottelo  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Für Scripte siehe, [ESP8266 Scripte - Ordner komprimiert](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
 | tasmota-minimal          | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
-Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. Im ZIP-Archiv für den ESP8266 befinden sich alle Varianten gesammelt im bin.gz Format. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden. Zum erstmaligen Flashen via USB-Flasher muss die .gz entpackt werden.
+Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. Im ZIP-Archiv für den ESP8266 befinden sich alle Varianten gesammelt im bin.gz Format. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden. Zum erstmaligen Flashen via USB-Flasher muss die .gz entpackt werden.  
+
+### (Factory)Image übertragen / flashen
+Falls Tasmota bereits auf dem ESP ist, werden die Images einfach via OTA übertragen (Firmware Upgrade -> Use file upload)  
+Ist das nicht der Fall muss das (Factory ESP32) Image (.bin) geflasht werden z.B. mit [Tasmota Web Installer](https://tasmota.github.io/install/)   
+I.d.R. haben die ESP Boards eine USB-Buchse, die am PC einen COM-Port zur Verfügung stellen. Über diese wird das Image dann geflasht. Ist sowas nicht vorhanden braucht ihr einen USB-Seriell Adapter.  
+
+### Passende Tasmota SML / Shelly / EcoTracker Scripte
+Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
 ### Shelly Pro 3EM / EcoTracker Emulation für smarte Akkus (wie z.B. Marstek Venus C,E, Jupiter, Hoymiles, Growatt NOAH 2000)
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas). Das alles haben wir dem Tasmota Script Entwickler [gemu2015](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas) zu verdanken, der es zusammen mit Kalle entwickelt und getestet hat! Siehe auch [im Forum](https://forum.creationx.de/forum/index.php?thread/1095-d0-z%C3%A4hler-sml-auslesen-mit-tasmota/&pageNo=110). Gemu2015 hat ein Testscript zusammen mit Kalle erstellt. Ich habe die Teile aus dem Script entnommen, optimiert und eigene Scripte entworfen [siehe hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
-# Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266
+## TinyC - Alternative zum Scripting/Berry
+- **NEU: TinyC** von [gemu2015](https://github.com/gemu2015) hinzugefügt (Script ist weiterhin mit drin) !! Eine sehr gute und schnelle Alternative zum Scripting/Berry. Ich könnt nun eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
+=> hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
+=> Damit die IDE funktioniert müsst ihr die [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tasmota/tinyc/tinyc_ide.html.gz) via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
+<img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
+<img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
+
+## Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
@@ -74,15 +89,6 @@ Um alle gleichzeitig zu erstellen:
 Linux Script um danach alle Images in zip-Archive zu packen:
 [make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)
 
-
-### (Factory)Image übertragen / flashen
-[Tasmota Web Installer](https://tasmota.github.io/install/) (ESP32: nur Factory Images)  
-Die ESP32 Non-Factory Images überträgt man via OTA (Firmware Upgrade -> Use file upload)  
-
-Der ESP32-S2 hat einen integrierten USB-Controller und ist direkt mit der USB-Buchse verbunden. Den Treiber dafür könnt ihr hier herunterladen: https://zadig.akeo.ie/
-
-### Passende SML Scripte
-Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
 ### Infos
 Mehr Infos bzgl. ESP32 Versionen:  
