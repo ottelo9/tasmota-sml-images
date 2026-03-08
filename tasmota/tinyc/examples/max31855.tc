@@ -1,0 +1,79 @@
+// MAX31855 Thermocouple Sensor Driver (SPI)
+// Reads 14-bit thermocouple temperature via SPI
+// Demonstrates: spiInit, spiSetCS, spiTransfer, WebCall, JsonCall
+
+#define CS_PIN   5
+#define SPI_MHZ  4
+
+float tc_temp = 0.0;
+int tc_ok = 0;
+int tc_fault = 0;
+char tc_lbl[32];
+
+void EverySecond() {
+    // Read 4 bytes from MAX31855 (read-only device, MOSI not needed)
+    char buf[4];
+    buf[0] = 0;
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    int n = spiTransfer(1, buf, 4, 1);
+    if (n != 4) {
+        tc_ok = 0;
+        return;
+    }
+
+    // Check fault bit (bit 16 = buf[1] bit 0)
+    if (buf[1] & 0x01) {
+        tc_fault = buf[3] & 0x07;  // fault code in lowest 3 bits of byte 3
+        tc_ok = 0;
+        return;
+    }
+
+    // Thermocouple temp: bits 31..18 = 14-bit signed value in buf[0..1]
+    // buf[0] = bits 31..24, buf[1] = bits 23..16
+    int raw = ((buf[0] << 8) | buf[1]) >> 2;  // shift out bits 17..16
+    if (raw & 0x2000) {
+        raw = raw - 16384;  // sign extend 14-bit to int
+    }
+    tc_temp = (float)raw * 0.25;
+    tc_ok = 1;
+    tc_fault = 0;
+}
+
+void WebCall() {
+    char out[64];
+    if (tc_ok) {
+        LGetString(0, tc_lbl);
+        strcpy(out, "{s}MAX31855 ");
+        strcat(out, tc_lbl);
+        strcat(out, "{m}");
+        webSend(out);
+        sprintfFloat(out, "%.1f &deg;C{e}", tc_temp);
+        webSend(out);
+    } else if (tc_fault) {
+        sprintfInt(out, "{s}MAX31855{m}Fault 0x%02X{e}", tc_fault);
+        webSend(out);
+    } else {
+        webSend("{s}MAX31855{m}no data{e}");
+    }
+}
+
+void JsonCall() {
+    if (!tc_ok) return;
+    char out[64];
+    sprintfFloat(out, ",\"MAX31855\":{\"Temperature\":%.1f}", tc_temp);
+    responseAppend(out);
+}
+
+int main() {
+    // Init hardware SPI at 4 MHz (read-only, no MOSI needed)
+    spiInit(-1, -1, -1, SPI_MHZ);
+    spiSetCS(1, CS_PIN);
+
+    tc_ok = 0;
+    tc_fault = 0;
+    tc_temp = 0.0;
+    printStr("MAX31855 thermocouple driver ready\n");
+    return 0;
+}

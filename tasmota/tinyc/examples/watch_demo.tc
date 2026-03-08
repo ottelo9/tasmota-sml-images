@@ -1,0 +1,44 @@
+// Watch Variables Demo
+// Demonstrates change detection for IOT monitoring
+// watch keyword tracks variable changes automatically
+
+watch float power;
+watch int relay;
+int cycle;
+
+void EverySecond() {
+    cycle++;
+
+    // Simulate sensor reading changing every 3 seconds
+    if (cycle % 3 == 0) {
+        power = (float)(cycle * 10);
+    }
+
+    // Simulate relay toggle every 5 seconds
+    if (cycle % 5 == 0) {
+        if (relay) { relay = 0; } else { relay = 1; }
+    }
+
+    // Check for power changes
+    if (changed(power)) {
+        float diff = delta(power);
+        print(power);
+        print(diff);
+        snapshot(power);
+    }
+
+    // Check for relay changes
+    if (written(relay)) {
+        print(relay);
+        snapshot(relay);
+    }
+}
+
+int main() {
+    power = 0.0;
+    relay = 0;
+    cycle = 0;
+    snapshot(power);
+    snapshot(relay);
+    return 0;
+}

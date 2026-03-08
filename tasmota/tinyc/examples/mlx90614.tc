@@ -1,0 +1,150 @@
+// MLX90614 Infrared Non-Contact Thermometer Driver
+// I2C address: 0x5A, no initialization needed
+// Reads object temperature (0x07) and ambient temperature (0x06)
+// SMBus protocol: LSB-first, 3 bytes per read (LSB, MSB, PEC)
+// PEC = CRC-8 with polynomial 0x07
+
+#define MLX_ADDR   0x5A
+#define MLX_TA     0x06
+#define MLX_TOBJ1  0x07
+
+float mlx_obj = 0.0;
+float mlx_amb = 0.0;
+int mlx_ok = 0;
+int mlx_addr = 0;
+int mlx_bus = 0;
+
+char mlx_buf[6];
+
+// CRC-8 for SMBus PEC (polynomial 0x07, init 0x00)
+int mlx_crc8(int start, int len) {
+    int crc = 0;
+    int i = 0;
+    while (i < len) {
+        crc = crc ^ mlx_buf[start + i];
+        int bit = 0;
+        while (bit < 8) {
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc = crc << 1;
+            }
+            crc = crc & 0xFF;
+            bit++;
+        }
+        i++;
+    }
+    return crc;
+}
+
+// Read 16-bit value from register with PEC verification
+// Returns raw value or -1 on error
+int mlx_read16(int reg) {
+    if (!i2cReadRS(mlx_addr, reg, mlx_buf, 3, mlx_bus)) {
+        return -1;
+    }
+
+    int lsb = mlx_buf[0];
+    int msb = mlx_buf[1];
+    int pec = mlx_buf[2];
+
+    // Build PEC check buffer: [addr_W, reg, addr_R, LSB, MSB]
+    mlx_buf[0] = mlx_addr << 1;        // address + write bit
+    mlx_buf[1] = reg;                   // register
+    mlx_buf[2] = (mlx_addr << 1) | 1;  // address + read bit
+    mlx_buf[3] = lsb;
+    mlx_buf[4] = msb;
+
+    int cpec = mlx_crc8(0, 5);
+    if (cpec != pec) {
+        return -1;  // CRC mismatch
+    }
+
+    int raw = lsb | (msb << 8);
+    if (raw & 0x8000) {
+        return -1;  // error flag
+    }
+    return raw;
+}
+
+int mlx_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        if (i2cSetDevice(MLX_ADDR, bus)) {
+            mlx_addr = MLX_ADDR;
+            mlx_bus = bus;
+            i2cSetActiveFound(mlx_addr, "MLX90614", mlx_bus);
+            return 1;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+void EverySecond() {
+    if (!mlx_addr) {
+        if (!mlx_scan()) { mlx_ok = 0; return; }
+    }
+
+    // Read object temperature (register 0x07)
+    int raw = mlx_read16(MLX_TOBJ1);
+    if (raw < 0) {
+        mlx_ok = 0;
+        return;
+    }
+    mlx_obj = (float)raw * 0.02 - 273.15;
+
+    // Read ambient temperature (register 0x06)
+    raw = mlx_read16(MLX_TA);
+    if (raw < 0) {
+        mlx_ok = 0;
+        return;
+    }
+    mlx_amb = (float)raw * 0.02 - 273.15;
+
+    mlx_ok = 1;
+}
+
+void WebCall() {
+    char buf[64];
+    if (mlx_ok) {
+        sprintfFloat(buf, "{s}MLX90614 Object{m}%.1f °C{e}", mlx_obj);
+        webSend(buf);
+        sprintfFloat(buf, "{s}MLX90614 Ambient{m}%.1f °C{e}", mlx_amb);
+        webSend(buf);
+    } else {
+        webSend("{s}MLX90614{m}no data{e}");
+    }
+}
+
+void JsonCall() {
+    if (!mlx_ok) return;
+    char buf[96];
+    sprintfFloat(buf, ",\"MLX90614\":{\"OBJTMP\":%.1f", mlx_obj);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"AMBTMP\":%.1f}", mlx_amb);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (mlx_addr) {
+        I2cResetActive(mlx_addr, mlx_bus);
+        mlx_addr = 0;
+    }
+}
+
+int main() {
+    char buf[48];
+    mlx_ok = 0;
+    mlx_addr = 0;
+
+    if (mlx_scan()) {
+        sprintfInt(buf, "MLX90614 found at 0x%x", mlx_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", mlx_bus);
+        print(buf);
+    } else {
+        print("MLX90614 not found\n");
+    }
+    return 0;
+}

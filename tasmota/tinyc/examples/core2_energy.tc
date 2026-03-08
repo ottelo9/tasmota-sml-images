@@ -1,0 +1,982 @@
+// ═══════════════════════════════════════════════════════════════════
+// Core2 Energy Monitoring System — PHASE 5: global keyword
+// Converted from Tasmota Scripter: core2_script_dev.txt
+// Uses 'global float' for automatic UDP variable updates (V5 binary)
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Energy price constants ───
+#define PRICE_GAS_KWH  12     // cents per kWh (gas: cbm * 9.9 = kwh)
+#define PRICE_STROM    40     // cents per kWh electricity
+
+// ─── Display colors (RGB565) ───
+#define COL_BLACK   0x0000
+#define COL_WHITE   0xFFFF
+#define COL_RED     0xF800
+#define COL_GREEN   0x07E0
+#define COL_BLUE    0x001F
+#define COL_YELLOW  0xFFE0
+#define COL_CYAN    0x07FF
+#define COL_MAGENTA 0xF81F
+
+// ═══════════════════════════════════════════════════════════════════
+// GLOBAL VARIABLES — UDP auto-update (received from other Tasmota devices)
+// 'global float' vars are automatically updated by the VM when UDP packets arrive
+// ═══════════════════════════════════════════════════════════════════
+
+// Solar totals and current power
+global float sedt;
+global float sedc;
+global float atmp;
+global float scol;
+global float ssp;
+global float wrgh;
+global float wrgg;
+global float wrga;
+global float auto;
+global float t_ga;
+global float t_gh;
+global float t_gg;
+global float t_wb;
+global float t_ws;
+global float t_gs;
+int bw_ww;
+global float zwzi;
+global float zwzo;
+global float zwzc;
+global float pwl;
+global float sip;
+global float sop;
+global float bip;
+global float hip;
+global float tcap;
+global float rcap;
+global float rper;
+global float wtemp;
+global float whumi;
+global float wtvoc;
+global float wco2;
+global float aztemp;
+global float azhumi;
+global float aztvoc;
+global float azeco2;
+global float bpress;
+global float btemp;
+global float bhumi;
+global float klima;
+global float pwp;
+global float t_kpwp;
+global float bwwp;
+global float bwtwp;
+global float hwp;
+global float t_hwp;
+global float train;
+global float hrain;
+global float avgt;
+global float ktmp;
+global float shtemp;
+global float phs1;
+global float phs2;
+global float phs3;
+global float gerr;
+
+// ─── Device IP strings (auto-updated via UDP) ───
+global char tv2_ip[20];
+global char us_ip[20];
+global char fs_ip[20];
+global char wz_ip[20];
+global char wzv_ip[20];
+global char azh_ip[20];
+global char kue_ip[20];
+global char flu_ip[20];
+global char sug_ip[20];
+global char nsp_ip[20];
+
+// ═══════════════════════════════════════════════════════════════════
+// PERSIST VARIABLES — survive reboot
+// ═══════════════════════════════════════════════════════════════════
+persist int hwp_m;
+persist int zrz_m;
+persist int auto_m;
+persist int gas_m;
+persist int was_m;
+
+// ═══════════════════════════════════════════════════════════════════
+// TIME-SERIES ARRAYS for daily charts (96 = 15-min intervals per day)
+// Must be float[] — WebChart reads array elements as IEEE-754 floats
+// ═══════════════════════════════════════════════════════════════════
+float t_wr1[97];
+float t_wr2[97];
+float t_wr3[97];
+float t_wr4[97];
+float t_hv[97];
+float t_atmp[97];
+float t_ktmp[97];
+float t_ss[97];
+float t_pw[97];
+float t_hzwp[97];
+float t_bwwp[97];
+float t_ni[97];
+float t_gas[97];
+float t_wa[97];
+
+// ═══════════════════════════════════════════════════════════════════
+// TIME-SERIES ARRAYS for weekly charts (168 = hours per week)
+// ═══════════════════════════════════════════════════════════════════
+float w_atmp[169];
+float w_bwp[169];
+float w_hwp[169];
+float w_gwp[169];
+float w_rain[169];
+float w_pwl[169];
+float w_sin[169];
+float w_swa[169];
+float w_hv[169];
+float w_at[169];
+float w_sk[169];
+float w_wr1[169];
+float w_wr2[169];
+float w_wr3[169];
+float w_wr4[169];
+float w_gas[169];
+float w_pgas[169];
+float w_wa[169];
+float w_avgt[169];
+float w_bwwp[169];
+
+// ─── Dummy array for unused fxto columns ───
+float a_du[169];
+
+// ═══════════════════════════════════════════════════════════════════
+// WEEKLY SUMMARY ARRAYS (7 days)
+// ═══════════════════════════════════════════════════════════════════
+float wt_hv[8];
+float wt_sin1[8];
+float wt_sin2[8];
+float wt_sin3[8];
+float wt_sin4[8];
+float wt_he[8];
+float wt_wb[8];
+float wt_wp[8];
+float wt_bwwp[8];
+float wt_hwp[8];
+float wt_rain[8];
+float wt_tmp[8];
+float wt_gas[8];
+float wt_pgas[8];
+float wt_wa[8];
+
+// ─── Live streaming array ───
+int array[5];
+
+// ─── Heat pump average tracking ───
+int hwp_avg[61];
+
+// ═══════════════════════════════════════════════════════════════════
+// LOCAL STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════════
+int tmp;
+int res;
+int cnt;
+int hr;
+int fr;
+int fsiz;
+int dotask;
+int wk_loaded;
+int tim;
+int mn;
+int extra;
+int once;
+int bflg;
+int tdur;
+int xtime;
+int dres;
+int dr;
+int start;
+int stop;
+int d52;
+int hwp_alarm;
+int alo;
+int batt;
+int stemp;
+int sens;
+int alarm;
+int gas_c;
+int was_c;
+int zrz_o;
+int oavgt;
+
+// ─── Persist variable shadows for auto-save ───
+int sv_hwp_m;
+int sv_zrz_m;
+int sv_auto_m;
+int sv_gas_m;
+int sv_was_m;
+
+// ─── Timer counters ───
+int udp_timer;
+int pw_timer;
+
+// ─── Daily chart tracking ───
+int d_pos;         // ring buffer write position (0-95)
+int d_cnt;         // 15-min sample count (total written)
+
+// ─── String buffers ───
+char buf[256];
+char str[128];
+// Weekday/month lookup strings (German)
+// wdays: 3 chars each (2-char name + separator), indexed by (wday-1)*3, extract 2
+// mons: 3 chars each, indexed by (month-1)*3, extract 3
+char wdays[22];  // "So Mo Di Mi Do Fr Sa"
+char mons[37];   // "JanFebMrzAprMaiJunJulAugSepOktNovDez"
+char s1[32];
+char s2[32];
+char sx1[32];
+char sx2[32];
+char fnam[80];
+char hdr_s[64];
+char hstr[80];
+char lwstr[80];
+char tmin[32];
+char tmax[32];
+char tval[32];
+char oval[32];
+char min_s[32];
+char max_s[32];
+char wstr[128];
+char url[128];
+char dx1[32];
+char dx2[32];
+
+// ═══════════════════════════════════════════════════════════════════
+// DISPLAY
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Draw static display elements (called once from main) ───
+void drawStatic() {
+    dspText("[Bi0D0z]");   // clear display
+    // Separator lines
+    dspText("[x0y45h320]");
+    dspText("[x0y90h320]");
+    // Labels (Ci5=yellow)
+    dspText("[Ci5f2s1x5y100]Netz:");
+    dspText("[x5y130]Solar:");
+    dspText("[x5y160]Batt:");
+    dspText("[x5y190]Haus:");
+    dspText("[x5y220]Gas:");
+    dspText("[D1]");
+    dspUpdate();
+}
+
+// ─── Update time display (every second) ───
+// Uses native display commands: Ci3=green, f4=font4, T=time, tS=seconds
+void updateTime() {
+    dspText("[Ci3f4x5y10T]");
+    dspText("[f4x155y10tS]");
+}
+
+// ─── Update sensor values (every 5 seconds) ───
+// Uses dspText for values, sprintfInt to build value strings
+void updateValues() {
+    // Temperature (orange, Ci6) + battery level
+    dspText("[f2s1Ci6x5y60p-8]");
+    sprintfInt(buf, "%d C", atmp);
+    dspDraw(buf);
+
+    dspText("[x140y60p-10]");
+    sprintfInt(buf, "%d %%", pwl);
+    dspDraw(buf);
+
+    // Power values (cyan, Ci7)
+    dspText("[Ci7x150y100p-10]");
+    sprintfInt(buf, "%d W", sip);
+    dspDraw(buf);
+
+    dspText("[x150y130p-10]");
+    sprintfInt(buf, "%d W", sop);
+    dspDraw(buf);
+
+    dspText("[x150y160p-10]");
+    sprintfInt(buf, "%d W", bip);
+    dspDraw(buf);
+
+    dspText("[x150y190p-10]");
+    sprintfInt(buf, "%d W", hip);
+    dspDraw(buf);
+
+    // Gas
+    dspText("[x150y220p-10]");
+    sprintfInt(buf, "%d", t_gs);
+    dspDraw(buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DATA COLLECTION — 15-minute samples into daily ring buffers
+// ═══════════════════════════════════════════════════════════════════
+void collectDaily() {
+    // Store current values into daily arrays (all float)
+    t_wr4[d_pos] = sedc;               // Dach (roof PV)
+    t_wr1[d_pos] = 0.0 - wrga;         // Garage PV
+    t_wr2[d_pos] = 0.0 - wrgh;         // Gartenhaus PV
+    t_wr3[d_pos] = 0.0 - wrgg;         // Garten PV
+    t_hv[d_pos]  = hip;                // Haus (house consumption)
+    t_ni[d_pos]  = sip;                // Netz (grid import)
+    t_pw[d_pos]  = pwl;                // Powerwall %
+    t_atmp[d_pos] = atmp;              // Aussentemperatur
+    t_ss[d_pos]  = ssp;                // Solarspeicher
+    d_pos = d_pos + 1;
+    if (d_pos >= 96) { d_pos = 0; }
+    if (d_cnt < 96) { d_cnt = d_cnt + 1; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WEB — Main page sensor display (WebPage callback)
+// ═══════════════════════════════════════════════════════════════════
+// ─── WebCall: AJAX refresh callback (runs every ~2 seconds) ───
+void WebCall() {
+    int sr;
+    int ss;
+    int dl;
+    sr = tasm_sunrise;
+    ss = tasm_sunset;
+    dl = ss - sr;
+
+    // ─── Clock / Date / Sunrise header (as table row) ───
+    webSend("<tr><td colspan=2 style='text-align:center;background:#333;padding:8px;border-radius:8px'>");
+    webSend("<span style='color:green;font-size:40px;font-weight:bold'>");
+    sprintfInt(buf, "%02d:", tasm_hour);
+    webSend(buf);
+    sprintfInt(buf, "%02d:", tasm_minute);
+    webSend(buf);
+    sprintfInt(buf, "%02d", tasm_second);
+    webSend(buf);
+    webSend("</span><br>");
+    // Date: weekday day. month year
+    strSub(s1, wdays, (tasm_wday - 1) * 3, 2);
+    strSub(s2, mons, (tasm_month - 1) * 3, 3);
+    sprintfStr(buf, "%s ", s1);
+    sprintfAppendInt(buf, "%d. ", tasm_day);
+    sprintfAppendStr(buf, "%s ", s2);
+    sprintfAppendInt(buf, "%d", tasm_year);
+    webSend(buf);
+    webSend("<br>");
+    // Sunrise --- daylight duration --- Sunset
+    webSend("&#127774; ");
+    sprintfInt(buf, "%02d:", sr / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", sr % 60);
+    webSend(buf);
+    webSend(" &lt;--- ");
+    sprintfInt(buf, "%d:", dl / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", dl % 60);
+    webSend(buf);
+    webSend(" ---&gt; ");
+    sprintfInt(buf, "%02d:", ss / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", ss % 60);
+    webSend(buf);
+    webSend(" &#127769;");
+    webSend("</td></tr>");
+
+    // ═══════════════════════════════════════════════════════════════
+    // Sensor rows — use {s}/{m}/{e} tags for Tasmota table integration
+    // Client JS replaces: {s}→<tr><th>, {m}→</th><td...>, {e}→</td></tr>
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─── Wasser ───
+    // NOTE: sprintfFloat has 64-byte internal buffer limit.
+    // Split: webSend("{s}LABEL{m}<span style='color:COLOR'>") then sprintfFloat for value only.
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Wasser</b>{m}{e}");
+    webSend("{s}Heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f l</span>{e}", (t_ws - was_m) * 1000);
+    webSend(buf);
+    webSend("{s}Z&auml;hlerstand{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f &#13221;</span>{e}", t_ws);
+    webSend(buf);
+
+    // ─── Solarthermie ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solarthermie</b>{m}{e}");
+    webSend("{s}Au&szlig;entemperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.1f &#8451;</span>{e}", atmp);
+    webSend(buf);
+    webSend("{s}Durchschnittstemperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", avgt);
+    webSend(buf);
+    webSend("{s}Kellertemperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", ktmp);
+    webSend(buf);
+    webSend("{s}Solarkollektor{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.1f &#8451;</span>{e}", scol);
+    webSend(buf);
+    webSend("{s}Solarspeicher{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.1f &#8451;</span>{e}", ssp);
+    webSend(buf);
+
+    // ─── Regen ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Regen</b>{m}{e}");
+    webSend("{s}Heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f mm</span>{e}", hrain);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f mm</span>{e}", train);
+    webSend(buf);
+
+    // ─── Haupt Hauszähler ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Haupt Hausz&auml;hler</b>{m}{e}");
+    webSend("{s}Verbrauch{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.4f KWh</span>{e}", zwzi);
+    webSend(buf);
+    webSend("{s}Verbrauch heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.4f KWh</span>{e}", zwzi - zrz_m);
+    webSend(buf);
+    webSend("{s}Einspeisung{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.4f KWh</span>{e}", zwzo);
+    webSend(buf);
+    webSend("{s}aktueller Verbrauch{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", zwzc);
+    webSend(buf);
+
+    // ─── Wallbox ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Wallbox</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", auto);
+    webSend(buf);
+    webSend("{s}heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_wb - auto_m);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_wb);
+    webSend(buf);
+
+    // ─── Klima-Anlage ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Klima-Anlage</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - klima);
+    webSend(buf);
+    webSend("{s}Total (+Pool){m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_kpwp);
+    webSend(buf);
+
+    // ─── Pool-WP ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Pool-WP</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - pwp);
+    webSend(buf);
+
+    // ─── Brauchwasser-WP ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Brauchwasser-WP</b>{m}{e}");
+    webSend("{s}Heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f KWh</span>{e}", bwtwp);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f KWh</span>{e}", bwwp);
+    webSend(buf);
+
+    // ─── Heizungs-WP ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Heizungs-WP</b>{m}{e}");
+    webSend("{s}Heute{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f KWh</span>{e}", t_hwp - hwp_m);
+    webSend(buf);
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", hwp);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f KWh</span>{e}", t_hwp);
+    webSend(buf);
+
+    // ─── Solar Hausdach ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solar Hausdach, 5.25 KW</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", sedc);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f KWh</span>{e}", sedt);
+    webSend(buf);
+
+    // ─── Solar Garage ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solar Garage, 2.42/3.45 KW</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - wrga);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_ga);
+    webSend(buf);
+
+    // ─── Solar Gartenhaus ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solar Gartenhaus, 1.96/2.8 KW</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - wrgh);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_gh);
+    webSend(buf);
+
+    // ─── Solar Garten ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solar Garten, 2.87/4.1 KW</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - wrgg);
+    webSend(buf);
+    webSend("{s}Total{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", t_gg);
+    webSend(buf);
+
+    // ─── Solar Gesamt ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Solar Gesamt, 7.25/10.35 KW</b>{m}{e}");
+    webSend("{s}aktuell{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", 0.0 - (wrga + wrgh + wrgg));
+    webSend(buf);
+
+    // ─── Powerwall (mixed colors) ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Powerwall</b>{m}{e}");
+    webSend("{s}Batterie F&uuml;llstand{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f %% (", pwl);
+    webSend(buf);
+    sprintfFloat(buf, "%.2f kWh)</span>{e}", pwl / 100.0 * 13.5);
+    webSend(buf);
+    webSend("{s}Netz{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f W</span>{e}", sip);
+    webSend(buf);
+    webSend("{s}Solar{m}<span style='color:green'>");
+    sprintfFloat(buf, "%.2f W</span>{e}", sop);
+    webSend(buf);
+    webSend("{s}Batterie{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f W</span>{e}", bip);
+    webSend(buf);
+    webSend("{s}Haus{m}<span style='color:red'>");
+    sprintfFloat(buf, "%.2f W</span>{e}", hip);
+    webSend(buf);
+    webSend("{s}Gesamt{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", tcap / 1000.0);
+    webSend(buf);
+    webSend("{s}Verbleibend{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.3f kWh</span>{e}", rcap / 1000.0);
+    webSend(buf);
+    webSend("{s}Rcap{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f %%</span>{e}", rper);
+    webSend(buf);
+
+    // ─── Büro ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>B&uuml;ro</b>{m}{e}");
+    webSend("{s}Temperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", btemp);
+    webSend(buf);
+    webSend("{s}Feuchte{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f %%</span>{e}", bhumi);
+    webSend(buf);
+    webSend("{s}Luftdruck{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f hPa</span>{e}", bpress);
+    webSend(buf);
+
+    // ─── Schlafzimmer ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Schlafzimmer</b>{m}{e}");
+    webSend("{s}Temperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", shtemp);
+    webSend(buf);
+
+    // ─── Schlafzimmer G ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Schlafzimmer G</b>{m}{e}");
+    webSend("{s}Temperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", aztemp);
+    webSend(buf);
+    webSend("{s}Feuchte{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f %%</span>{e}", azhumi);
+    webSend(buf);
+    webSend("{s}TVOC{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f ppb</span>{e}", aztvoc);
+    webSend(buf);
+    webSend("{s}eCO2{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f ppm</span>{e}", azeco2);
+    webSend(buf);
+
+    // ─── Wohnzimmer ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Wohnzimmer</b>{m}{e}");
+    webSend("{s}Temperatur{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f &#8451;</span>{e}", wtemp);
+    webSend(buf);
+    webSend("{s}Feuchte{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.2f %%</span>{e}", whumi);
+    webSend(buf);
+    webSend("{s}TVOC{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f ppb</span>{e}", wtvoc);
+    webSend(buf);
+    webSend("{s}CO2{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f ppm</span>{e}", wco2);
+    webSend(buf);
+
+    // ─── Phasen ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>Phasen</b>{m}{e}");
+    webSend("{s}Phase 1{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", phs1);
+    webSend(buf);
+    webSend("{s}Phase 2{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", phs2);
+    webSend(buf);
+    webSend("{s}Phase 3{m}<span style='color:yellow'>");
+    sprintfFloat(buf, "%.0f W</span>{e}", phs3);
+    webSend(buf);
+
+    // ─── System ───
+    webSend("{s}<hr>{m}<hr>{e}{s}<b style='color:magenta'>System</b>{m}{e}");
+    sprintfInt(buf, "{s}Heap{m}<span style='color:yellow'>%d kB</span>{e}", tasm_heap / 1000);
+    webSend(buf);
+
+    webSend("{s}<hr>{m}<hr>{e}");
+}
+
+void WebPage() {
+    // ─── Live streaming chart: 4 solar inverters (Chart.js) ───
+    webSend("<div><canvas id='schart' style='width:640px;height:300px;'></canvas></div>");
+    webSendFile("stream_tc.js");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DATA LOADING — download log databases from data collector
+// ═══════════════════════════════════════════════════════════════════
+
+// Build partial download URL with date range suffix
+// Data collector runs Scripter — @date filter needs German format: D.M.YY-H:MM
+// Uses s1/s2 ISO timestamps, converts to German for URL, keeps s1/s2 intact
+void buildUrl(int is15min) {
+    // Copy ISO timestamps and convert to German format
+    strcpy(dx1, s1);
+    timeConvert(dx1, 1);    // "2026-02-20T00:00:00" → "20.2.26 0:00"
+    strcpy(dx2, s2);
+    timeConvert(dx2, 1);    // "2026-02-28T00:00:00" → "28.2.26 0:00"
+
+    // Replace space with dash for URL: "20.2.26 0:00" → "20.2.26-0:00"
+    // strToken is 1-based, delimiter must be char literal (not string)
+    strToken(str, dx1, ' ', 1);
+    strToken(buf, dx1, ' ', 2);
+    dx1 = str;
+    dx1 += "-";
+    dx1 += buf;
+
+    strToken(str, dx2, ' ', 1);
+    strToken(buf, dx2, ' ', 2);
+    dx2 = str;
+    dx2 += "-";
+    dx2 += buf;
+
+    if (is15min == 0) {
+        url = "http://192.168.188.61/ufs/energy_m_log.txt@";
+    } else {
+        url = "http://192.168.188.61/ufs/energy_15_log.txt@";
+    }
+    url += dx1;
+    url += "_";
+    url += dx2;
+}
+
+// Load week data — download and extract both databases
+void loadWeekData() {
+    int fr;
+    int rows;
+
+    // ── Load 15-minute data (7 days, averaged to hourly) ──
+    addLog("TCC: loading 15min data...");
+    timeStamp(s1);
+    timeOffset(s1, -7, 1);       // 7 days ago midnight
+    timeStamp(s2);
+    timeOffset(s2, 0, 1);        // today midnight
+
+    buildUrl(1);                  // 15-min DB URL with @date
+    dres = fileDownload("/tmplog.txt", url);
+    sprintfInt(buf, "TCC: 15min HTTP=%d", dres);
+    addLog(buf);
+
+    if (dres == 200) {
+        fr = fileOpen("/tmplog.txt", "r");
+        if (fr >= 0) {
+            // col_offs=1 (skip WB), accum=-4 (average 4 rows -> hourly)
+            rows = fileExtract(fr, s1, s2, 1, -4,
+                w_wr1, w_wr2, w_wr3, w_at,
+                a_du, a_du, a_du,
+                w_sk, w_swa, w_wr4,
+                a_du, a_du,
+                w_wa, w_gas, w_pwl,
+                a_du,
+                w_sin,
+                a_du,
+                w_hv);
+            fileClose(fr);
+            sprintfInt(buf, "TCC: 15min rows=%d", rows);
+            addLog(buf);
+        }
+    }
+
+    // ── Load daily data (9 days, delta mode → 8 rows, skip [0]=0) ──
+    addLog("TCC: loading daily data...");
+    timeStamp(s1);
+    timeOffset(s1, -9, 1);       // 9 days ago midnight
+    timeStamp(s2);
+    timeOffset(s2, 0, 1);        // today midnight
+
+    buildUrl(0);                  // daily DB URL with @date
+    dres = fileDownload("/daylog.txt", url);
+    sprintfInt(buf, "TCC: daily HTTP=%d", dres);
+    addLog(buf);
+
+    if (dres == 200) {
+        fr = fileOpen("/daylog.txt", "r");
+        if (fr >= 0) {
+            // col_offs=0 (start at WB), accum=-1 (delta)
+            rows = fileExtract(fr, s1, s2, 0, -1,
+                wt_wb, wt_sin1, wt_sin2, wt_sin3, wt_tmp,
+                a_du, a_du, a_du, a_du, a_du,
+                wt_sin4, wt_hv, a_du, wt_wa, wt_gas,
+                a_du, a_du, a_du, a_du, a_du,
+                a_du, a_du, a_du, wt_wp);
+            fileClose(fr);
+            sprintfInt(buf, "TCC: daily rows=%d", rows);
+            addLog(buf);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TASK LOOP — background FreeRTOS task for data loading
+// ═══════════════════════════════════════════════════════════════════
+void TaskLoop() {
+    while (1) {
+        if (dotask == 1) {
+            addLog("TCC: TaskLoop start");
+            loadWeekData();
+            wk_loaded = 1;
+            dotask = 0;
+            addLog("TCC: TaskLoop done");
+        }
+        delay(2000);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WEB — Chart pages (WebUI callback, rendered at /tc_ui?p=N)
+// ═══════════════════════════════════════════════════════════════════
+void WebUI() {
+    int pg;
+    pg = webPage();
+    if (pg == 0) {
+        // ─── Page 0: Daily charts ───
+        // Stop AJAX refresh — charts are destroyed by innerHTML replacement
+        webSend("<script>rfsh=0;clearTimeout(lt);</script>");
+        webSend("<h3>Tages Verlauf</h3>");
+        // Chart 1: PV power (4 inverters)
+        //  WebChart(type, title, unit, color, pos, count, array, dec, interval, ymin, ymax)
+        WebChart('l', "Photovoltaik", "W", 0xFF0000, d_pos, d_cnt, t_wr1, 0, 15, 0.0, 5000.0);
+        WebChart('l', "", "W", 0x00AA00, d_pos, d_cnt, t_wr2, 0, 15, 0.0, 5000.0);
+        WebChart('l', "", "W", 0x0000FF, d_pos, d_cnt, t_wr3, 0, 15, 0.0, 5000.0);
+        WebChart('l', "", "W", 0xFF8800, d_pos, d_cnt, t_wr4, 0, 15, 0.0, 5000.0);
+        // Chart 2: Grid + House
+        WebChart('l', "Netz / Haus", "W", 0x0088FF, d_pos, d_cnt, t_ni, 0, 15, 0.0, 5000.0);
+        WebChart('l', "", "W", 0xFF0000, d_pos, d_cnt, t_hv, 0, 15, 0.0, 5000.0);
+        // Chart 3: Powerwall charge
+        WebChart('l', "Powerwall", "%%", 0x00CC00, d_pos, d_cnt, t_pw, 0, 15, 0.0, 100.0);
+        // Chart 4: Temperatures
+        WebChart('l', "Temperatur", "C", 0xFF6600, d_pos, d_cnt, t_atmp, 0, 15, 0.0, 40.0);
+        WebChart('l', "", "C", 0xCC0000, d_pos, d_cnt, t_ss, 0, 15, 0.0, 40.0);
+    }
+    if (pg == 1) {
+        // ─── Page 1: Letzte Woche (7-day hourly line charts) ───
+        webSend("<script>rfsh=0;clearTimeout(lt);</script>");
+        webSend("<h3>Letzte Woche</h3>");
+        if (wk_loaded == 1 && dotask == 0) {
+            // Chart 1: Energy balance column chart (daily data, pos=8 count=7 skips delta[0])
+            WebChart('c', "Energie Bilanz", "Netz", 0xFF0000, 8, 7, wt_hv, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "Wallbox", 0x0088FF, 8, 7, wt_wb, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "Garage", 0x00AA00, 8, 7, wt_sin1, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "G-Haus", 0x008800, 8, 7, wt_sin2, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "Garten", 0x888800, 8, 7, wt_sin3, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "Dach", 0xFF8800, 8, 7, wt_sin4, 1, 1440, 0.0, 0.0);
+            WebChart('c', "", "WP", 0x8800FF, 8, 7, wt_wp, 1, 1440, 0.0, 0.0);
+            // Chart 2: Powerwall & Temperatures
+            WebChart('l', "Powerwall / Temperaturen", "%%", 0x00CC00, 0, 168, w_pwl, 0, 60, 0.0, 100.0);
+            WebChart('l', "", "C", 0xFF6600, 0, 168, w_at, 1, 60, 0.0, 100.0);
+            WebChart('l', "", "C", 0x0000FF, 0, 168, w_sk, 1, 60, 0.0, 100.0);
+            WebChart('l', "", "C", 0xCC0000, 0, 168, w_swa, 1, 60, 0.0, 100.0);
+            // Chart 3: Power consumption & solar yield
+            WebChart('l', "Verbrauch / Solar", "W", 0xFF0000, 0, 168, w_hv, 0, 60, 0.0, 5000.0);
+            WebChart('l', "", "W", 0x00AA00, 0, 168, w_sin, 0, 60, 0.0, 5000.0);
+            WebChart('l', "", "W", 0xFF8800, 0, 168, w_wr1, 0, 60, 0.0, 5000.0);
+            WebChart('l', "", "W", 0x0000FF, 0, 168, w_wr2, 0, 60, 0.0, 5000.0);
+            WebChart('l', "", "W", 0x888800, 0, 168, w_wr3, 0, 60, 0.0, 5000.0);
+            WebChart('l', "", "W", 0x8800FF, 0, 168, w_wr4, 0, 60, 0.0, 5000.0);
+            // Chart 4: Gas & Water
+            WebChart('l', "Gas / Wasser", "m3", 0xFF0000, 0, 168, w_gas, 2, 60, 0.0, 10.0);
+            WebChart('l', "", "m3", 0x0088FF, 0, 168, w_wa, 2, 60, 0.0, 10.0);
+            // Chart 5: Energy balance table (daily data)
+            WebChart('t', "Tag|So|Mo|Di|Mi|Do|Fr|Sa", "Haus", 0x000000, 8, 7, wt_hv, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "Wallbox", 0x000000, 8, 7, wt_wb, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "Garage", 0x000000, 8, 7, wt_sin1, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "G-Haus", 0x000000, 8, 7, wt_sin2, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "Garten", 0x000000, 8, 7, wt_sin3, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "Dach", 0x000000, 8, 7, wt_sin4, 1, 0, 0.0, 0.0);
+            WebChart('t', "", "Gas", 0x000000, 8, 7, wt_gas, 2, 0, 0.0, 0.0);
+            WebChart('t', "", "Wasser", 0x000000, 8, 7, wt_wa, 2, 0, 0.0, 0.0);
+            WebChart('t', "", "WP", 0x000000, 8, 7, wt_wp, 1, 0, 0.0, 0.0);
+            webSend("<p><a href='/tc_ui?p=1'>Aktualisieren</a></p>");
+        } else if (dotask == 0) {
+            dotask = 1;
+            webSend("<p>Daten werden geladen...</p>");
+            webSend("<p><a href='/tc_ui?p=1'>Aktualisieren</a></p>");
+        } else {
+            webSend("<p>Daten werden geladen...</p>");
+            webSend("<p><a href='/tc_ui?p=1'>Aktualisieren</a></p>");
+        }
+    }
+    if (pg == 3) {
+        // ─── Page 3: Andere Geräte (device links, dynamic IPs from UDP) ───
+        webSend("<style>button{border:0;border-radius:0.3rem;background:#1fa3ec;color:white;line-height:1.4rem;font-size:1.2rem;width:400px;transition-duration:0.4s;cursor:pointer;height:45px;}</style>");
+        webSend("<div style='text-align:center'>");
+        webSend("<h3>Andere Ger&auml;te</h3>");
+        // Rolladen buttons (IPs received via UDP global char[])
+        webSend("<p><form action='http://");
+        webSend(wz_ip);
+        webSend("' method='get'><button>Rolladen Wohnzimmer Veranda</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(wzv_ip);
+        webSend("' method='get'><button>Rolladen Wohnzimmer vorne</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(azh_ip);
+        webSend("' method='get'><button>Rolladen AZ Heidrun</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(kue_ip);
+        webSend("' method='get'><button>Rolladen K&uuml;che</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(flu_ip);
+        webSend("' method='get'><button>Rolladen Flur</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(sug_ip);
+        webSend("' method='get'><button>Schaltuhr Garage</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(nsp_ip);
+        webSend("' method='get'><button>Netstream Power</button></form></p>");
+        // Additional devices
+        webSend("<p><form action='http://");
+        webSend(fs_ip);
+        webSend("' method='get'><button>Fenster und Thermostate</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(us_ip);
+        webSend("' method='get'><button>Schadstoffsensoren</button></form></p>");
+        webSend("<p><form action='http://");
+        webSend(tv2_ip);
+        webSend("' method='get'><button>Schlafzimmer G</button></form></p>");
+        webSend("</div>");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CALLBACKS
+// ═══════════════════════════════════════════════════════════════════
+
+// UDP packet received — reset timeout timer
+void UdpCall() {
+    udp_timer = 60;
+}
+
+void EverySecond() {
+    cnt = cnt + 1;
+
+    // ─── UDP timeout — alert if no packets for 60 seconds ───
+    if (udp_timer > 0) {
+        udp_timer = udp_timer - 1;
+    }
+    if (udp_timer == 0) {
+        udp_timer = 60;
+        addLog("TCC: udp timeout");
+    }
+
+    // ─── Display update ───
+    if (dotask == 0) {
+        dspText("[D0]");
+        updateTime();
+        if (cnt % 5 == 0) {
+            updateValues();
+        }
+        dspText("[D1]");
+        dspUpdate();
+    }
+
+    // ─── 15-minute data collection ───
+    if (cnt % 900 == 0) {
+        collectDaily();
+    }
+
+}
+
+void WebOn() {
+    int h;
+    h = webHandler();
+    if (h == 1) {
+        // /tc_array → JSON with 4 PV inverter watts
+        // TODO: use webSendJsonArray after firmware rebuild
+        sprintfInt(buf, "{\"array\":[%d,", sedc);
+        webSend(buf);
+        sprintfInt(buf, "%d,", 0 - wrga);
+        webSend(buf);
+        sprintfInt(buf, "%d,", 0 - wrgh);
+        webSend(buf);
+        sprintfInt(buf, "%d]}", 0 - wrgg);
+        webSend(buf);
+    }
+}
+
+void OnExit() {
+    print("Core2 Energy shutdown\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN: Initialization
+// ═══════════════════════════════════════════════════════════════════
+int main() {
+    // Initialize state
+    dotask = 0;
+    wk_loaded = 0;
+    once = 0;
+    bflg = 0;
+    alarm = 0;
+    hwp_alarm = 0;
+    d52 = 52;
+    zrz_o = 21399;
+    cnt = 0;
+
+    // Timer init
+    udp_timer = 30;
+    pw_timer = 300;
+
+    // Initialize shadow copies
+    sv_hwp_m = hwp_m;
+    sv_zrz_m = zrz_m;
+    sv_auto_m = auto_m;
+    sv_gas_m = gas_m;
+    sv_was_m = was_m;
+    mn = -1;
+    d_pos = 0;
+    d_cnt = 0;
+
+    // Weekday names: 3 chars each (2-letter + space), tasm_wday 1=Sun..7=Sat
+    wdays = "So Mo Di Mi Do Fr Sa";
+    // Month names: 3 chars each, tasm_month 1-12
+    mons = "JanFebMrzAprMaiJunJulAugSepOktNovDez";
+
+    // Register web chart pages (buttons appear on main page)
+    webPageLabel(0, "Tages Verlauf");
+    webPageLabel(1, "Letzte Woche");
+    webPageLabel(2, "52 Wochen");
+    webPageLabel(3, "Andere Ger&auml;te");
+    webPageLabel(4, "Heizung 31 Tage");
+
+    // Register streaming chart data endpoint
+    webOn(1, "/tc_array");
+
+    // Draw initial display
+    drawStatic();
+
+    // Collect first data point immediately
+    collectDaily();
+
+    print("Phase 5: global keyword started\n");
+    sprintfInt(buf, "heap: %d\n", tasm_heap);
+    print(buf);
+
+    return 0;
+}

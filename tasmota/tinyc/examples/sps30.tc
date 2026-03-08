@@ -1,0 +1,313 @@
+// SPS30 Particulate Matter Sensor Driver
+// I2C address: 0x69
+// Measures: PM1.0, PM2.5, PM4.0, PM10.0 (ug/m3)
+//           NCPM0.5, NCPM1.0, NCPM2.5, NCPM4.0, NCPM10 (#/cm3)
+//           Typical Particle Size (um)
+// Data as IEEE754 floats, CRC8 poly 0x31, init 0xFF (Sensirion)
+// Duty-cycled: sleeps between measurements to extend laser lifetime (~8yr continuous)
+// Default: measure every 5 minutes (fan runs 30s to stabilize)
+// Console: SPS30 Measure (trigger now), SPS30 Interval <seconds>
+
+#define SPS_INTERVAL 300  // default: measure every 300s (5 min)
+#define SPS_FANTIME   30  // fan stabilization time (seconds)
+
+// States
+#define ST_SLEEP   0
+#define ST_WAKE    1
+#define ST_START   2
+#define ST_STABLE  3
+#define ST_READ    4
+#define ST_STOP    5
+
+int sps_addr = 0;
+int sps_bus = 0;
+int sps_ok = 0;
+// Mass concentrations (ug/m3)
+float sps_pm1 = 0.0;
+float sps_pm25 = 0.0;
+float sps_pm4 = 0.0;
+float sps_pm10 = 0.0;
+// Number concentrations (#/cm3)
+float sps_nc05 = 0.0;
+float sps_nc1 = 0.0;
+float sps_nc25 = 0.0;
+float sps_nc4 = 0.0;
+float sps_nc10 = 0.0;
+// Typical particle size (um)
+float sps_tps = 0.0;
+int sps_state = 0;
+int sps_tick = 0;
+int sps_interval = SPS_INTERVAL;
+int sps_fan_count = 0;
+char sps_buf[62];
+
+// CRC8 Sensirion: poly 0x31, init 0xFF, over 2 data bytes
+int sps_crc(int b1, int b2) {
+    int crc = 0xFF ^ b1;
+    int j = 0;
+    while (j < 8) {
+        if (crc & 0x80) crc = ((crc << 1) ^ 0x31) & 0xFF;
+        else crc = (crc << 1) & 0xFF;
+        j++;
+    }
+    crc = crc ^ b2;
+    j = 0;
+    while (j < 8) {
+        if (crc & 0x80) crc = ((crc << 1) ^ 0x31) & 0xFF;
+        else crc = (crc << 1) & 0xFF;
+        j++;
+    }
+    return crc;
+}
+
+// Send 16-bit command (no data)
+void sps_cmd(int cmd) {
+    sps_buf[0] = cmd & 0xFF;
+    i2cWrite(sps_addr, cmd >> 8, sps_buf, 1, sps_bus);
+}
+
+// Send 16-bit command with 16-bit argument + CRC
+void sps_cmd_arg(int cmd, int arg) {
+    sps_buf[0] = cmd & 0xFF;
+    sps_buf[1] = arg >> 8;
+    sps_buf[2] = arg & 0xFF;
+    sps_buf[3] = sps_crc(sps_buf[1], sps_buf[2]);
+    i2cWrite(sps_addr, cmd >> 8, sps_buf, 4, sps_bus);
+}
+
+// Reconstruct IEEE754 float from 6-byte response chunk
+// Layout: [hi_MSB, hi_LSB, CRC, lo_MSB, lo_LSB, CRC]
+float sps_get_float(int offset) {
+    int hi_msb = sps_buf[offset];
+    int hi_lsb = sps_buf[offset + 1];
+    int lo_msb = sps_buf[offset + 3];
+    int lo_lsb = sps_buf[offset + 4];
+    if (sps_crc(hi_msb, hi_lsb) != sps_buf[offset + 2]) return 0.0;
+    if (sps_crc(lo_msb, lo_lsb) != sps_buf[offset + 5]) return 0.0;
+    int bits = (hi_msb << 24) | (hi_lsb << 16) | (lo_msb << 8) | lo_lsb;
+    return intBitsToFloat(bits);
+}
+
+void sps_sleep() {
+    sps_cmd(0x0104);   // stop measurement
+    delay(20);
+    sps_cmd(0x1001);   // sleep (disables I2C, fan off, laser off)
+    delay(5);
+    sps_state = ST_SLEEP;
+    sps_tick = 0;
+}
+
+void sps_wake() {
+    // Sleep mode disables I2C — send wake cmd twice
+    // (first reactivates interface, second is the actual wake)
+    sps_cmd(0x1103);
+    delay(5);
+    sps_cmd(0x1103);
+    delay(100);
+    sps_state = ST_WAKE;
+}
+
+int sps_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        if (i2cSetDevice(0x69, bus)) {
+            sps_addr = 0x69;
+            sps_bus = bus;
+            i2cSetActiveFound(sps_addr, "SPS30", sps_bus);
+            return 1;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+void EverySecond() {
+    if (!sps_addr) return;
+
+    if (sps_state == ST_SLEEP) {
+        sps_tick++;
+        if (sps_tick >= sps_interval) {
+            // Time to measure — wake up
+            sps_wake();
+        }
+        return;
+    }
+
+    if (sps_state == ST_WAKE) {
+        // Start measurement: cmd 0x0010, arg 0x0300 (big-endian float output)
+        sps_cmd_arg(0x0010, 0x0300);
+        delay(20);
+        sps_fan_count = 0;
+        sps_state = ST_STABLE;
+        return;
+    }
+
+    if (sps_state == ST_STABLE) {
+        // Wait for fan to stabilize
+        sps_fan_count++;
+        if (sps_fan_count >= SPS_FANTIME) {
+            sps_state = ST_READ;
+        }
+        return;
+    }
+
+    if (sps_state == ST_READ) {
+        // Check data ready (cmd 0x0202)
+        sps_cmd(0x0202);
+        delay(20);
+        if (!i2cRead0(sps_addr, sps_buf, 3, sps_bus)) {
+            sps_sleep();
+            return;
+        }
+        if (sps_crc(sps_buf[0], sps_buf[1]) != sps_buf[2]) {
+            sps_sleep();
+            return;
+        }
+        int ready = (sps_buf[0] << 8) | sps_buf[1];
+        if (!ready) return;  // wait another second
+
+        // Read all 10 floats = 60 bytes
+        sps_cmd(0x0300);
+        delay(20);
+        if (i2cRead0(sps_addr, sps_buf, 60, sps_bus)) {
+            sps_pm1  = sps_get_float(0);
+            sps_pm25 = sps_get_float(6);
+            sps_pm4  = sps_get_float(12);
+            sps_pm10 = sps_get_float(18);
+            sps_nc05 = sps_get_float(24);
+            sps_nc1  = sps_get_float(30);
+            sps_nc25 = sps_get_float(36);
+            sps_nc4  = sps_get_float(42);
+            sps_nc10 = sps_get_float(48);
+            sps_tps  = sps_get_float(54);
+            sps_ok = 1;
+        }
+        // Done — go back to sleep
+        sps_sleep();
+        return;
+    }
+}
+
+void Command(char cmd[]) {
+    char buf[64];
+    char arg[16];
+
+    if (strFind(cmd, "MEASURE") == 0) {
+        // Trigger immediate measurement
+        if (sps_state == ST_SLEEP) {
+            sps_wake();
+            responseCmnd("Waking up, measurement in ~30s");
+        } else {
+            responseCmnd("Already measuring");
+        }
+    } else if (strFind(cmd, "INTERVAL") == 0) {
+        if (strlen(cmd) > 9) {
+            strSub(arg, cmd, 9, 0);
+            int val = atoi(arg);
+            if (val >= 60) {
+                sps_interval = val;
+            }
+        }
+        sprintfInt(buf, "Interval: %d s", sps_interval);
+        responseCmnd(buf);
+    } else {
+        responseCmnd("Measure|Interval <sec>");
+    }
+}
+
+void WebCall() {
+    char buf[80];
+    if (sps_ok) {
+        // Mass concentrations
+        sprintfFloat(buf, "{s}SPS30 PM 1.0{m}%.2f &micro;g/m&sup3;{e}", sps_pm1);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 PM 2.5{m}%.2f &micro;g/m&sup3;{e}", sps_pm25);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 PM 4.0{m}%.2f &micro;g/m&sup3;{e}", sps_pm4);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 PM 10{m}%.2f &micro;g/m&sup3;{e}", sps_pm10);
+        webSend(buf);
+        // Number concentrations
+        sprintfFloat(buf, "{s}SPS30 NCPM 0.5{m}%.2f #/cm&sup3;{e}", sps_nc05);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 NCPM 1.0{m}%.2f #/cm&sup3;{e}", sps_nc1);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 NCPM 2.5{m}%.2f #/cm&sup3;{e}", sps_nc25);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 NCPM 4.0{m}%.2f #/cm&sup3;{e}", sps_nc4);
+        webSend(buf);
+        sprintfFloat(buf, "{s}SPS30 NCPM 10{m}%.2f #/cm&sup3;{e}", sps_nc10);
+        webSend(buf);
+        // Typical particle size
+        sprintfFloat(buf, "{s}SPS30 TYPSIZ{m}%.2f &micro;m{e}", sps_tps);
+        webSend(buf);
+        // Status
+        if (sps_state == ST_SLEEP) {
+            sprintfInt(buf, "{s}SPS30 Status{m}sleeping, next in %d s{e}", sps_interval - sps_tick);
+        } else {
+            webSend("{s}SPS30 Status{m}measuring...{e}");
+        }
+        webSend(buf);
+    } else {
+        webSend("{s}SPS30{m}waiting for first measurement{e}");
+    }
+}
+
+void JsonCall() {
+    if (!sps_ok) return;
+    char buf[64];
+    sprintfFloat(buf, ",\"SPS30\":{\"PM1_0\":%.2f", sps_pm1);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"PM2_5\":%.2f", sps_pm25);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"PM4_0\":%.2f", sps_pm4);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"PM10\":%.2f", sps_pm10);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"NCPM0_5\":%.2f", sps_nc05);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"NCPM1_0\":%.2f", sps_nc1);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"NCPM2_5\":%.2f", sps_nc25);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"NCPM4_0\":%.2f", sps_nc4);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"NCPM10\":%.2f", sps_nc10);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"TYPSIZ\":%.2f}", sps_tps);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (sps_addr) {
+        if (sps_state != ST_SLEEP) {
+            sps_cmd(0x0104);  // stop measurement
+            delay(20);
+            sps_cmd(0x1001);  // sleep
+            delay(5);
+        }
+        I2cResetActive(sps_addr, sps_bus);
+    }
+}
+
+int main() {
+    sps_ok = 0;
+    sps_addr = 0;
+    sps_state = ST_SLEEP;
+    sps_tick = 0;
+    sps_interval = SPS_INTERVAL;
+
+    if (sps_scan()) {
+        char buf[48];
+        sprintfInt(buf, "SPS30 found at 0x%x", sps_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", sps_bus);
+        print(buf);
+        addCommand("SPS30");
+        // Do first measurement immediately
+        sps_wake();
+    } else {
+        print("SPS30 not found\n");
+    }
+    return 0;
+}

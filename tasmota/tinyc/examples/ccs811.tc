@@ -1,0 +1,168 @@
+// CCS811 Digital Air Quality Sensor (eCO2 + TVOC)
+// I2C address: 0x5A (default) or 0x5B (ADDR pin high)
+// HW_ID: 0x81
+//
+// Reports: eCO2 (400-8192 ppm), TVOC (0-1187 ppb)
+// Measurement mode 1: 1-second interval
+// Needs ~20 min warm-up for stable readings
+
+#define CCS_ADDR1 0x5A
+#define CCS_ADDR2 0x5B
+#define CCS_HW_ID 0x81
+
+// registers
+#define CCS_STATUS   0x00
+#define CCS_MEAS     0x01
+#define CCS_ALG_DATA 0x02
+#define CCS_ENV_DATA 0x05
+#define CCS_HW_ID_REG 0x20
+#define CCS_ERR_REG  0xE0
+#define CCS_APP_START 0xF4
+#define CCS_SW_RESET 0xFF
+
+int ccs_addr = 0;
+int ccs_bus = 0;
+int ccs_ok = 0;
+int ccs_eco2 = 0;
+int ccs_tvoc = 0;
+int ccs_err = 0;
+char ccs_name[16];
+char ccs_buf[16];
+char ccs_lbl[32];
+
+int ccs_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        int addr = CCS_ADDR1;
+        while (addr <= CCS_ADDR2) {
+            if (i2cSetDevice(addr, bus)) {
+                int id = i2cRead8(addr, CCS_HW_ID_REG, bus);
+                if (id == CCS_HW_ID) {
+                    ccs_addr = addr;
+                    ccs_bus = bus;
+                    i2cSetActiveFound(ccs_addr, "CCS811", ccs_bus);
+                    return 1;
+                }
+            }
+            addr = addr + 1;
+        }
+        bus = bus + 1;
+    }
+    return 0;
+}
+
+int ccs_init() {
+    // read status — check APP_VALID (bit 4)
+    int status = i2cRead8(ccs_addr, CCS_STATUS, ccs_bus);
+    if ((status & 0x10) == 0) {
+        return 0;  // no valid app firmware
+    }
+
+    // if in boot mode (FW_MODE bit 7 = 0), send APP_START
+    if ((status & 0x80) == 0) {
+        i2cWrite0(ccs_addr, CCS_APP_START, ccs_bus);
+        delay(100);
+        // verify transition
+        status = i2cRead8(ccs_addr, CCS_STATUS, ccs_bus);
+        if ((status & 0x80) == 0) {
+            return 0;  // failed to enter app mode
+        }
+    }
+
+    // set measurement mode 1 (1-second interval), no interrupts
+    i2cWrite8(ccs_addr, CCS_MEAS, 0x10, ccs_bus);
+    return 1;
+}
+
+void EverySecond() {
+    if (!ccs_ok) return;
+
+    // check status: DATA_READY (bit 3)
+    int status = i2cRead8(ccs_addr, CCS_STATUS, ccs_bus);
+    if ((status & 0x04) != 0) {
+        // error flag set
+        ccs_err = i2cRead8(ccs_addr, CCS_ERR_REG, ccs_bus);
+    }
+    if ((status & 0x08) == 0) {
+        return;  // data not ready
+    }
+
+    // read ALG_RESULT_DATA: 8 bytes from register 0x02
+    // [eco2_hi, eco2_lo, tvoc_hi, tvoc_lo, status, error, raw_hi, raw_lo]
+    int ret = i2cRead(ccs_addr, CCS_ALG_DATA, ccs_buf, 8, ccs_bus);
+    if (ret) {
+        ccs_eco2 = ((ccs_buf[0] & 0xFF) << 8) | (ccs_buf[1] & 0xFF);
+        ccs_tvoc = ((ccs_buf[2] & 0xFF) << 8) | (ccs_buf[3] & 0xFF);
+    }
+}
+
+void ccs_web_label(int idx) {
+    char vt[48];
+    LGetString(idx, ccs_lbl);
+    strcpy(vt, "{s}");
+    strcat(vt, ccs_name);
+    strcat(vt, " ");
+    strcat(vt, ccs_lbl);
+    strcat(vt, "{m}");
+    webSend(vt);
+}
+
+void WebCall() {
+    char vt[32];
+    if (ccs_ok) {
+        // eCO2
+        ccs_web_label(5);  // 5 = eCO2
+        sprintfInt(vt, "%d ppm{e}", ccs_eco2);
+        webSend(vt);
+        // TVOC
+        ccs_web_label(6);  // 6 = TVOC
+        sprintfInt(vt, "%d ppb{e}", ccs_tvoc);
+        webSend(vt);
+    } else {
+        webSend("{s}CCS811{m}not found{e}");
+    }
+}
+
+void JsonCall() {
+    if (!ccs_ok) return;
+    char buf[64];
+    strcpy(buf, ",\"");
+    strcat(buf, ccs_name);
+    strcat(buf, "\":{");
+    responseAppend(buf);
+    sprintfInt(buf, "\"eCO2\":%d", ccs_eco2);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"TVOC\":%d}", ccs_tvoc);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (ccs_addr) {
+        // set mode 0 (idle) before releasing
+        i2cWrite8(ccs_addr, CCS_MEAS, 0x00, ccs_bus);
+        I2cResetActive(ccs_addr, ccs_bus);
+        ccs_addr = 0;
+    }
+}
+
+int main() {
+    delay(10000);
+
+    if (!ccs_scan()) return 0;
+
+    // build name with address
+    if (ccs_addr == CCS_ADDR1) {
+        strcpy(ccs_name, "CCS811");
+    } else {
+        strcpy(ccs_name, "CCS811b");
+    }
+
+    if (!ccs_init()) {
+        char dt[48];
+        sprintfInt(dt, "CCS811 init failed (addr 0x%x)", ccs_addr);
+        print(dt);
+        return 0;
+    }
+
+    return 0;
+}

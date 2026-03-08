@@ -207,12 +207,16 @@
 //-- Software Serial für ESP32 (nur RX), Pin mit dem Zeichen '-' in der SML Sektion definieren (bei mehr als 2/3-Leseköpfen, je nach ESP32 Variante)
 //-- Optional: Serielle Schnittstelle (RX/TX RS232) im Script verwenden
 //-- Optional: Full Webpage (für Untermenüs/Diagramme)
+//-- TinyC !! Die schnelle gute Alternative zum Scripting. C-Code direkt in der Tasmota-TinyC IDE programmieren und ausführen!
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ESP32_SW_SERIAL
   #define USE_SCRIPT_SERIAL //3KB
   #define SCRIPT_FULL_WEBPAGE //1KB
   #define USE_MQTT_TLS //3KB
   #define USE_INFLUXDB //6KB
+  //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc Nur für ESPs mit FileSystem (ich habe es nur für ESP32 aktiviert)
+  #define USE_TINYC           // Enable TinyC VM (XDRV_124)
+  #define USE_TINYC_IDE       // Enable self-hosted browser IDE (requires USE_UFILESYS)
 #endif
 
 //-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)

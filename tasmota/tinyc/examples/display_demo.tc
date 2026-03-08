@@ -1,0 +1,213 @@
+// Sensor Dashboard for ILI9488 (480x320)
+// Static layout drawn once, only values update each second
+// dspPad(n) pads text to n chars — overwrites old text cleanly
+
+char buf[64];
+int w;
+int h;
+global float btemp;  // auto-updated from UDP
+global float bhumi;  // auto-updated from UDP
+
+void drawStatic() {
+    w = dspWidth();
+    h = dspHeight();
+    dspClear();
+
+    // Title bar
+    dspColor(NAVY, WHITE);
+    dspPos(0, 0);
+    dspFillRect(w, 30);
+    dspFont(2);
+    dspSize(1);
+    dspPos(10, 7);
+    dspColor(WHITE, NAVY);
+    dspDraw("Tasmota Dashboard");
+
+    // Separator
+    dspColor(DARKGREY, BLACK);
+    dspPos(0, 100);
+    dspHLine(w);
+
+    // Labels
+    dspFont(2);
+    dspSize(1);
+    dspColor(WHITE, BLACK);
+    dspPos(20, 115);
+    dspDraw("Temp:");
+
+    dspPos(20, 155);
+    dspDraw("Hum:");
+
+    // Separator
+    dspColor(DARKGREY, BLACK);
+    dspPos(0, 195);
+    dspHLine(w);
+
+    // Static labels
+    dspFont(1);
+    dspSize(1);
+    dspColor(GREY, BLACK);
+    dspPos(20, 210);
+    dspDraw("Uptime:");
+    dspPos(20, 230);
+    dspDraw("Heap:");
+    dspPos(20, 250);
+    dspDraw("MQTT:");
+    dspPos(250, 250);
+    dspDraw("Power:");
+
+    // Bottom bar
+
+    dspColor(NAVY, WHITE);
+    dspPos(0, h - 22);
+    dspFillRect(w, 22);
+    dspFont(1);
+    dspSize(1);
+    dspPos(10, h - 17);
+    dspColor(WHITE, NAVY);
+    dspDraw("TinyC Sensor Dashboard");
+
+    dspPad(0);
+    dspUpdate();
+}
+
+void EverySecond() {
+    dspText("[D0]");  // disable auto-draw — batch all updates
+    // ── Clock ──
+    dspColor(CYAN, BLACK);
+    dspFont(2);
+    dspSize(1);
+    sprintfInt(buf, "%02d", tasm_hour);
+    strcat(buf, ":");
+    sprintfAppendInt(buf, "%02d", tasm_minute);
+    strcat(buf, ":");
+    sprintfAppendInt(buf, "%02d", tasm_second);
+    dspPos(20, 40);
+    dspDraw(buf);
+
+    // ── Date ──
+    dspColor(LIGHTGREY, BLACK);
+    dspFont(2);
+    dspSize(1);
+    sprintfInt(buf, "%02d", tasm_day);
+    strcat(buf, ".");
+    sprintfAppendInt(buf, "%02d", tasm_month);
+    strcat(buf, ".");
+    sprintfAppendInt(buf, "%d", tasm_year);
+    dspPos(20, 70);
+    dspDraw(buf);
+
+    // ── WiFi indicator ──
+    dspFont(1);
+    dspSize(1);
+    dspPad(10);
+    if (tasm_wifi) {
+        dspColor(GREEN, NAVY);
+        dspPos(w - 78, 10);
+        dspDraw("WiFi OK");
+    } else {
+        dspColor(RED, NAVY);
+        dspPos(w - 78, 10);
+        dspDraw("No WiFi");
+    }
+
+    // ── Temperature value (auto-updated from UDP) ──
+    float temp = btemp;
+    dspFont(2);
+    dspSize(1);
+    dspPad(10);
+    dspPos(200, 112);
+    sprintfFloat(buf, "%.1f", temp);
+    if (buf[0] == 'n' || buf[0] == 'N' || buf[0] == 0) {
+        dspColor(DARKGREY, BLACK);
+        dspDraw("--.-");
+    } else {
+        dspColor(YELLOW, BLACK);
+        strcat(buf, " C");
+        dspDraw(buf);
+        //dspPad(0);
+        //dspDraw(" C");
+    }
+
+    // ── Humidity value (auto-updated from UDP) ──
+    float hum = bhumi;
+    dspFont(2);
+    dspSize(1);
+    dspPad(10);
+    dspPos(200, 152);
+    sprintfFloat(buf, "%.1f", hum);
+    if (buf[0] == 'n' || buf[0] == 'N' || buf[0] == 0) {
+        dspColor(DARKGREY, BLACK);
+        dspDraw("--.-");
+    } else {
+        dspColor(CYAN, BLACK);
+        strcat(buf, " %");
+        dspDraw(buf);
+        //dspPad(0);
+        //dspDraw(" %%");
+    }
+
+    // ── Uptime value ──
+/*    int days;
+    int hrs;
+    int mins;
+    days = tasm_uptime / 86400;
+    hrs = (tasm_uptime % 86400) / 3600;
+    mins = (tasm_uptime % 3600) / 60;
+    dspColor(GREY, BLACK);
+    dspFont(1);
+    dspSize(1);
+    dspPad(20);
+    sprintfInt(buf, "%dd ", days);
+    dspPos(90, 210);
+    dspDraw(buf);
+    dspPad(0);
+    sprintfInt(buf, "%dh ", hrs);
+    dspDraw(buf);
+    sprintfInt(buf, "%dm", mins);
+*/
+ dspFont(1);
+    dspSize(1);
+    dspPos(90, 210);
+    sprintfInt(buf, "%d secs", tasm_uptime);
+    dspDraw(buf);
+
+    // ── Heap value ──
+
+    dspColor(GREY, BLACK);
+    dspPad(16);
+    sprintfInt(buf, "%d bytes", tasm_heap);
+    dspPos(90, 230);
+    dspDraw(buf);
+
+    // ── MQTT status ──
+    dspPad(14);
+    dspPos(70, 250);
+    if (tasm_mqttcon) {
+        dspColor(GREEN, BLACK);
+        dspDraw("Connected");
+    } else {
+        dspColor(RED, BLACK);
+        dspDraw("Disconnected");
+    }
+
+    // ── Power status ──
+    dspPad(4);
+    dspPos(310, 250);
+    if (tasm_power) {
+        dspColor(GREEN, BLACK);
+        dspDraw("ON");
+    } else {
+        dspColor(DARKGREY, BLACK);
+        dspDraw("OFF");
+    }
+
+    dspPad(0);
+    dspText("[D1]");  // re-enable auto-draw
+    dspUpdate();      // single frame update
+}
+
+int main() {
+    drawStatic();
+    return 0;
+}

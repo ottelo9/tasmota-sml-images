@@ -1,0 +1,140 @@
+// Test: File I/O operations
+// Tests create, write, read, seek, size, exists, delete on filesystem
+// No hardware dependencies — uses internal flash filesystem
+
+char buf[256];
+int errors;
+int tests;
+
+void check(int condition, char name[]) {
+    tests = tests + 1;
+    if (condition) {
+        sprintfStr(buf, "  PASS: %s\n", name);
+    } else {
+        errors = errors + 1;
+        sprintfStr(buf, "  FAIL: %s\n", name);
+    }
+    printStr(buf);
+}
+
+void test_write_read() {
+    print("--- Write & Read ---\n");
+    int fd;
+
+    // Write a file
+    fd = fileOpen("/tc_test.txt", 1);  // 1 = write
+    check(fd >= 0, "fileOpen write");
+    if (fd < 0) return;
+
+    char data[64];
+    strcpy(data, "Line 1: Hello TinyC\n");
+    int w = fileWrite(fd, data, strlen(data));
+    check(w == strlen(data), "fileWrite line1");
+
+    strcpy(data, "Line 2: Test data 12345\n");
+    w = fileWrite(fd, data, strlen(data));
+    check(w == strlen(data), "fileWrite line2");
+
+    fileClose(fd);
+
+    // Read it back
+    fd = fileOpen("/tc_test.txt", 0);  // 0 = read
+    check(fd >= 0, "fileOpen read");
+    if (fd < 0) return;
+
+    char readbuf[128];
+    int r = fileRead(fd, readbuf, 64);
+    check(r > 0, "fileRead returns data");
+
+    // Check content starts with "Line 1"
+    char prefix[16];
+    strSub(readbuf, prefix, 0, 6);
+    check(strcmp(prefix, "Line 1") == 0, "fileRead content correct");
+
+    fileClose(fd);
+}
+
+void test_size_exists() {
+    print("--- Size & Exists ---\n");
+
+    check(fileExists("/tc_test.txt") == 1, "fileExists true");
+    check(fileExists("/nonexistent_xyz.txt") == 0, "fileExists false");
+
+    int sz = fileSize("/tc_test.txt");
+    check(sz > 0, "fileSize > 0");
+
+    char msg[64];
+    sprintfInt(msg, "  File size: %d bytes\n", sz);
+    printStr(msg);
+}
+
+void test_seek_tell() {
+    print("--- Seek & Tell ---\n");
+
+    int fd = fileOpen("/tc_test.txt", 0);  // read
+    check(fd >= 0, "fileOpen for seek");
+    if (fd < 0) return;
+
+    int pos = fileTell(fd);
+    check(pos == 0, "fileTell at start");
+
+    // Seek to position 8 (past "Line 1: ")
+    fileSeek(fd, 8, 0);  // 0 = SEEK_SET
+    pos = fileTell(fd);
+    check(pos == 8, "fileTell after seek");
+
+    // Read from position 8
+    char readbuf[32];
+    int r = fileRead(fd, readbuf, 11);
+    char sub[12];
+    strSub(readbuf, sub, 0, 11);
+    check(strcmp(sub, "Hello TinyC") == 0, "read after seek");
+
+    fileClose(fd);
+}
+
+void test_delete() {
+    print("--- Delete ---\n");
+
+    int r = fileDelete("/tc_test.txt");
+    check(r == 1, "fileDelete success");
+    check(fileExists("/tc_test.txt") == 0, "file gone after delete");
+}
+
+void test_fileLog() {
+    print("--- fileLog ---\n");
+
+    // fileLog appends timestamped lines
+    char line[64];
+    strcpy(line, "Test log entry 1");
+    int r = fileLog("/tc_log_test.txt", line, 1);  // 1 = append with timestamp
+    check(r >= 0, "fileLog append 1");
+
+    strcpy(line, "Test log entry 2");
+    r = fileLog("/tc_log_test.txt", line, 1);
+    check(r >= 0, "fileLog append 2");
+
+    // Verify file exists and has content
+    check(fileExists("/tc_log_test.txt") == 1, "log file exists");
+    int sz = fileSize("/tc_log_test.txt");
+    check(sz > 20, "log file has content");
+
+    // Cleanup
+    fileDelete("/tc_log_test.txt");
+}
+
+int main() {
+    errors = 0;
+    tests = 0;
+    print("=== File I/O Test Suite ===\n\n");
+
+    test_write_read();
+    test_size_exists();
+    test_seek_tell();
+    test_delete();
+    test_fileLog();
+
+    sprintfInt(buf, "\n=== Results: %d tests, ", tests);
+    sprintfAppendInt(buf, "%d errors ===\n", errors);
+    printStr(buf);
+}

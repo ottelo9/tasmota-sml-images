@@ -1,0 +1,194 @@
+// TCS34725 RGB Color Sensor Driver
+// I2C address: 0x29, requires initialization
+// Reads RGBC (Red, Green, Blue, Clear) + calculates Lux and Color Temperature
+// DN40 algorithm for lux/CT calculation
+// Command bit 0x80 must be OR'd with register address
+// Auto-increment 0xA0 for block reads
+
+#define TCS_ADDR    0x29
+#define TCS_CMD     0x80
+#define TCS_AUTOINC 0xA0
+
+// Registers
+#define TCS_ENABLE  0x00
+#define TCS_ATIME   0x01
+#define TCS_CONTROL 0x0F
+#define TCS_ID      0x12
+#define TCS_STATUS  0x13
+#define TCS_CDATAL  0x14
+
+// Integration time 154ms (0xC0) — good range, max ~65535 counts
+#define TCS_ATIME_VAL  0xC0
+#define TCS_ATIME_MS   154
+
+// Gain 4X
+#define TCS_GAIN_VAL   0x01
+#define TCS_GAIN_FACT  4
+
+int tcs_addr = 0;
+int tcs_bus = 0;
+int tcs_ok = 0;
+int tcs_r = 0;
+int tcs_g = 0;
+int tcs_b = 0;
+int tcs_c = 0;
+float tcs_lux = 0.0;
+float tcs_ct = 0.0;
+
+char tcs_buf[8];
+
+int tcs_init() {
+    // Verify chip ID (0x44 = TCS34725, 0x10 = TCS34721)
+    int id = i2cRead8(tcs_addr, TCS_CMD | TCS_ID, tcs_bus);
+    if (id != 0x44 && id != 0x10) {
+        return 0;
+    }
+
+    // Power ON (PON bit)
+    i2cWrite8(tcs_addr, TCS_CMD | TCS_ENABLE, 0x01, tcs_bus);
+    delay(3);
+
+    // Set integration time
+    i2cWrite8(tcs_addr, TCS_CMD | TCS_ATIME, TCS_ATIME_VAL, tcs_bus);
+
+    // Set gain
+    i2cWrite8(tcs_addr, TCS_CMD | TCS_CONTROL, TCS_GAIN_VAL, tcs_bus);
+
+    // Enable RGBC (PON | AEN)
+    i2cWrite8(tcs_addr, TCS_CMD | TCS_ENABLE, 0x03, tcs_bus);
+
+    return 1;
+}
+
+int tcs_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        if (i2cSetDevice(TCS_ADDR, bus)) {
+            tcs_addr = TCS_ADDR;
+            tcs_bus = bus;
+            if (tcs_init()) {
+                i2cSetActiveFound(tcs_addr, "TCS34725", tcs_bus);
+                return 1;
+            }
+            tcs_addr = 0;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+void EverySecond() {
+    if (!tcs_addr) {
+        if (!tcs_scan()) { tcs_ok = 0; return; }
+    }
+
+    // Check AVALID bit (bit 0) in STATUS register
+    int status = i2cRead8(tcs_addr, TCS_CMD | TCS_STATUS, tcs_bus);
+    if (!(status & 0x01)) {
+        return;  // conversion not ready
+    }
+
+    // Block read 8 bytes: C_L, C_H, R_L, R_H, G_L, G_H, B_L, B_H
+    if (!i2cReadRS(tcs_addr, TCS_AUTOINC | TCS_CDATAL, tcs_buf, 8, tcs_bus)) {
+        tcs_ok = 0;
+        return;
+    }
+
+    tcs_c = tcs_buf[0] | (tcs_buf[1] << 8);
+    tcs_r = tcs_buf[2] | (tcs_buf[3] << 8);
+    tcs_g = tcs_buf[4] | (tcs_buf[5] << 8);
+    tcs_b = tcs_buf[6] | (tcs_buf[7] << 8);
+
+    // DN40 lux and color temperature calculation
+    if (tcs_c > 0 && tcs_r > 0) {
+        // IR estimate
+        int ir = (tcs_r + tcs_g + tcs_b - tcs_c) / 2;
+        if (ir < 0) ir = 0;
+
+        // CPL = (atime_ms * gain) / (GA * DF)
+        // GA=1.0, DF=310.0, with 154ms and 4X: CPL = 1.987
+        float cpl = (float)(TCS_ATIME_MS * TCS_GAIN_FACT) / 310.0;
+
+        // Lux (DN40 coefficients)
+        float r_comp = (float)(tcs_r - ir);
+        float g_comp = (float)(tcs_g - ir);
+        float b_comp = (float)(tcs_b - ir);
+
+        tcs_lux = (0.136 * r_comp + 1.0 * g_comp - 0.444 * b_comp) / cpl;
+        if (tcs_lux < 0.0) tcs_lux = 0.0;
+
+        // Color temperature (Kelvin)
+        if (r_comp > 0.0) {
+            tcs_ct = 3810.0 * b_comp / r_comp + 1391.0;
+        } else {
+            tcs_ct = 0.0;
+        }
+    } else {
+        tcs_lux = 0.0;
+        tcs_ct = 0.0;
+    }
+
+    tcs_ok = 1;
+}
+
+void WebCall() {
+    char buf[80];
+    if (tcs_ok) {
+        sprintfInt(buf, "{s}TCS34725 Red{m}%d{e}", tcs_r);
+        webSend(buf);
+        sprintfInt(buf, "{s}TCS34725 Green{m}%d{e}", tcs_g);
+        webSend(buf);
+        sprintfInt(buf, "{s}TCS34725 Blue{m}%d{e}", tcs_b);
+        webSend(buf);
+        sprintfInt(buf, "{s}TCS34725 Clear{m}%d{e}", tcs_c);
+        webSend(buf);
+        sprintfFloat(buf, "{s}TCS34725 Lux{m}%.0f lx{e}", tcs_lux);
+        webSend(buf);
+        sprintfFloat(buf, "{s}TCS34725 CT{m}%.0f K{e}", tcs_ct);
+        webSend(buf);
+    } else {
+        webSend("{s}TCS34725{m}no data{e}");
+    }
+}
+
+void JsonCall() {
+    if (!tcs_ok) return;
+    char buf[96];
+    sprintfInt(buf, ",\"TCS34725\":{\"Red\":%d", tcs_r);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"Green\":%d", tcs_g);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"Blue\":%d", tcs_b);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"Clear\":%d", tcs_c);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"Lux\":%.0f", tcs_lux);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"CT\":%.0f}", tcs_ct);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (tcs_addr) {
+        // Power off sensor
+        i2cWrite8(tcs_addr, TCS_CMD | TCS_ENABLE, 0x00, tcs_bus);
+        I2cResetActive(tcs_addr, tcs_bus);
+        tcs_addr = 0;
+    }
+}
+
+int main() {
+    char buf[48];
+    tcs_ok = 0;
+    tcs_addr = 0;
+
+    if (tcs_scan()) {
+        sprintfInt(buf, "TCS34725 found at 0x%x", tcs_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", tcs_bus);
+        print(buf);
+    } else {
+        print("TCS34725 not found\n");
+    }
+    return 0;
+}

@@ -1,0 +1,223 @@
+// ADS1115 16-bit 4-Channel ADC Driver
+// I2C addresses: 0x48 (ADDR=GND), 0x49 (ADDR=VDD), 0x4A (ADDR=SDA), 0x4B (ADDR=SCL)
+// Single-ended mode: reads AIN0..AIN3 vs GND
+// Configurable PGA gain, single-shot conversion
+// Displays voltage on web UI + JSON teleperiod + 6h chart
+
+#define ADS_ADDR1  0x48
+#define ADS_ADDR2  0x4B
+
+// PGA gain settings (config bits 11-9)
+// Change ADS_PGA to match your voltage range
+#define PGA_6144   0   // ±6.144V  (LSB = 187.5µV)
+#define PGA_4096   1   // ±4.096V  (LSB = 125µV)
+#define PGA_2048   2   // ±2.048V  (LSB = 62.5µV)  — default
+#define PGA_1024   3   // ±1.024V  (LSB = 31.25µV)
+#define PGA_0512   4   // ±0.512V  (LSB = 15.625µV)
+#define PGA_0256   5   // ±0.256V  (LSB = 7.8125µV)
+
+// *** Configuration — adjust to your needs ***
+#define ADS_PGA       PGA_4096    // gain setting
+#define ADS_CHANNELS  4           // number of channels to read (1..4)
+
+// LSB voltage in µV for each PGA setting (index = PGA value)
+// We store as int µV to avoid float array init issues
+// PGA_6144=187500, PGA_4096=125000, PGA_2048=62500, PGA_1024=31250, PGA_0512=15625, PGA_0256=7813
+
+int ads_addr = 0;
+int ads_bus = 0;
+int ads_ok = 0;
+
+// Raw ADC values and voltages per channel
+int ads_raw[4];
+float ads_volt[4];
+
+// I2C buffer for 2-byte reads/writes
+char ads_buf[4];
+
+// Chart history (6h at 1/min = 360)
+#define CHART_LEN 360
+float hist_ch0[CHART_LEN];
+float hist_ch1[CHART_LEN];
+float hist_ch2[CHART_LEN];
+float hist_ch3[CHART_LEN];
+int hist_pos;
+int hist_tick;
+
+// Get LSB size in µV for current PGA setting
+float ads_get_lsb() {
+    if (ADS_PGA == 0) return 187.5;
+    if (ADS_PGA == 1) return 125.0;
+    if (ADS_PGA == 2) return 62.5;
+    if (ADS_PGA == 3) return 31.25;
+    if (ADS_PGA == 4) return 15.625;
+    return 7.8125;
+}
+
+// Sign-extend 16-bit to signed int
+int sign16(int val) {
+    if (val >= 32768) return val - 65536;
+    return val;
+}
+
+// Scan for ADS1115 on both buses
+int ads_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        int addr = ADS_ADDR1;
+        while (addr <= ADS_ADDR2) {
+            if (i2cSetDevice(addr, bus)) {
+                // Read config register — default after reset is 0x8583
+                if (i2cRead(addr, 0x01, ads_buf, 2, bus)) {
+                    int cfg = (ads_buf[0] << 8) | ads_buf[1];
+                    // Check bits that should be default: DR=100 (128SPS), MODE=1
+                    // Default config = 0x8583, but just check device responds
+                    if (cfg != 0 && cfg != 0xFFFF) {
+                        ads_addr = addr;
+                        ads_bus = bus;
+                        i2cSetActiveFound(ads_addr, "ADS1115", ads_bus);
+                        return 1;
+                    }
+                }
+            }
+            addr++;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+// Read one channel (0-3) in single-shot mode, returns raw signed value
+int ads_read_channel(int ch) {
+    // Config register: OS=1 (start), MUX=1xx (single-ended AINx), PGA, MODE=1 (single-shot)
+    // DR=100 (128SPS), COMP_QUE=11 (disable comparator)
+    // Byte 0 (high): OS[15] MUX[14:12] PGA[11:9] MODE[8]
+    //   OS=1, MUX = 100 + ch, PGA = ADS_PGA, MODE = 1
+    // Byte 1 (low): DR[7:5] COMP_MODE[4] COMP_POL[3] COMP_LAT[2] COMP_QUE[1:0]
+    //   DR=100 (128SPS), rest=0, COMP_QUE=11
+    //   = 10000011 = 0x83
+
+    int mux = 4 + ch;    // 100=AIN0, 101=AIN1, 110=AIN2, 111=AIN3
+    int hi = 0x80 | (mux << 4) | (ADS_PGA << 1) | 0x01;
+    int lo = 0x83;        // 128 SPS, comparator disabled
+
+    // Write config register
+    ads_buf[0] = hi;
+    ads_buf[1] = lo;
+    if (!i2cWrite(ads_addr, 0x01, ads_buf, 2, ads_bus)) return 0;
+
+    // Wait for conversion (128 SPS = ~8ms, use 10ms margin)
+    delay(10);
+
+    // Read conversion register (2 bytes, MSB first)
+    if (!i2cRead(ads_addr, 0x00, ads_buf, 2, ads_bus)) return 0;
+
+    int raw = (ads_buf[0] << 8) | ads_buf[1];
+    return sign16(raw);
+}
+
+void EverySecond() {
+    if (!ads_addr) {
+        if (!ads_scan()) { ads_ok = 0; return; }
+    }
+
+    float lsb = ads_get_lsb();
+    int ch = 0;
+    while (ch < ADS_CHANNELS) {
+        ads_raw[ch] = ads_read_channel(ch);
+        // Convert to volts: raw * lsb_µV / 1000000
+        ads_volt[ch] = (float)ads_raw[ch] * lsb / 1000000.0;
+        ch++;
+    }
+    ads_ok = 1;
+
+    // Chart history every minute
+    hist_tick++;
+    if (hist_tick >= 60) {
+        hist_tick = 0;
+        int p = hist_pos % CHART_LEN;
+        hist_ch0[p] = ads_volt[0];
+        if (ADS_CHANNELS > 1) hist_ch1[p] = ads_volt[1];
+        if (ADS_CHANNELS > 2) hist_ch2[p] = ads_volt[2];
+        if (ADS_CHANNELS > 3) hist_ch3[p] = ads_volt[3];
+        hist_pos++;
+    }
+}
+
+void WebPage() {
+    int n = hist_pos;
+    if (n > CHART_LEN) n = CHART_LEN;
+    if (n > 0) {
+        WebChart('l', "ADS1115 Voltages", "AIN0 (V)", 0xe74c3c, hist_pos, CHART_LEN, hist_ch0, 1, 0, 0, 0);
+        if (ADS_CHANNELS > 1) {
+            WebChart('l', "", "AIN1 (V)", 0x3498db, hist_pos, CHART_LEN, hist_ch1, 1, 0, 0, 0);
+        }
+        if (ADS_CHANNELS > 2) {
+            WebChart('l', "", "AIN2 (V)", 0x27ae60, hist_pos, CHART_LEN, hist_ch2, 1, 0, 0, 0);
+        }
+        if (ADS_CHANNELS > 3) {
+            WebChart('l', "", "AIN3 (V)", 0x9b59b6, hist_pos, CHART_LEN, hist_ch3, 1, 0, 0, 0);
+        }
+    }
+}
+
+void WebCall() {
+    char buf[80];
+    if (ads_ok) {
+        int ch = 0;
+        while (ch < ADS_CHANNELS) {
+            sprintfInt(buf, "{s}ADS1115 AIN%d{m}", ch);
+            webSend(buf);
+            sprintfFloat(buf, "%.4f V{e}", ads_volt[ch]);
+            webSend(buf);
+            ch++;
+        }
+    } else {
+        webSend("{s}ADS1115{m}not found{e}");
+    }
+}
+
+void JsonCall() {
+    if (!ads_ok) return;
+    char buf[64];
+    responseAppend(",\"ADS1115\":{");
+    int ch = 0;
+    while (ch < ADS_CHANNELS) {
+        if (ch > 0) responseAppend(",");
+        sprintfInt(buf, "\"A%d\":", ch);
+        responseAppend(buf);
+        sprintfFloat(buf, "%.4f", ads_volt[ch]);
+        responseAppend(buf);
+        ch++;
+    }
+    responseAppend("}");
+}
+
+void OnExit() {
+    if (ads_addr) {
+        I2cResetActive(ads_addr, ads_bus);
+        ads_addr = 0;
+    }
+}
+
+int main() {
+    char buf[64];
+    ads_ok = 0;
+    ads_addr = 0;
+    hist_pos = 0;
+    hist_tick = 0;
+
+    if (ads_scan()) {
+        sprintfInt(buf, "ADS1115 found at 0x%x", ads_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", ads_bus);
+        print(buf);
+        sprintfInt(buf, "PGA gain: %d", ADS_PGA);
+        print(buf);
+        sprintfInt(buf, ", channels: %d\n", ADS_CHANNELS);
+        print(buf);
+    } else {
+        print("ADS1115 not found on any bus\n");
+    }
+    return 0;
+}

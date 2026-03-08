@@ -1,0 +1,40 @@
+// Custom Web Handler Demo
+// Registers HTTP endpoints on the Tasmota web server
+// Access: http://<device>/api/hello and /api/status
+
+char buf[128];
+int counter;
+
+void WebOn() {
+    int h = webHandler();
+    if (h == 1) {
+        // GET /api/hello?name=xxx
+        char name[32];
+        int len = webArg("name", name);
+        if (len > 0) {
+            strcpy(buf, "{\"greeting\":\"Hello, ");
+            strcat(buf, name);
+            strcat(buf, "!\"}");
+        } else {
+            strcpy(buf, "{\"greeting\":\"Hello, World!\"}");
+        }
+        webSend(buf);
+    }
+    if (h == 2) {
+        // GET /api/status
+        webSend("{\"status\":\"ok\"}");
+    }
+}
+
+void EverySecond() {
+    counter = counter + 1;
+}
+
+int main() {
+    webOn(1, "/api/hello");
+    webOn(2, "/api/status");
+    printStr("Web handlers registered\n");
+    printStr("Try: /api/hello?name=YourName\n");
+    printStr("Try: /api/status\n");
+    return 0;
+}

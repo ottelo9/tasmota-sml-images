@@ -1,0 +1,258 @@
+// BMP280 Temperature & Pressure Sensor Driver
+// I2C addresses: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
+// Chip ID: 0x58 (BMP280), vs 0x60 (BME280 with humidity)
+// Scans both I2C buses, claims via Tasmota I2C system
+// Reads every second, displays on web UI + JSON teleperiod
+// Includes 6h chart history
+
+#define BMP_ADDR1  0x76
+#define BMP_ADDR2  0x77
+#define BMP_ID     0x58
+
+// Measurement results
+float bmp_temp = 0.0;
+float bmp_pres = 0.0;
+int bmp_ok = 0;
+int bmp_addr = 0;
+int bmp_bus = 0;
+char bmp_lbl[32];
+
+// I2C data buffer
+char bmp_buf[26];
+
+// Calibration data (from registers 0x88..0x9F)
+// Temperature
+int dig_T1;
+int dig_T2;
+int dig_T3;
+// Pressure
+int dig_P1;
+int dig_P2;
+int dig_P3;
+int dig_P4;
+int dig_P5;
+int dig_P6;
+int dig_P7;
+int dig_P8;
+int dig_P9;
+
+// t_fine is shared between temp and pressure compensation
+int t_fine;
+
+// Chart history (6h at 1 sample/min = 360 points)
+#define CHART_LEN 360
+float hist_temp[CHART_LEN];
+float hist_pres[CHART_LEN];
+int hist_pos;
+int hist_tick;
+
+// Sign-extend a 16-bit value to signed int
+int sign16(int val) {
+    if (val >= 32768) {
+        return val - 65536;
+    }
+    return val;
+}
+
+// Read calibration data from sensor
+int bmp_read_calib() {
+    // Read 24 bytes from 0x88..0x9F (temp + pressure calibration)
+    if (!i2cRead(bmp_addr, 0x88, bmp_buf, 24, bmp_bus)) return 0;
+
+    dig_T1 = bmp_buf[0] | (bmp_buf[1] << 8);
+    dig_T2 = sign16(bmp_buf[2] | (bmp_buf[3] << 8));
+    dig_T3 = sign16(bmp_buf[4] | (bmp_buf[5] << 8));
+
+    dig_P1 = bmp_buf[6] | (bmp_buf[7] << 8);
+    dig_P2 = sign16(bmp_buf[8] | (bmp_buf[9] << 8));
+    dig_P3 = sign16(bmp_buf[10] | (bmp_buf[11] << 8));
+    dig_P4 = sign16(bmp_buf[12] | (bmp_buf[13] << 8));
+    dig_P5 = sign16(bmp_buf[14] | (bmp_buf[15] << 8));
+    dig_P6 = sign16(bmp_buf[16] | (bmp_buf[17] << 8));
+    dig_P7 = sign16(bmp_buf[18] | (bmp_buf[19] << 8));
+    dig_P8 = sign16(bmp_buf[20] | (bmp_buf[21] << 8));
+    dig_P9 = sign16(bmp_buf[22] | (bmp_buf[23] << 8));
+
+    return 1;
+}
+
+// Configure sensor: oversampling x1 temp+press, normal mode, 1000ms standby
+int bmp_configure() {
+    // config (0xF5): standby 1000ms (101), filter off (000), SPI off (0) = 0xA0
+    if (!i2cWrite8(bmp_addr, 0xF5, 0xA0, bmp_bus)) return 0;
+    // ctrl_meas (0xF4): temp os x1 (001), press os x1 (001), normal mode (11) = 0x27
+    if (!i2cWrite8(bmp_addr, 0xF4, 0x27, bmp_bus)) return 0;
+    return 1;
+}
+
+// Scan both buses and addresses
+int bmp_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        int addr = BMP_ADDR1;
+        while (addr <= BMP_ADDR2) {
+            if (i2cSetDevice(addr, bus)) {
+                // Check chip ID register (0xD0) — BMP280 = 0x58
+                int id = i2cRead8(addr, 0xD0, bus);
+                if (id == BMP_ID) {
+                    bmp_addr = addr;
+                    bmp_bus = bus;
+                    i2cSetActiveFound(bmp_addr, "BMP280", bmp_bus);
+                    return 1;
+                }
+            }
+            addr++;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+// Compensate temperature — returns °C * 100 as int, sets t_fine
+int bmp_comp_temp(int adc_T) {
+    int var1 = ((((adc_T >> 3) - (dig_T1 << 1))) * dig_T2) >> 11;
+    int var2 = (((((adc_T >> 4) - dig_T1) * ((adc_T >> 4) - dig_T1)) >> 12) * dig_T3) >> 14;
+    t_fine = var1 + var2;
+    int T = (t_fine * 5 + 128) >> 8;
+    return T;
+}
+
+// Compensate pressure — returns Pa as float
+// Using float arithmetic to avoid 32-bit overflow
+float bmp_comp_pres(int adc_P) {
+    float var1 = (float)t_fine / 2.0 - 64000.0;
+    float var2 = var1 * var1 * (float)dig_P6 / 32768.0;
+    var2 = var2 + var1 * (float)dig_P5 * 2.0;
+    var2 = var2 / 4.0 + (float)dig_P4 * 65536.0;
+    var1 = ((float)dig_P3 * var1 * var1 / 524288.0 + (float)dig_P2 * var1) / 524288.0;
+    var1 = (1.0 + var1 / 32768.0) * (float)dig_P1;
+    if (var1 == 0.0) return 0.0;
+    float p = 1048576.0 - (float)adc_P;
+    p = (p - var2 / 4096.0) * 6250.0 / var1;
+    var1 = (float)dig_P9 * p * p / 2147483648.0;
+    var2 = p * (float)dig_P8 / 32768.0;
+    p = p + (var1 + var2 + (float)dig_P7) / 16.0;
+    return p;
+}
+
+void EverySecond() {
+    if (!bmp_addr) {
+        if (!bmp_scan()) {
+            bmp_ok = 0;
+            return;
+        }
+        if (!bmp_read_calib()) {
+            bmp_ok = 0;
+            bmp_addr = 0;
+            return;
+        }
+        if (!bmp_configure()) {
+            bmp_ok = 0;
+            bmp_addr = 0;
+            return;
+        }
+    }
+
+    // Read 6 bytes from 0xF7: press[3], temp[3] (no humidity on BMP280)
+    if (!i2cRead(bmp_addr, 0xF7, bmp_buf, 6, bmp_bus)) {
+        bmp_ok = 0;
+        bmp_addr = 0;
+        return;
+    }
+
+    int adc_P = (bmp_buf[0] << 12) | (bmp_buf[1] << 4) | (bmp_buf[2] >> 4);
+    int adc_T = (bmp_buf[3] << 12) | (bmp_buf[4] << 4) | (bmp_buf[5] >> 4);
+
+    // Temperature (sets t_fine used by pressure)
+    int T100 = bmp_comp_temp(adc_T);
+    bmp_temp = (float)T100 / 100.0;
+
+    // Pressure in hPa
+    bmp_pres = bmp_comp_pres(adc_P) / 100.0;
+
+    bmp_ok = 1;
+
+    // Update chart history every minute
+    hist_tick++;
+    if (hist_tick >= 60) {
+        hist_tick = 0;
+        hist_temp[hist_pos % CHART_LEN] = bmp_temp;
+        hist_pres[hist_pos % CHART_LEN] = bmp_pres;
+        hist_pos++;
+    }
+}
+
+// Tasmota main page — charts
+void WebPage() {
+    int n = hist_pos;
+    if (n > CHART_LEN) n = CHART_LEN;
+    if (n > 0) {
+        WebChart('l', "Temperature", "\u00b0C", 0xe74c3c, hist_pos, CHART_LEN, hist_temp, 1, 0, 0, 0);
+        WebChart('l', "Pressure", "hPa", 0x27ae60, hist_pos, CHART_LEN, hist_pres, 1, 0, 0, 0);
+    }
+}
+
+// Tasmota web UI — sensor rows
+void bmp_web_label(int idx) {
+    char vt[32];
+    LGetString(idx, bmp_lbl);
+    strcpy(vt, "{s}BMP280 ");
+    strcat(vt, bmp_lbl);
+    strcat(vt, "{m}");
+    webSend(vt);
+}
+
+void WebCall() {
+    char buf[32];
+    if (bmp_ok) {
+        bmp_web_label(0);
+        sprintfFloat(buf, "%.1f &deg;C{e}", bmp_temp);
+        webSend(buf);
+        bmp_web_label(2);
+        sprintfFloat(buf, "%.1f hPa{e}", bmp_pres);
+        webSend(buf);
+    } else {
+        webSend("{s}BMP280{m}not found{e}");
+    }
+}
+
+// JSON teleperiod — appears in MQTT sensor payload
+void JsonCall() {
+    if (!bmp_ok) return;
+    char buf[96];
+    sprintfFloat(buf, ",\"BMP280\":{\"Temperature\":%.1f", bmp_temp);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"Pressure\":%.1f}", bmp_pres);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (bmp_addr) {
+        I2cResetActive(bmp_addr, bmp_bus);
+        bmp_addr = 0;
+    }
+}
+
+int main() {
+    char buf[64];
+    bmp_ok = 0;
+    bmp_addr = 0;
+    hist_pos = 0;
+    hist_tick = 0;
+
+    if (bmp_scan()) {
+        sprintfInt(buf, "BMP280 found at 0x%x", bmp_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", bmp_bus);
+        print(buf);
+        if (bmp_read_calib() && bmp_configure()) {
+            print("BMP280 calibration loaded, sensor active\n");
+        } else {
+            print("BMP280 calibration/config failed\n");
+            bmp_addr = 0;
+        }
+    } else {
+        print("BMP280 not found on any bus\n");
+    }
+    return 0;
+}

@@ -1,0 +1,116 @@
+// Live Moving Line Chart — demonstrates _Q() macro for Google Charts
+// The chart polls the device every second via fetch() and shows a
+// sliding 60-second window of simulated temperature and humidity.
+//
+// _Q(temperature,humidity) is expanded at compile time to index-based
+// query parameters (e.g. "0f;1f") — no variable names in the binary.
+
+float temperature = 20.0;
+float humidity = 50.0;
+int tick = 0;
+
+// Simple integer sine (period 400, range -100..100)
+int isin(int x) {
+    int p = x % 400;
+    if (p < 0) p = p + 400;
+    if (p < 100) return p;
+    if (p < 200) return 200 - p;
+    if (p < 300) return -(p - 200);
+    return -(400 - p);
+}
+
+void EverySecond() {
+    // Simulate sensor readings: sine wave + random noise
+    int s = isin(tick * 4);
+    temperature = 22.0 + s / 20.0 + random(-10, 10) / 10.0;
+    humidity = 55.0 + s / 10.0 + random(-20, 20) / 10.0;
+    tick++;
+}
+
+// Button on Tasmota main page linking to the chart
+void WebPage() {
+    webSend("<p><form action='/chart' method='get'>");
+    webSend("<button>Live Chart</button></form></p>");
+}
+
+// Standalone chart page at /chart — no interference from Tasmota refresh
+void WebOn() {
+    int h = webHandler();
+    if (h != 1) return;
+
+    // Full HTML page
+    webSend("<!DOCTYPE html><html><head><meta charset='utf-8'>");
+    webSend("<meta name='viewport' content='width=device-width'>");
+    webSend("<title>TinyC Live Chart</title></head><body>");
+    webSend("<div id='ch' style='width:800px;height:400px;'></div>");
+    webSend("<script src='https://www.gstatic.com/charts/loader.js'></script>");
+    webSend("<script>");
+    webFlush();
+
+    // Load Google Charts
+    webSend("google.charts.load('current',{packages:['corechart']});");
+    webSend("google.charts.setOnLoadCallback(init);");
+    webSend("var T=[],H=[],N=60,ch;");
+
+    // Init: create chart, start polling
+    webSend("function init(){");
+    webSend("ch=new google.visualization.LineChart(");
+    webSend("document.getElementById('ch'));");
+    webSend("poll();setInterval(poll,1000);}");
+    webFlush();
+
+    // Poll: fetch variables, update chart
+    // _Q(temperature,humidity) expands to index+type at compile time
+    webSend("function poll(){");
+    webSend("fetch('/cm?cmnd=TinyC+%3F_Q(temperature,humidity)')");
+    webSend(".then(r=>r.json()).then(j=>{");
+    webSend("var v=j.TinyC;");
+    webSend("T.push(v[0]);H.push(v[1]);");
+    webSend("if(T.length>N){T.shift();H.shift();}");
+    webSend("draw();});}");
+    webFlush();
+
+    // Draw chart — rows always [0..N-1] so x-axis stays fixed
+    webSend("function draw(){");
+    webSend("var t=new google.visualization.DataTable();");
+    webSend("t.addColumn('number','Sec');");
+    webSend("t.addColumn('number','Temp (C)');");
+    webSend("t.addColumn('number','Humidity (%)');");
+    webSend("for(var i=0;i<T.length;i++)");
+    webSend("t.addRow([i,T[i],H[i]]);");
+    webSend("ch.draw(t,{");
+    webSend("title:'TinyC Live Sensor Data',");
+    webSend("curveType:'function',");
+    webSend("legend:{position:'bottom'},");
+    webSend("hAxis:{viewWindow:{min:0,max:N},textPosition:'none'},");
+    webSend("vAxis:{viewWindow:{min:10,max:80}},");
+    webSend("chartArea:{width:'85%',height:'70%'},");
+    webSend("series:{0:{color:'#e74c3c'},1:{color:'#3498db'}}");
+    webSend("});}");
+
+    webSend("</script></body></html>");
+    webFlush();
+}
+
+void WebCall() {
+    char buf[80];
+    sprintfFloat(buf, "{s}Temperature{m}%.1f &deg;C{e}", temperature);
+    webSend(buf);
+    sprintfFloat(buf, "{s}Humidity{m}%.1f %%{e}", humidity);
+    webSend(buf);
+}
+
+void JsonCall() {
+    char buf[80];
+    sprintfFloat(buf, ",\"TinyC\":{\"Temp\":%.1f", temperature);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"Hum\":%.1f}", humidity);
+    responseAppend(buf);
+}
+
+int main() {
+    webOn(1, "/chart");
+    printStr("Live chart demo active\n");
+    printStr("Open http://<device>/chart to see the live chart\n");
+    return 0;
+}

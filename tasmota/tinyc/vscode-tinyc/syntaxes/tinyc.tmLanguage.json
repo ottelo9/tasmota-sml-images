@@ -1,0 +1,355 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "TinyC",
+  "scopeName": "source.tinyc",
+  "fileTypes": ["tc"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#preprocessor" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#callbacks" },
+    { "include": "#builtins" },
+    { "include": "#function-definition" },
+    { "include": "#function-call" },
+    { "include": "#operators" },
+    { "include": "#constants" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.tinyc",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.tinyc",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.tinyc",
+          "match": "^\\s*(#define)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(.*))?$",
+          "captures": {
+            "1": { "name": "keyword.control.directive.define.tinyc" },
+            "2": { "name": "entity.name.constant.preprocessor.tinyc" },
+            "3": {
+              "patterns": [
+                { "include": "#numbers" },
+                { "include": "#strings" },
+                {
+                  "name": "constant.other.tinyc",
+                  "match": "."
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.tinyc",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.tinyc",
+              "match": "\\\\[ntr0\\\\\"']"
+            },
+            {
+              "name": "constant.other.placeholder.tinyc",
+              "match": "%[-+ #0]?[0-9*]*\\.?[0-9*]*[diouxXeEfgGcsp%]"
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.tinyc",
+          "match": "'(?:\\\\[ntr0\\\\\"']|[^'\\\\])'"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.tinyc",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.tinyc",
+          "match": "\\b0[bB][01]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.tinyc",
+          "match": "\\b[0-9]+\\.[0-9]*[fF]?\\b|\\b[0-9]*\\.[0-9]+[fF]?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.tinyc",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.tinyc",
+          "match": "\\b(if|else|while|for|switch|case|default|return|break|continue)\\b"
+        },
+        {
+          "name": "keyword.operator.sizeof.tinyc",
+          "match": "\\b(sizeof)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.tinyc",
+          "match": "\\b(int|float|char|void|bool|uint8_t|uint32_t|int32_t|unsigned|persist|watch)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.tinyc",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.tinyc",
+          "match": "\\b(NULL)\\b"
+        },
+        {
+          "name": "constant.other.caps.tinyc",
+          "match": "\\b[A-Z][A-Z0-9_]{2,}\\b"
+        }
+      ]
+    },
+    "callbacks": {
+      "comment": "Tasmota callback function names — special highlighting",
+      "patterns": [
+        {
+          "name": "entity.name.function.callback.tinyc",
+          "match": "\\b(EveryLoop|Every50ms|EverySecond|JsonCall|WebCall|WebPage|WebUI|UdpCall|TaskLoop|TouchButton|HomeKitWrite|Command|OnExit)\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "comment": "TinyC built-in syscall functions",
+      "patterns": [
+        {
+          "comment": "GPIO",
+          "name": "support.function.gpio.tinyc",
+          "match": "\\b(pinMode|digitalWrite|digitalRead|analogRead|analogWrite|gpioInit)\\b"
+        },
+        {
+          "comment": "Timing",
+          "name": "support.function.timing.tinyc",
+          "match": "\\b(delay|delayMicroseconds|millis|micros|timerStart|timerDone|timerStop|timerRemaining)\\b"
+        },
+        {
+          "comment": "Serial",
+          "name": "support.function.serial.tinyc",
+          "match": "\\b(serialBegin|serialPrint|serialPrintInt|serialPrintFloat|serialPrintln|serialRead|serialAvailable|serialClose|serialWriteByte|serialWriteStr|serialWriteBytes)\\b"
+        },
+        {
+          "comment": "1-Wire",
+          "name": "support.function.onewire.tinyc",
+          "match": "\\b(owSetPin|owReset|owWrite|owRead|owWriteBit|owReadBit|owSearchReset|owSearch)\\b"
+        },
+        {
+          "comment": "Math",
+          "name": "support.function.math.tinyc",
+          "match": "\\b(abs|min|max|map|random|sqrt|sin|cos|floor|ceil|round|exp|log|intBitsToFloat)\\b"
+        },
+        {
+          "comment": "String operations",
+          "name": "support.function.string.tinyc",
+          "match": "\\b(strlen|strcpy|strcat|strcmp|printString|printStr|strToken|strSub|strFind|atoi|atof)\\b"
+        },
+        {
+          "comment": "sprintf variants",
+          "name": "support.function.sprintf.tinyc",
+          "match": "\\b(sprintfInt|sprintfFloat|sprintfStr|sprintfAppendInt|sprintfAppendFloat|sprintfAppendStr)\\b"
+        },
+        {
+          "comment": "Tasmota command & output",
+          "name": "support.function.tasmota.tinyc",
+          "match": "\\b(tasmCmd|sensorGet|responseAppend|webSend|webFlush|addLog|addCommand|responseCmnd)\\b"
+        },
+        {
+          "comment": "I2C bus",
+          "name": "support.function.i2c.tinyc",
+          "match": "\\b(i2cRead8|i2cWrite8|i2cRead|i2cWrite|i2cExists|i2cRead0|i2cWrite0|i2cSetDevice|i2cSetActiveFound)\\b"
+        },
+        {
+          "comment": "SPI bus",
+          "name": "support.function.spi.tinyc",
+          "match": "\\b(spiInit|spiSetCS|spiTransfer)\\b"
+        },
+        {
+          "comment": "File I/O",
+          "name": "support.function.file.tinyc",
+          "match": "\\b(fileOpen|fileClose|fileRead|fileWrite|fileExists|fileDelete|fileSize|fileFormat|fileMkdir|fileRmdir|fileReadArray|fileWriteArray|fileLog|fileDownload|fileGetStr|fileExtract|fileExtractFast|fsInfo)\\b"
+        },
+        {
+          "comment": "Time / timestamp",
+          "name": "support.function.time.tinyc",
+          "match": "\\b(timeStamp|timeConvert|timeOffset|timeToSecs|secsToTime)\\b"
+        },
+        {
+          "comment": "HTTP requests",
+          "name": "support.function.http.tinyc",
+          "match": "\\b(httpGet|httpPost|httpHeader|webParse)\\b"
+        },
+        {
+          "comment": "TCP server",
+          "name": "support.function.tcp.tinyc",
+          "match": "\\b(tcpServer|tcpClose|tcpAvailable|tcpRead|tcpWrite|tcpReadArray|tcpWriteArray)\\b"
+        },
+        {
+          "comment": "UDP multicast and general-purpose",
+          "name": "support.function.udp.tinyc",
+          "match": "\\b(udpSend|udpRecv|udpReady|udpSendArray|udpRecvArray|udp)\\b"
+        },
+        {
+          "comment": "Display drawing",
+          "name": "support.function.display.tinyc",
+          "match": "\\b(dspText|dspClear|dspPos|dspFont|dspSize|dspColor|dspDraw|dspPad|dspPixel|dspLine|dspRect|dspFillRect|dspCircle|dspFillCircle|dspHLine|dspVLine|dspRoundRect|dspFillRoundRect|dspTriangle|dspFillTriangle|dspDim|dspOnOff|dspUpdate|dspPicture|dspWidth|dspHeight)\\b"
+        },
+        {
+          "comment": "Touch Buttons",
+          "name": "support.function.touch.tinyc",
+          "match": "\\b(dspButton|dspTButton|dspPButton|dspSlider|dspButtonState|dspButtonDel|touchButton)\\b"
+        },
+        {
+          "comment": "WebUI widgets",
+          "name": "support.function.webui.tinyc",
+          "match": "\\b(webButton|webSlider|webCheckbox|webText|webNumber|webPulldown|webRadio|webTime|webPageLabel|webPage|webSendFile|webOn|webHandler|webArg)\\b"
+        },
+        {
+          "comment": "Audio",
+          "name": "support.function.audio.tinyc",
+          "match": "\\b(audioVol|audioPlay|audioSay)\\b"
+        },
+        {
+          "comment": "Deep sleep",
+          "name": "support.function.sleep.tinyc",
+          "match": "\\b(deepSleep|deepSleepGpio|wakeupCause)\\b"
+        },
+        {
+          "comment": "Email",
+          "name": "support.function.email.tinyc",
+          "match": "\\b(mailBody|mailAttach|mailSend)\\b"
+        },
+        {
+          "comment": "HomeKit",
+          "name": "support.function.homekit.tinyc",
+          "match": "\\b(hkSetCode|hkAdd|hkVar|hkReady|hkStart|hkReset|hkStop)\\b"
+        },
+        {
+          "comment": "LED strip",
+          "name": "support.function.led.tinyc",
+          "match": "\\b(setPixels)\\b"
+        },
+        {
+          "comment": "Smart Meter (SML)",
+          "name": "support.function.sml.tinyc",
+          "match": "\\b(smlGet|smlGetStr|smlWrite|smlRead|smlSetBaud|smlSetWStr|smlSetOpt|smlGetV)\\b"
+        },
+        {
+          "comment": "mDNS",
+          "name": "support.function.mdns.tinyc",
+          "match": "\\b(mdnsRegister)\\b"
+        },
+        {
+          "comment": "Watch intrinsics",
+          "name": "support.function.watch.tinyc",
+          "match": "\\b(changed|delta|written|snapshot|saveVars)\\b"
+        },
+        {
+          "comment": "Tesla Powerwall",
+          "name": "support.function.powerwall.tinyc",
+          "match": "\\b(pwlRequest|pwlBind|pwlGet|pwlStr)\\b"
+        },
+        {
+          "comment": "Debug",
+          "name": "support.function.debug.tinyc",
+          "match": "\\b(print|dumpVM)\\b"
+        },
+        {
+          "comment": "Tasmota system variables",
+          "name": "variable.language.tasmota.tinyc",
+          "match": "\\b(tasm_wifi|tasm_mqttcon|tasm_teleperiod|tasm_uptime|tasm_heap|tasm_power|tasm_dimmer|tasm_temp|tasm_hum|tasm_hour|tasm_minute|tasm_second|tasm_year|tasm_month|tasm_day|tasm_wday|tasm_cw|tasm_sunrise|tasm_sunset|tasm_time)\\b"
+        }
+      ]
+    },
+    "function-definition": {
+      "comment": "Function definitions: type name(...) {",
+      "patterns": [
+        {
+          "match": "\\b(int|float|char|void|bool)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "storage.type.tinyc" },
+            "2": { "name": "entity.name.function.tinyc" }
+          }
+        }
+      ]
+    },
+    "function-call": {
+      "comment": "Generic function calls (not builtins)",
+      "patterns": [
+        {
+          "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.tinyc" }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.compound.tinyc",
+          "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>="
+        },
+        {
+          "name": "keyword.operator.comparison.tinyc",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.tinyc",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.bitwise.tinyc",
+          "match": "&|\\||\\^|~|<<|>>"
+        },
+        {
+          "name": "keyword.operator.increment-decrement.tinyc",
+          "match": "\\+\\+|--"
+        },
+        {
+          "name": "keyword.operator.assignment.tinyc",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.arithmetic.tinyc",
+          "match": "\\+|-|\\*|/|%"
+        }
+      ]
+    }
+  }
+}

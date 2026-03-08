@@ -25,8 +25,12 @@
 
 #define XSNS_53 53
 
-// this driver depends on use USE_SCRIPT !!!
+// this driver works with USE_SCRIPT or standalone with USE_UFILESYS (file: /sml_meter.def)
 
+// provide SCRIPT_EOL if scripter is not compiled
+#ifndef SCRIPT_EOL
+#define SCRIPT_EOL '\n'
+#endif
 
 // debug counter input to led for counter1 and 2
 //#define DEBUG_CNT_LED1 2
@@ -58,9 +62,11 @@
 // if you have to save more RAM you may disable these options by defines in user_config_override
 
 #ifndef NO_SML_REPLACE_VARS
+#ifdef USE_SCRIPT
 // allows to replace values in decoder section with script string variables
 #undef SML_REPLACE_VARS
 #define SML_REPLACE_VARS
+#endif
 #endif
 
 #ifndef NO_USE_SML_SPECOPT
@@ -1346,6 +1352,7 @@ double dval;
 }
 
 uint8_t sb_counter;
+uint32_t lastmath;
 
 // need double precision in this driver
 double CharToDouble(const char *str)
@@ -1483,6 +1490,8 @@ void sml_empty_receiver(uint32_t meters) {
     meter_desc[meters].meter_ss->read();
   }
 }
+
+void SML_Decode(uint8_t index);
 
 void sml_shift_in(uint32_t meters, uint32_t shard) {
   uint32_t count;
@@ -1810,6 +1819,9 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
       break;
   }
   sb_counter++;
+  if (sb_counter > 10) {
+    sb_counter = 0;
+  }
 
   if (mp->shift_mode) {
     SML_Decode(meters);
@@ -1993,6 +2005,8 @@ void SML_Decode(uint8_t index) {
       mp++;
       // do math m 1+2+3
       if (*mp == 'm' && !sb_counter) {
+      //if (*mp == 'm' && (millis()-lastmath)>1000) {
+        lastmath = millis();
         // only every 256 th byte
         // else it would be calculated every single serial byte
         mp++;
@@ -2966,8 +2980,6 @@ void SML_CounterIsr(void *arg) {
 #endif
 
 
-#ifdef SML_REPLACE_VARS
-
 #ifndef SML_SRCBSIZE
 #define SML_SRCBSIZE 256
 #endif
@@ -2981,6 +2993,8 @@ uint32_t cnt;
   }
   return cnt;
 }
+
+#ifdef SML_REPLACE_VARS
 
 uint32_t SML_getscriptsize(char *lp) {
 uint32_t mlen = 0;
@@ -3273,16 +3287,26 @@ void SML_Init(void) {
 
 	sml_globs.mp = meter_desc;
 
+  lastmath = millis();
+
+#ifdef USE_SCRIPT
   uint8_t meter_script = Run_Scripter(">M", -2, 0);
+#else
+  uint8_t meter_script = 0;  // no script, force file-only path
+#endif
   char *lp;
 #ifdef USE_UFILESYS
   char *file_md = 0;
 #define SML_METER_FILE "/sml_meter.def"
   if (meter_script != 99) {
     // try to load meter descriptor from filesystem
-    char fname[16]; 
+    char fname[16];
     strcpy_P(fname, PSTR("/sml_meter.def"));
+#ifdef USE_SCRIPT
     FS *cfp = script_file_path(fname);
+#else
+    FS *cfp = ufsp;
+#endif
     File ef = cfp->open(fname, FS_FILE_READ);
     if (ef) {
       uint16_t fsiz = ef.size();
@@ -3295,18 +3319,28 @@ void SML_Init(void) {
       }
     } else {
       nfd:
-      AddLog(LOG_LEVEL_INFO, PSTR("no meter section found!"));
+      AddLog(LOG_LEVEL_INFO, PSTR("SML: no meter section found!"));
       return;
     }
   } else {
+#ifdef USE_SCRIPT
      lp = glob_script_mem.section_ptr;
-  }
 #else
+     AddLog(LOG_LEVEL_INFO, PSTR("SML: no meter section found!"));
+     return;
+#endif
+  }
+#else  // !USE_UFILESYS
+#ifdef USE_SCRIPT
   if (meter_script != 99) {
-    AddLog(LOG_LEVEL_INFO, PSTR("no meter section found!"));
+    AddLog(LOG_LEVEL_INFO, PSTR("SML: no meter section found!"));
     return;
   }
   lp = glob_script_mem.section_ptr;
+#else
+  AddLog(LOG_LEVEL_INFO, PSTR("SML: need USE_SCRIPT or USE_UFILESYS!"));
+  return;
+#endif
 #endif
 
   uint8_t new_meters_used;
@@ -3374,10 +3408,14 @@ void SML_Init(void) {
   if (file_md) {
     lp = strstr_P(file_md, PSTR(">M"));
   } else {
+#ifdef USE_SCRIPT
     lp = glob_script_mem.section_ptr;
+#endif
   }
 #else
+#ifdef USE_SCRIPT
   lp = glob_script_mem.section_ptr;
+#endif
 #endif
 
   struct METER_DESC *mmp;
@@ -4278,8 +4316,6 @@ uint32_t ctime = millis();
   }
 }
 
-#ifdef USE_SCRIPT
-
 #ifdef USE_SML_CANBUS
 
 
@@ -4750,7 +4786,6 @@ void SML_Send_Seq(uint32_t meter, char *seq) {
 #endif
 
 }
-#endif // USE_SCRIPT
 
 uint16_t MBUS_calculateCRC(uint8_t *frame, uint8_t num, uint16_t start) {
   uint16_t crc, flag;

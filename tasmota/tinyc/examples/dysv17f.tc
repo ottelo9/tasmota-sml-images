@@ -1,0 +1,164 @@
+// DY-SV17F MP3 Player Driver (Serial TX)
+// UART 9600 baud, TX only
+// Packet: [0xAA] [CMD] [data_len] [data...] [checksum]
+// Checksum = sum of all bytes (incl. 0xAA) & 0xFF
+// Play by filename: cmd 0x08, data = [device][path_transformed]
+// Path: /prefix, dots→stars, uppercase. E.g. "Sound.mp3" → "/SOUND*MP3"
+// Console: MP3 Play Sound.mp3, MP3 Stop, MP3 Pause, MP3 Next, MP3 Prev, MP3 Vol 20
+
+#define DY_DEVICE  2    // 0=USB, 1=SD, 2=FLASH (built-in)
+
+int dy_txpin = 10;      // TX pin — selectable via web UI
+int dy_ok = 0;
+int dy_vol = 15;
+char dy_file[32];
+char dy_pkt[34];    // global packet buffer for dy_send
+
+// Send raw packet: [0xAA][cmd][len][data from dy_pkt][checksum]
+// Builds complete packet in dy_buf and sends as single buffer write
+char dy_buf[38];    // complete packet buffer (header + data + checksum)
+
+void dy_send(int cmd, int len) {
+    dy_buf[0] = 0xAA;
+    dy_buf[1] = cmd;
+    dy_buf[2] = len;
+    int cs = 0xAA + cmd + len;
+    int i = 0;
+    while (i < len) {
+        dy_buf[3 + i] = dy_pkt[i];
+        cs = cs + dy_pkt[i];
+        i++;
+    }
+    dy_buf[3 + len] = cs & 0xFF;
+    serialWriteBytes(dy_buf, len + 4);
+}
+
+// Simple commands (no data)
+void dy_play()  { dy_send(0x02, 0); }
+void dy_stop()  { dy_send(0x04, 0); }
+void dy_pause() { dy_send(0x03, 0); }
+void dy_next()  { dy_send(0x06, 0); }
+void dy_prev()  { dy_send(0x05, 0); }
+
+void dy_volume(int v) {
+    if (v < 0) v = 0;
+    if (v > 30) v = 30;
+    dy_vol = v;
+    dy_pkt[0] = v;
+    dy_send(0x13, 1);
+}
+
+// Play file by name on specified device
+// Reads filename from dy_file global
+// Transforms: dots→stars, uppercase
+// Sends cmd 0x08: [device][transformed_path]
+void dy_play_file() {
+    dy_pkt[0] = DY_DEVICE;
+    int i = 0;
+    int o = 1;
+    // Auto-prepend '/' if missing (DY-SV17F needs absolute path)
+    if (dy_file[0] != '/') {
+        dy_pkt[o] = '/';
+        o++;
+    }
+    while (dy_file[i] && o < 33) {
+        int c = dy_file[i];
+        if (c == '.') {
+            dy_pkt[o] = '*';
+        } else if (c >= 'a' && c <= 'z') {
+            dy_pkt[o] = c - 32;  // uppercase
+        } else {
+            dy_pkt[o] = c;
+        }
+        o++;
+        i++;
+    }
+    dy_send(0x08, o);
+}
+
+void Command(char cmd[]) {
+    char buf[64];
+    char arg[32];
+
+    // Tasmota uppercases the topic, so subcommands arrive as PLAY, STOP, etc.
+    // Data after the space (filenames, numbers) keeps original case.
+    if (strFind(cmd, "PLAY") == 0) {
+        // "PLAY" or "PLAY Sound.mp3"
+        if (strlen(cmd) > 5) {
+            strSub(dy_file, cmd, 5, 0);
+            dy_play_file();
+            sprintfStr(buf, "Playing %s", dy_file);
+            responseCmnd(buf);
+        } else {
+            dy_play();
+            responseCmnd("Playing");
+        }
+    } else if (strFind(cmd, "STOP") == 0) {
+        dy_stop();
+        responseCmnd("Stopped");
+    } else if (strFind(cmd, "PAUSE") == 0) {
+        dy_pause();
+        responseCmnd("Paused");
+    } else if (strFind(cmd, "NEXT") == 0) {
+        dy_next();
+        responseCmnd("Next track");
+    } else if (strFind(cmd, "PREV") == 0) {
+        dy_prev();
+        responseCmnd("Previous track");
+    } else if (strFind(cmd, "VOL") == 0) {
+        if (strlen(cmd) > 4) {
+            strSub(arg, cmd, 4, 0);
+            int val = atoi(arg);
+            dy_volume(val);
+        }
+        sprintfInt(buf, "Volume: %d", dy_vol);
+        responseCmnd(buf);
+    } else {
+        responseCmnd("Play [file]|Stop|Pause|Next|Prev|Vol <n>");
+    }
+}
+
+void WebUI() {
+    webPulldown(dy_txpin, "TX Pin", "@getfreepins");
+}
+
+void WebCall() {
+    char buf[64];
+    if (dy_ok) {
+        sprintfInt(buf, "{s}MP3 Volume{m}%d{e}", dy_vol);
+        webSend(buf);
+        if (dy_file[0]) {
+            sprintfStr(buf, "{s}MP3 File{m}%s{e}", dy_file);
+            webSend(buf);
+        }
+    } else {
+        webSend("{s}MP3{m}not ready{e}");
+    }
+}
+
+void OnExit() {
+    dy_stop();
+    delay(50);
+    serialClose();
+}
+
+int main() {
+    dy_file[0] = 0;
+    // Wait for system to fully initialize (serial/GPIO not ready during early boot)
+    delay(10000);
+    // Restore persisted pin from web UI before opening serial
+    webPulldown(dy_txpin, "TX Pin", "@getfreepins");
+    int ret = serialBegin(-1, dy_txpin, 9600, 3, 64);  // 3 = 8N1
+    if (ret == 1) {
+        dy_ok = 1;
+        addCommand("MP3");
+        delay(100);
+        dy_volume(dy_vol);
+        char buf[48];
+        sprintfInt(buf, "DY-SV17F ready on GPIO %d\n", dy_txpin);
+        print(buf);
+    } else {
+        print("DY-SV17F: serial init failed\n");
+    }
+    return 0;
+}

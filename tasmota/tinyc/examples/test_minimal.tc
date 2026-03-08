@@ -1,0 +1,15 @@
+// Absolute minimal test - just EverySecond
+int cnt;
+char buf[32];
+
+void EverySecond() {
+    cnt = cnt + 1;
+    sprintfInt(buf, "tick %d\n", cnt);
+    print(buf);
+}
+
+int main() {
+    cnt = 0;
+    print("minimal test started\n");
+    return 0;
+}

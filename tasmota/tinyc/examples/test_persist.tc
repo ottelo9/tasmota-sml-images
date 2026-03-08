@@ -1,0 +1,68 @@
+// Test: Persist variables survive reboot
+// Run this program, increment counters, call saveVars(), then reboot.
+// After reboot, the counters should be restored.
+
+persist int boot_count;
+persist int total_seconds;
+persist float max_temp;
+persist float min_temp;
+persist int last_hour;
+persist int last_minute;
+
+int initialized;
+
+int main() {
+    boot_count = boot_count + 1;
+
+    // First boot detection: if max_temp is still 0, initialize bounds
+    if (max_temp == 0 && min_temp == 0) {
+        max_temp = -100.0;
+        min_temp = 100.0;
+        print("First boot — persist vars initialized\n");
+    }
+
+    char msg[128];
+    sprintfInt(msg, "Boot #%d\n", boot_count);
+    printStr(msg);
+    sprintfInt(msg, "Total seconds tracked: %d\n", total_seconds);
+    printStr(msg);
+    sprintfFloat(msg, "Temperature range: %.1f", min_temp);
+    sprintfAppendFloat(msg, " to %.1f\n", max_temp);
+    printStr(msg);
+    sprintfInt(msg, "Last save: %02d:", last_hour);
+    sprintfAppendInt(msg, "%02d\n", last_minute);
+    printStr(msg);
+
+    // Save on every boot to track boot_count
+    saveVars();
+    initialized = 1;
+}
+
+void EverySecond() {
+    if (!initialized) return;
+    total_seconds = total_seconds + 1;
+
+    // Track temperature extremes
+    float t = tasm_temp;
+    if (t > max_temp) max_temp = t;
+    if (t < min_temp && t > -50.0) min_temp = t;
+
+    // Auto-save every 5 minutes
+    if (tasm_second == 0 && (tasm_minute % 5) == 0) {
+        last_hour = tasm_hour;
+        last_minute = tasm_minute;
+        saveVars();
+        print("Persist vars saved\n");
+    }
+}
+
+void WebPage() {
+    char html[256];
+    sprintfInt(html, "<p>Boot count: <b>%d</b></p>", boot_count);
+    sprintfAppendInt(html, "<p>Uptime tracked: <b>%d</b> seconds</p>", total_seconds);
+    sprintfAppendFloat(html, "<p>Temp min: <b>%.1f</b>", min_temp);
+    sprintfAppendFloat(html, " max: <b>%.1f</b></p>", max_temp);
+    sprintfAppendInt(html, "<p>Last save: %02d:", last_hour);
+    sprintfAppendInt(html, "%02d</p>", last_minute);
+    webSend(html);
+}

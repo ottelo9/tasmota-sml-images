@@ -1,0 +1,70 @@
+// Test: HTTP requests and webParse
+// Tests httpGet, webParse for parsing responses
+// Requires WiFi — no special hardware
+
+char response[512];
+char parsed[128];
+int http_ok;
+
+int main() {
+    print("=== HTTP & webParse Test ===\n\n");
+
+    // Test 1: GET request to own device (status page)
+    print("--- HTTP GET own status ---\n");
+    char url[64];
+    strcpy(url, "http://localhost/cm?cmnd=status%200");
+    http_ok = httpGet(url, response);
+    char msg[64];
+    sprintfInt(msg, "httpGet returned: %d\n", http_ok);
+    printStr(msg);
+    if (http_ok == 200) {
+        // Response is JSON — parse with strToken
+        char val[32];
+        int r = strToken(response, val, "Heap", 0);
+        if (r > 0) {
+            sprintfStr(msg, "  Found Heap info: %s\n", val);
+            printStr(msg);
+        }
+        print("  GET own status OK\n");
+    } else {
+        print("  GET failed (expected on some configs)\n");
+    }
+
+    // Test 2: webParse with delimiter parsing
+    print("\n--- webParse delimiter ---\n");
+    char data[128];
+    strcpy(data, "alpha;beta;gamma;delta;epsilon");
+    char field[32];
+
+    // Parse 3rd field (index 2) with ; delimiter
+    int r = webParse(data, 2, ";", field);
+    sprintfStr(msg, "  field[2] = '%s'", field);
+    sprintfAppendInt(msg, " (r=%d)\n", r);
+    printStr(msg);
+
+    r = webParse(data, 0, ";", field);
+    sprintfStr(msg, "  field[0] = '%s'\n", field);
+    printStr(msg);
+
+    r = webParse(data, 4, ";", field);
+    sprintfStr(msg, "  field[4] = '%s'\n", field);
+    printStr(msg);
+
+    // Test 3: webParse with name=value parsing
+    print("\n--- webParse name=value ---\n");
+    strcpy(data, "temp=23.5&hum=67&press=1013.25&wind=3.2");
+
+    r = webParse(data, 0, "temp", field);
+    sprintfStr(msg, "  temp = '%s'\n", field);
+    printStr(msg);
+
+    r = webParse(data, 0, "hum", field);
+    sprintfStr(msg, "  hum = '%s'\n", field);
+    printStr(msg);
+
+    r = webParse(data, 0, "press", field);
+    sprintfStr(msg, "  press = '%s'\n", field);
+    printStr(msg);
+
+    print("\n=== HTTP tests complete ===\n");
+}

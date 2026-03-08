@@ -1,0 +1,154 @@
+// Test: Math operations, float/int coercion, arrays
+// Pure software — no hardware dependencies
+
+char buf[256];
+int errors;
+int tests;
+
+void check(int condition, char name[]) {
+    tests = tests + 1;
+    if (condition) {
+        sprintfStr(buf, "  PASS: %s\n", name);
+    } else {
+        errors = errors + 1;
+        sprintfStr(buf, "  FAIL: %s\n", name);
+    }
+    printStr(buf);
+}
+
+void checkf(float val, float expected, float tol, char name[]) {
+    tests = tests + 1;
+    float diff = val - expected;
+    if (diff < 0) diff = 0.0 - diff;
+    if (diff < tol) {
+        sprintfStr(buf, "  PASS: %s\n", name);
+    } else {
+        errors = errors + 1;
+        sprintfStr(buf, "  FAIL: %s", name);
+        sprintfAppendFloat(buf, " (got %.4f", val);
+        sprintfAppendFloat(buf, " expected %.4f)\n", expected);
+    }
+    printStr(buf);
+}
+
+void test_basic_math() {
+    print("--- Basic Math ---\n");
+    check(abs(-42) == 42, "abs negative");
+    check(abs(42) == 42, "abs positive");
+    check(min(3, 7) == 3, "min");
+    check(max(3, 7) == 7, "max");
+    check(map(50, 0, 100, 0, 1000) == 500, "map 50%");
+    check(map(0, 0, 100, 0, 1000) == 0, "map 0%");
+}
+
+void test_float_math() {
+    print("--- Float Math ---\n");
+    checkf(sqrt(4.0), 2.0, 0.001, "sqrt(4)");
+    checkf(sqrt(2.0), 1.4142, 0.001, "sqrt(2)");
+    checkf(sin(0.0), 0.0, 0.001, "sin(0)");
+    checkf(cos(0.0), 1.0, 0.001, "cos(0)");
+    checkf(sin(1.5708), 1.0, 0.001, "sin(pi/2)");
+    checkf(floor(3.7), 3.0, 0.001, "floor(3.7)");
+    checkf(ceil(3.2), 4.0, 0.001, "ceil(3.2)");
+    checkf(round(3.5), 4.0, 0.001, "round(3.5)");
+    checkf(round(3.4), 3.0, 0.001, "round(3.4)");
+}
+
+void test_float_int_coercion() {
+    print("--- Float/Int Coercion ---\n");
+    float f = 3.14;
+    int i = f;        // float to int truncation
+    check(i == 3, "float to int truncate");
+
+    i = 42;
+    f = i;            // int to float
+    checkf(f, 42.0, 0.001, "int to float");
+
+    // Arithmetic mixing
+    f = 10.5 + 3;     // float + int
+    checkf(f, 13.5, 0.001, "float + int");
+
+    f = 7 * 2.5;      // int * float
+    checkf(f, 17.5, 0.001, "int * float");
+}
+
+void test_arrays() {
+    print("--- Arrays ---\n");
+    int a[10];
+    float fa[10];
+    int i;
+
+    // Fill and verify
+    for (i = 0; i < 10; i = i + 1) {
+        a[i] = i * i;
+        fa[i] = i * 0.5;
+    }
+    check(a[0] == 0, "array[0] = 0");
+    check(a[5] == 25, "array[5] = 25");
+    check(a[9] == 81, "array[9] = 81");
+    checkf(fa[3], 1.5, 0.001, "float array[3]");
+    checkf(fa[7], 3.5, 0.001, "float array[7]");
+
+    // Sort
+    int unsorted[8];
+    unsorted[0] = 5; unsorted[1] = 2; unsorted[2] = 8; unsorted[3] = 1;
+    unsorted[4] = 9; unsorted[5] = 3; unsorted[6] = 7; unsorted[7] = 4;
+    sortArray(unsorted, 8, 0);  // 0 = ascending
+    check(unsorted[0] == 1, "sort asc [0]");
+    check(unsorted[7] == 9, "sort asc [7]");
+    sortArray(unsorted, 8, 1);  // 1 = descending
+    check(unsorted[0] == 9, "sort desc [0]");
+    check(unsorted[7] == 1, "sort desc [7]");
+}
+
+void test_random() {
+    print("--- Random ---\n");
+    int i;
+    int in_range = 1;
+    for (i = 0; i < 100; i = i + 1) {
+        int r = random(10, 20);
+        if (r < 10 || r > 20) {
+            in_range = 0;
+        }
+    }
+    check(in_range, "random(10,20) in range x100");
+
+    // Two random calls should (very likely) differ
+    int r1 = random(0, 1000000);
+    int r2 = random(0, 1000000);
+    check(r1 != r2, "two randoms differ");
+}
+
+void test_tasm_vars() {
+    print("--- Tasmota System Variables ---\n");
+    check(tasm_heap > 0, "tasm_heap > 0");
+    check(tasm_uptime >= 0, "tasm_uptime >= 0");
+    check(tasm_hour >= 0 && tasm_hour < 24, "tasm_hour valid");
+    check(tasm_minute >= 0 && tasm_minute < 60, "tasm_minute valid");
+    check(tasm_second >= 0 && tasm_second < 60, "tasm_second valid");
+    check(tasm_year >= 2024, "tasm_year >= 2024");
+    check(tasm_month >= 1 && tasm_month <= 12, "tasm_month valid");
+    check(tasm_day >= 1 && tasm_day <= 31, "tasm_day valid");
+    check(tasm_wday >= 0 && tasm_wday <= 6, "tasm_wday valid");
+    // pheap may be 0 on ESP8266, > 0 on ESP32 with PSRAM
+    char msg[64];
+    sprintfInt(msg, "  tasm_pheap = %d\n", tasm_pheap);
+    printStr(msg);
+}
+
+int main() {
+    errors = 0;
+    tests = 0;
+    print("=== Math & Arrays Test Suite ===\n\n");
+
+    test_basic_math();
+    test_float_math();
+    test_float_int_coercion();
+    test_arrays();
+    test_random();
+    test_tasm_vars();
+
+    sprintfInt(buf, "\n=== Results: %d tests, ", tests);
+    sprintfAppendInt(buf, "%d errors ===\n", errors);
+    printStr(buf);
+}

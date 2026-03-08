@@ -1,0 +1,145 @@
+// VEML6075 UV Light Sensor Driver
+// I2C address: 0x10, 16-bit registers (LSB first)
+// Reads UVA, UVB with compensation and calculates UV Index
+// Compensation removes visible light and IR interference
+// DN40 responsivity for UV Index calculation
+
+#define VEML_ADDR    0x10
+#define VEML_CONF    0x00
+#define VEML_UVA     0x07
+#define VEML_UVB     0x09
+#define VEML_UVCOMP1 0x0A
+#define VEML_UVCOMP2 0x0B
+#define VEML_ID      0x0C
+
+int veml_addr = 0;
+int veml_bus = 0;
+int veml_ok = 0;
+int veml_uva = 0;
+int veml_uvb = 0;
+float veml_uvi = 0.0;
+
+char veml_buf[2];
+
+// Read 16-bit register (LSB first)
+int veml_read16(int reg) {
+    if (!i2cReadRS(veml_addr, reg, veml_buf, 2, veml_bus)) {
+        return -1;
+    }
+    return veml_buf[0] | (veml_buf[1] << 8);
+}
+
+// Write 16-bit register (LSB first)
+int veml_write16(int reg, int val) {
+    veml_buf[0] = val & 0xFF;
+    veml_buf[1] = (val >> 8) & 0xFF;
+    return i2cWrite(veml_addr, reg, veml_buf, 2, veml_bus);
+}
+
+int veml_init() {
+    // Verify chip ID (expect 0x0026)
+    int id = veml_read16(VEML_ID);
+    if (id != 0x26) {
+        return 0;
+    }
+    // Config: 100ms integration (inttime=1 in bits 6:4), active mode
+    veml_write16(VEML_CONF, 0x10);
+    return 1;
+}
+
+int veml_scan() {
+    int bus = 0;
+    while (bus < 2) {
+        if (i2cSetDevice(VEML_ADDR, bus)) {
+            veml_addr = VEML_ADDR;
+            veml_bus = bus;
+            if (veml_init()) {
+                i2cSetActiveFound(veml_addr, "VEML6075", veml_bus);
+                return 1;
+            }
+            veml_addr = 0;
+        }
+        bus++;
+    }
+    return 0;
+}
+
+void EverySecond() {
+    if (!veml_addr) {
+        if (!veml_scan()) { veml_ok = 0; return; }
+    }
+
+    int uva_raw = veml_read16(VEML_UVA);
+    int uvb_raw = veml_read16(VEML_UVB);
+    int comp1   = veml_read16(VEML_UVCOMP1);
+    int comp2   = veml_read16(VEML_UVCOMP2);
+
+    if (uva_raw < 0 || uvb_raw < 0 || comp1 < 0 || comp2 < 0) {
+        veml_ok = 0;
+        return;
+    }
+
+    // Compensate for visible light and IR interference
+    float uva_comp = (float)uva_raw - 2.22 * (float)comp1 - 1.33 * (float)comp2;
+    float uvb_comp = (float)uvb_raw - 2.95 * (float)comp1 - 1.74 * (float)comp2;
+    if (uva_comp < 0.0) uva_comp = 0.0;
+    if (uvb_comp < 0.0) uvb_comp = 0.0;
+
+    veml_uva = (int)uva_comp;
+    veml_uvb = (int)uvb_comp;
+
+    // UV Index (100ms responsivity: UVA=0.001461, UVB=0.002591)
+    veml_uvi = (uva_comp * 0.001461 + uvb_comp * 0.002591) / 2.0;
+
+    veml_ok = 1;
+}
+
+void WebCall() {
+    char buf[64];
+    if (veml_ok) {
+        sprintfInt(buf, "{s}VEML6075 UVA{m}%d{e}", veml_uva);
+        webSend(buf);
+        sprintfInt(buf, "{s}VEML6075 UVB{m}%d{e}", veml_uvb);
+        webSend(buf);
+        sprintfFloat(buf, "{s}VEML6075 UV Index{m}%.1f{e}", veml_uvi);
+        webSend(buf);
+    } else {
+        webSend("{s}VEML6075{m}no data{e}");
+    }
+}
+
+void JsonCall() {
+    if (!veml_ok) return;
+    char buf[96];
+    sprintfInt(buf, ",\"VEML6075\":{\"UVA\":%d", veml_uva);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"UVB\":%d", veml_uvb);
+    responseAppend(buf);
+    sprintfFloat(buf, ",\"UVI\":%.1f}", veml_uvi);
+    responseAppend(buf);
+}
+
+void OnExit() {
+    if (veml_addr) {
+        // Shutdown sensor (set pwr bit)
+        veml_write16(VEML_CONF, 0x01);
+        I2cResetActive(veml_addr, veml_bus);
+        veml_addr = 0;
+    }
+}
+
+int main() {
+    char buf[48];
+    veml_ok = 0;
+    veml_addr = 0;
+
+    if (veml_scan()) {
+        sprintfInt(buf, "VEML6075 found at 0x%x", veml_addr);
+        print(buf);
+        sprintfInt(buf, " on bus %d\n", veml_bus);
+        print(buf);
+    } else {
+        print("VEML6075 not found\n");
+    }
+    return 0;
+}

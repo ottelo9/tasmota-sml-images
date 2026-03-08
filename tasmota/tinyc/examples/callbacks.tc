@@ -1,0 +1,28 @@
+// Callback functions — Tasmota integration
+// EverySecond, JsonCall, WebCall are called automatically by Tasmota
+
+int counter = 0;
+
+void EverySecond() {
+    counter++;
+}
+
+void JsonCall() {
+    // Appends to Tasmota MQTT telemetry JSON
+    char buf[64];
+    sprintfInt(buf, ",\"TinyC\":{\"Count\":%d}", counter);
+    responseAppend(buf);
+}
+
+void WebCall() {
+    // Adds a row to the Tasmota web page
+    char buf[64];
+    sprintfInt(buf, "{s}TinyC Counter{m}%d{e}", counter);
+    webSend(buf);
+}
+
+int main() {
+    counter = 0;
+    printStr("Callbacks active\n");
+    return 0;
+}

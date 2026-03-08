@@ -1,0 +1,17 @@
+// Blink LED on pin 8 (classic Arduino blink)
+#define LED_PIN 8
+#define OUTPUT 1
+
+int main() {
+    pinMode(LED_PIN, OUTPUT);
+
+    int i = 0;
+    while (i < 10) {
+        digitalWrite(LED_PIN, 1);
+        delay(500);
+        digitalWrite(LED_PIN, 0);
+        delay(500);
+        i++;
+    }
+    return 0;
+}

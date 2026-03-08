@@ -1,0 +1,210 @@
+// Test: all globals + arrays from core2_energy, minimal code
+// If EverySecond works with these, the issue is in function code
+
+// ─── UDP globals ───
+int sedt;
+int sedc;
+int atmp;
+int scol;
+int ssp;
+int wrgh;
+int wrgg;
+int wrga;
+int auto_g;
+int t_ga;
+int t_gh;
+int t_gg;
+int t_wb;
+int t_ws;
+int t_gs;
+int bw_ww;
+int zwzi;
+int zwzo;
+int zwzc;
+int pwl;
+int sip;
+int sop;
+int bip;
+int hip;
+int tcap;
+int rcap;
+int rper;
+int wtemp;
+int whumi;
+int wtvoc;
+int wco2;
+int aztemp;
+int azhumi;
+int aztvoc;
+int azeco2;
+int bpress;
+int btemp;
+int bhumi;
+int klima;
+int pwp;
+int t_kpwp;
+int bwwp;
+int bwtwp;
+int hwp;
+int t_hwp;
+int train;
+int hrain;
+int avgt;
+int ktmp;
+int shtemp;
+int phs1;
+int phs2;
+int phs3;
+int gerr;
+
+char tv2_ip[20];
+char us_ip[20];
+char fs_ip[20];
+char wz_ip[20];
+
+// ─── Persist ───
+persist int hwp_m;
+persist int zrz_m;
+persist int auto_m;
+persist int gas_m;
+persist int was_m;
+persist int micgain;
+persist int loud;
+
+// ─── Daily arrays (97 elements each) ───
+int t_wr1[97];
+int t_wr2[97];
+int t_wr3[97];
+int t_wr4[97];
+int t_hv[97];
+int t_atmp[97];
+int t_ktmp[97];
+int t_ss[97];
+int t_pw[97];
+int t_hzwp[97];
+int t_bwwp[97];
+int t_ni[97];
+int t_gas[97];
+int t_wa[97];
+
+// ─── Weekly arrays (169 elements each) ───
+int w_atmp[169];
+int w_bwp[169];
+int w_hwp[169];
+int w_gwp[169];
+int w_rain[169];
+int w_pwl[169];
+int w_sin[169];
+int w_swa[169];
+int w_hv[169];
+int w_at[169];
+int w_sk[169];
+int w_wr1[169];
+int w_wr2[169];
+int w_wr3[169];
+int w_wr4[169];
+int w_gas[169];
+int w_pgas[169];
+int w_wa[169];
+int w_avgt[169];
+int w_bwwp[169];
+
+int a_du[169];
+
+// ─── Weekly summary (8 elements each) ───
+int wt_hv[8];
+int wt_sin1[8];
+int wt_sin2[8];
+int wt_sin3[8];
+int wt_sin4[8];
+int wt_he[8];
+int wt_wb[8];
+int wt_wp[8];
+int wt_bwwp[8];
+int wt_hwp[8];
+int wt_rain[8];
+int wt_tmp[8];
+int wt_gas[8];
+int wt_pgas[8];
+int wt_wa[8];
+
+int array[5];
+int hwp_avg[61];
+
+// ─── State variables ───
+int micrec;
+int tmp;
+int res;
+int cnt;
+int hr;
+int fr;
+int fsiz;
+int dotask;
+int tim;
+int mn;
+int extra;
+int once;
+int bflg;
+int tdur;
+int xtime;
+int dres;
+int dr;
+int start;
+int stop;
+int d52;
+int hwp_alarm;
+int alo;
+int batt;
+int stemp;
+int sens;
+int but1;
+int but2;
+int but3;
+int alarm;
+int gas_c;
+int was_c;
+int zrz_o;
+int oavgt;
+
+int sv_hwp_m;
+int sv_zrz_m;
+int sv_auto_m;
+int sv_gas_m;
+int sv_was_m;
+int sv_micgain;
+int sv_loud;
+
+int udp_timer;
+int dcnt_timer;
+int pw_timer;
+
+char buf[256];
+char str[128];
+char s1[32];
+char s2[32];
+char sx1[32];
+char sx2[32];
+char fnam[80];
+char hdr_s[64];
+char hstr[80];
+char lwstr[80];
+char tmin[32];
+char tmax[32];
+char tval[32];
+char oval[32];
+char min_s[32];
+char max_s[32];
+char wstr[128];
+
+// ─── Minimal code ───
+void EverySecond() {
+    cnt = cnt + 1;
+    sprintfInt(buf, "tick %d\n", cnt);
+    print(buf);
+}
+
+int main() {
+    cnt = 0;
+    print("globals test started\n");
+    return 0;
+}

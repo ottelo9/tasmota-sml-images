@@ -1,0 +1,39 @@
+{
+  "name": "tinyc",
+  "displayName": "TinyC",
+  "description": "Syntax highlighting for TinyC (.tc) — a C subset for ESP32/Tasmota",
+  "version": "1.0.0",
+  "publisher": "tinyc",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "tinyc",
+        "aliases": [
+          "TinyC",
+          "tinyc"
+        ],
+        "extensions": [
+          ".tc"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tinyc",
+        "scopeName": "source.tinyc",
+        "path": "./syntaxes/tinyc.tmLanguage.json"
+      }
+    ]
+  }
+}

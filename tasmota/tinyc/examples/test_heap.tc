@@ -1,0 +1,51 @@
+// Test: 35 large heap arrays
+int cnt;
+char buf[32];
+
+int arr1[169];
+int arr2[169];
+int arr3[169];
+int arr4[169];
+int arr5[169];
+int arr6[169];
+int arr7[169];
+int arr8[169];
+int arr9[169];
+int arr10[169];
+int arr11[169];
+int arr12[169];
+int arr13[169];
+int arr14[169];
+int arr15[169];
+int arr16[169];
+int arr17[169];
+int arr18[169];
+int arr19[169];
+int arr20[169];
+int arr21[169];
+int arr22[169];
+int arr23[169];
+int arr24[169];
+int arr25[169];
+int arr26[169];
+int arr27[169];
+int arr28[169];
+int arr29[169];
+int arr30[169];
+int arr31[169];
+int arr32[169];
+int arr33[97];
+int arr34[97];
+int arr35[97];
+
+void EverySecond() {
+    cnt = cnt + 1;
+    sprintfInt(buf, "tick %d\n", cnt);
+    print(buf);
+}
+
+int main() {
+    cnt = 0;
+    print("35 arrays test\n");
+    return 0;
+}

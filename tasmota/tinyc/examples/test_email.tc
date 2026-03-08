@@ -1,0 +1,105 @@
+// Test: Email with file attachment and inline credentials
+// Requires: WiFi connected
+// mailSend() format: "[server:port:user:password:from:to:subject]"
+// Empty fields use Tasmota's stored settings (emailserver, emailport, etc.)
+
+// *** CHANGE THESE to your real credentials ***
+#define SMTP_SERVER "smtp.gmail.com"
+#define SMTP_PORT   "587"
+#define SMTP_USER   "your@gmail.com"
+#define SMTP_PASS   "your-app-password"
+#define MAIL_FROM   "your@gmail.com"
+#define MAIL_TO     "recipient@example.com"
+
+char response[128];
+
+void send_with_inline_credentials() {
+    // All credentials in the bracket string — no Tasmota config needed
+    print("--- Method 1: Inline credentials ---\n");
+
+    // Create test file
+    int fd = fileOpen("/test_email.txt", 1);
+    if (fd < 0) { print("ERROR: cannot create test file\n"); return; }
+    char line[64];
+    sprintfInt(line, "TinyC test at uptime %d sec\n", tasm_uptime);
+    fileWrite(fd, line, strlen(line));
+    sprintfInt(line, "Heap: %d", tasm_heap);
+    sprintfAppendInt(line, "  PSRAM: %d\n", tasm_pheap);
+    fileWrite(fd, line, strlen(line));
+    fileClose(fd);
+
+    // Set body and attachment
+    char body[128];
+    strcpy(body, "<h2>TinyC Email Test</h2><p>Sent with inline SMTP credentials.</p>");
+    mailBody(body);
+    mailAttach("/test_email.txt");
+
+    // Build bracket string with all credentials
+    char params[256];
+    strcpy(params, "[");
+    strcat(params, SMTP_SERVER);
+    strcat(params, ":");
+    strcat(params, SMTP_PORT);
+    strcat(params, ":");
+    strcat(params, SMTP_USER);
+    strcat(params, ":");
+    strcat(params, SMTP_PASS);
+    strcat(params, ":");
+    strcat(params, MAIL_FROM);
+    strcat(params, ":");
+    strcat(params, MAIL_TO);
+    strcat(params, ":TinyC Test Email]");
+
+    int r = mailSend(params);
+    char msg[64];
+    sprintfInt(msg, "mailSend result: %d (0=ok)\n", r);
+    printStr(msg);
+}
+
+void send_with_tasmota_config() {
+    // Use Tasmota stored settings — set once, reuse
+    print("\n--- Method 2: Tasmota stored config ---\n");
+
+    // Configure SMTP via Tasmota commands (persists across reboots)
+    char cmd[128];
+    sprintfStr(cmd, "EmailServer %s", SMTP_SERVER);
+    tasmCmd(cmd, response);
+    sprintfStr(cmd, "EmailPort %s", SMTP_PORT);
+    tasmCmd(cmd, response);
+    sprintfStr(cmd, "EmailUser %s", SMTP_USER);
+    tasmCmd(cmd, response);
+    sprintfStr(cmd, "EmailPassword %s", SMTP_PASS);
+    tasmCmd(cmd, response);
+    sprintfStr(cmd, "EmailFrom %s", MAIL_FROM);
+    tasmCmd(cmd, response);
+    print("SMTP config stored in Tasmota settings\n");
+
+    // Now send with just from:to:subject — server/port/user/pass from settings
+    char body2[128];
+    strcpy(body2, "<h2>TinyC Email Test</h2><p>Sent using stored Tasmota SMTP config.</p>");
+    mailBody(body2);
+
+    char params[128];
+    strcpy(params, "[::::");
+    strcat(params, MAIL_FROM);
+    strcat(params, ":");
+    strcat(params, MAIL_TO);
+    strcat(params, ":TinyC Config Test]");
+
+    int r = mailSend(params);
+    char msg[64];
+    sprintfInt(msg, "mailSend result: %d (0=ok)\n", r);
+    printStr(msg);
+}
+
+int main() {
+    print("=== Email Test ===\n\n");
+    print("NOTE: Change #define credentials before running!\n\n");
+    send_with_inline_credentials();
+    // Uncomment to also test stored config:
+    // send_with_tasmota_config();
+
+    // Cleanup test file
+    fileDelete("/test_email.txt");
+    print("\nDone.\n");
+}

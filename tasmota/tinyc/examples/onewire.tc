@@ -1,0 +1,1486 @@
+// 1-Wire Driver: Temperature Sensors + Output Switches
+// Supports:
+//   DS18B20/DS18S20/DS1822 — temperature sensors
+//   DS2413 — 2-channel open-drain switch (family 0x3A)
+//   DS2408 — 8-channel GPIO (family 0x29)
+// Modes:
+//   GPIO mode  — native 1-Wire syscalls (timing in C, needs 4.7k pullup)
+//   DS2480B mode — via DS2480B serial-to-1-Wire bridge (9600 baud)
+//
+// WebUI lets user select mode and pin(s)
+// Supports up to 16 temp sensors + 16 switch devices on one bus
+// WebUI buttons for first 2 switch devices; rest via OW command
+
+#define OW_MAX_SENS 16
+#define OW_MAX_SW   16
+
+// 1-Wire ROM commands
+#define OW_SEARCH_ROM  0xF0
+#define OW_SKIP_ROM    0xCC
+#define OW_MATCH_ROM   0x55
+
+// DS18B20 commands
+#define DS_CONVERT     0x44
+#define DS_READ_SCRATCH 0xBE
+
+// DS18x20 family codes
+#define FAM_DS18B20  0x28
+#define FAM_DS18S20  0x10
+#define FAM_DS1822   0x22
+
+// DS2413 (2-ch switch) family + commands
+#define FAM_DS2413       0x3A
+#define DS2413_ACCESS_WRITE 0x5A
+#define DS2413_ACCESS_READ  0xF5
+
+// DS2406 (2-ch switch) family + commands
+#define FAM_DS2406       0x12
+#define DS2406_CH_ACCESS     0xF5
+#define DS2406_WRITE_STATUS  0x55
+
+// DS2408 (8-ch GPIO) family + commands
+#define FAM_DS2408       0x29
+#define DS2408_CHANNEL_WRITE 0x5A
+#define DS2408_CHANNEL_READ  0xF0
+#define DS2408_READ_PIO      0xF5
+
+// DS2480B constants
+#define DS_RESET      0xC1
+#define DS_DATA_MODE  0xE1
+#define DS_CMD_MODE   0xE3
+#define DS_PULSE_TERM 0xF1
+#define DS_WRITE1     0x91
+#define DS_WRITE0     0x81
+#define DS_RESET_OK   0xCD
+
+// --- config ---
+persist int ow_mode;   // 0=GPIO, 1=DS2480B (persist across reboot)
+persist int ow_pin;    // GPIO mode pin
+persist int ow_rxpin;  // DS2480B serial RX
+persist int ow_txpin;  // DS2480B serial TX
+int ow_serial = 0;     // serial opened flag
+int ow_ok = 0;         // driver active
+int ow_tick = 0;       // even/odd second counter
+int ow_ds_cmd = 1;     // DS2480B in command mode flag
+int ow_act_mode = -1;  // active config (for change detection)
+int ow_act_pin = -1;
+int ow_act_rx = -1;
+int ow_act_tx = -1;
+
+// temperature sensor data
+int ow_cnt = 0;        // number of temp sensors
+char ow_rom[128];      // 16 sensors x 8 bytes ROM
+float ow_temp[16];     // temperatures
+int ow_valid[16];      // valid reading flag
+
+// switch device data
+int ow_sw_cnt = 0;     // number of switch devices
+char ow_sw_rom[128];   // 16 devices x 8 bytes ROM
+int ow_sw_type[16];    // family code (0x3A or 0x29)
+int ow_sw_state[16];   // output state (DS2413: bits 0-1, DS2408: bits 0-7)
+int ow_sw_input[16];   // readback input state
+int ow_sw_valid[16];   // readback valid flag
+int ow_sw_ch[16];      // channel count (1=DS2406P, 2=DS2413/DS2406, 8=DS2408)
+
+// WebUI button variables for DS2413 switches (up to 2 devices x 2 channels)
+int ow_sw0a = 0;       // device 0 PIO-A
+int ow_sw0b = 0;       // device 0 PIO-B
+int ow_sw1a = 0;       // device 1 PIO-A
+int ow_sw1b = 0;       // device 1 PIO-B
+// WebUI number inputs for DS2408 (up to 2 devices)
+int ow_port0 = 0;      // device 0 port byte
+int ow_port1 = 0;      // device 1 port byte
+// track previous values for change detection
+int ow_sw0a_prev = 0;
+int ow_sw0b_prev = 0;
+int ow_sw1a_prev = 0;
+int ow_sw1b_prev = 0;
+int ow_port0_prev = 0;
+int ow_port1_prev = 0;
+
+// alias names (persist across reboots)
+// ROM-based: 16 entries x 20 bytes (8 ROM + 12 name) = 320 bytes
+#define OW_NLEN 12
+#define OW_ALEN 20
+#define OW_MAX_ALIAS 16
+persist char ow_alias[320];   // ROM-to-name alias table
+
+// buffers
+char ow_buf[16];
+char ow_lbl[32];
+char ow_arom[8];   // temp ROM buffer for alias lookup
+char ow_aname[16]; // temp name buffer for alias result
+
+// ---- CRC8 (1-Wire polynomial 0x8C reflected) ----
+int ow_crc8(int len) {
+    int crc = 0;
+    int i = 0;
+    while (i < len) {
+        int byte = ow_buf[i] & 0xFF;
+        int j = 0;
+        while (j < 8) {
+            int mix = (crc ^ byte) & 0x01;
+            crc = crc >> 1;
+            if (mix) crc = crc ^ 0x8C;
+            byte = byte >> 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+// ========================================
+// DS2480B serial 1-Wire bridge
+// ========================================
+
+// Wait for serial reply, up to 50ms
+int ow_ds_wait() {
+    int i = 0;
+    while (i < 50) {
+        if (serialAvailable() > 0) return 1;
+        delay(1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+int ow_ds_init() {
+    int ret = serialBegin(ow_rxpin, ow_txpin, 9600, 3, 64);
+    if (ret != 1) return 0;
+    ow_serial = 1;
+    delay(100);
+
+    // send 0xC1 to init (same as library begin())
+    serialWriteByte(DS_RESET);
+    if (ow_ds_wait()) {
+        serialRead();  // discard init response
+    }
+
+    ow_ds_cmd = 1;
+    return 1;
+}
+
+int ow_ds_reset() {
+    if (!ow_ds_cmd) {
+        serialWriteByte(DS_CMD_MODE);
+        delay(1);
+        ow_ds_cmd = 1;
+    }
+    serialWriteByte(DS_RESET);
+
+    if (ow_ds_wait()) {
+        int resp = serialRead() & 0xFF;
+        if (resp == DS_RESET_OK) return 1;  // 0xCD = presence detected
+        return 0;
+    }
+    return 0;
+}
+
+void ow_ds_wbit(int b) {
+    if (!ow_ds_cmd) {
+        serialWriteByte(DS_CMD_MODE);
+        ow_ds_cmd = 1;
+    }
+    if (b) {
+        serialWriteByte(DS_WRITE1);
+    } else {
+        serialWriteByte(DS_WRITE0);
+    }
+    if (ow_ds_wait()) {
+        serialRead();
+    }
+}
+
+int ow_ds_rbit() {
+    if (!ow_ds_cmd) {
+        serialWriteByte(DS_CMD_MODE);
+        ow_ds_cmd = 1;
+    }
+    serialWriteByte(DS_WRITE1);
+    if (ow_ds_wait()) {
+        int resp = serialRead() & 0xFF;
+        return resp & 0x01;
+    }
+    return 1;
+}
+
+void ow_ds_write(int byte) {
+    if (ow_ds_cmd) {
+        serialWriteByte(DS_DATA_MODE);
+        ow_ds_cmd = 0;
+    }
+    serialWriteByte(byte);
+    // escape: if byte is 0xE1, 0xE3, or 0xF1, send it twice
+    if (byte == DS_DATA_MODE || byte == DS_CMD_MODE || byte == DS_PULSE_TERM) {
+        serialWriteByte(byte);
+    }
+    if (ow_ds_wait()) {
+        serialRead();
+    }
+}
+
+int ow_ds_read() {
+    if (ow_ds_cmd) {
+        serialWriteByte(DS_DATA_MODE);
+        ow_ds_cmd = 0;
+    }
+    serialWriteByte(0xFF);
+    if (ow_ds_wait()) {
+        return serialRead() & 0xFF;
+    }
+    return 0xFF;
+}
+
+// ========================================
+// Abstraction layer
+// GPIO mode uses native owXxx() syscalls (timing in C)
+// DS2480B mode uses serial functions
+// ========================================
+
+int ow_reset() {
+    if (ow_mode == 0) return owReset();
+    return ow_ds_reset();
+}
+
+void ow_write(int byte) {
+    if (ow_mode == 0) owWrite(byte);
+    else ow_ds_write(byte);
+}
+
+int ow_read() {
+    if (ow_mode == 0) return owRead();
+    return ow_ds_read();
+}
+
+void ow_wbit(int b) {
+    if (ow_mode == 0) owWriteBit(b);
+    else ow_ds_wbit(b);
+}
+
+int ow_rbit() {
+    if (ow_mode == 0) return owReadBit();
+    return ow_ds_rbit();
+}
+
+// ========================================
+// ROM Search — uses native OneWire library search
+// ========================================
+
+char ow_srom[8];
+
+void ow_scan() {
+    ow_cnt = 0;
+    ow_sw_cnt = 0;
+
+    if (ow_mode == 0) {
+        // GPIO mode: use native owSearch() from OneWire library
+        owSearchReset();
+
+        int total = 0;
+        while (total < (OW_MAX_SENS + OW_MAX_SW)) {
+            if (!owSearch(ow_srom)) break;
+
+            int fam = ow_srom[0] & 0xFF;
+            char dd[48];
+            sprintfInt(dd, "OW: found fam=0x%02X", fam);
+            print(dd);
+
+            int i = 0;
+            if ((fam == FAM_DS18B20 || fam == FAM_DS18S20 || fam == FAM_DS1822) && ow_cnt < OW_MAX_SENS) {
+                int base = ow_cnt * 8;
+                while (i < 8) {
+                    ow_rom[base + i] = ow_srom[i];
+                    i = i + 1;
+                }
+                ow_valid[ow_cnt] = 0;
+                ow_cnt = ow_cnt + 1;
+            }
+            if ((fam == FAM_DS2413 || fam == FAM_DS2406 || fam == FAM_DS2408) && ow_sw_cnt < OW_MAX_SW) {
+                int base = ow_sw_cnt * 8;
+                while (i < 8) {
+                    ow_sw_rom[base + i] = ow_srom[i];
+                    i = i + 1;
+                }
+                ow_sw_type[ow_sw_cnt] = fam;
+                ow_sw_state[ow_sw_cnt] = 0xFF;  // all off (open-drain: 1=off)
+                ow_sw_input[ow_sw_cnt] = 0;
+                ow_sw_valid[ow_sw_cnt] = 0;
+                if (fam == FAM_DS2408) {
+                    ow_sw_ch[ow_sw_cnt] = 8;
+                } else {
+                    ow_sw_ch[ow_sw_cnt] = 2;  // DS2413=2, DS2406 default=2 (updated on first read)
+                }
+                ow_sw_cnt = ow_sw_cnt + 1;
+            }
+            total = total + 1;
+        }
+    } else {
+        // DS2480B mode: use TinyC bit-bang search via serial bridge
+        int ow_last_disc = 0;
+        int ow_last_done = 0;
+        int i = 0;
+        while (i < 8) {
+            ow_srom[i] = 0;
+            i = i + 1;
+        }
+
+        int total = 0;
+        while (total < (OW_MAX_SENS + OW_MAX_SW)) {
+            // --- inline search for DS2480B mode ---
+            if (ow_last_done) break;
+            if (!ow_ds_reset()) break;
+
+            ow_ds_write(OW_SEARCH_ROM);
+
+            int last_zero = 0;
+            int pos = 1;
+            int ok = 1;
+
+            while (pos <= 64) {
+                int id_bit = ow_ds_rbit();
+                int cmp_bit = ow_ds_rbit();
+
+                if (id_bit == 1 && cmp_bit == 1) {
+                    ok = 0;
+                    break;
+                }
+
+                int direction = 0;
+                if (id_bit == 0 && cmp_bit == 0) {
+                    if (pos == ow_last_disc) {
+                        direction = 1;
+                    } else if (pos > ow_last_disc) {
+                        direction = 0;
+                    } else {
+                        int byteN = (pos - 1) / 8;
+                        int bitN = (pos - 1) % 8;
+                        direction = (ow_srom[byteN] >> bitN) & 1;
+                    }
+                    if (direction == 0) {
+                        last_zero = pos;
+                    }
+                } else {
+                    direction = id_bit;
+                }
+
+                int byteN = (pos - 1) / 8;
+                int bitN = (pos - 1) % 8;
+                if (direction) {
+                    ow_srom[byteN] = ow_srom[byteN] | (1 << bitN);
+                } else {
+                    ow_srom[byteN] = ow_srom[byteN] & ~(1 << bitN);
+                }
+
+                ow_ds_wbit(direction);
+                pos = pos + 1;
+            }
+
+            if (!ok) break;
+
+            ow_last_disc = last_zero;
+            if (ow_last_disc == 0) {
+                ow_last_done = 1;
+            }
+
+            // verify CRC
+            i = 0;
+            while (i < 8) {
+                ow_buf[i] = ow_srom[i];
+                i = i + 1;
+            }
+            if (ow_crc8(8) != 0) {
+                total = total + 1;
+                continue;
+            }
+
+            int fam = ow_srom[0] & 0xFF;
+            i = 0;
+            if ((fam == FAM_DS18B20 || fam == FAM_DS18S20 || fam == FAM_DS1822) && ow_cnt < OW_MAX_SENS) {
+                int base = ow_cnt * 8;
+                while (i < 8) {
+                    ow_rom[base + i] = ow_srom[i];
+                    i = i + 1;
+                }
+                ow_valid[ow_cnt] = 0;
+                ow_cnt = ow_cnt + 1;
+            }
+            if ((fam == FAM_DS2413 || fam == FAM_DS2406 || fam == FAM_DS2408) && ow_sw_cnt < OW_MAX_SW) {
+                int base = ow_sw_cnt * 8;
+                while (i < 8) {
+                    ow_sw_rom[base + i] = ow_srom[i];
+                    i = i + 1;
+                }
+                ow_sw_type[ow_sw_cnt] = fam;
+                ow_sw_state[ow_sw_cnt] = 0xFF;
+                ow_sw_input[ow_sw_cnt] = 0;
+                ow_sw_valid[ow_sw_cnt] = 0;
+                if (fam == FAM_DS2408) {
+                    ow_sw_ch[ow_sw_cnt] = 8;
+                } else {
+                    ow_sw_ch[ow_sw_cnt] = 2;
+                }
+                ow_sw_cnt = ow_sw_cnt + 1;
+            }
+            total = total + 1;
+        }
+    }
+}
+
+// ========================================
+// Device selection helpers
+// ========================================
+
+void ow_select(int idx) {
+    ow_write(OW_MATCH_ROM);
+    int base = idx * 8;
+    int i = 0;
+    while (i < 8) {
+        ow_write(ow_rom[base + i] & 0xFF);
+        i = i + 1;
+    }
+}
+
+void ow_sw_select(int idx) {
+    ow_write(OW_MATCH_ROM);
+    int base = idx * 8;
+    int i = 0;
+    while (i < 8) {
+        ow_write(ow_sw_rom[base + i] & 0xFF);
+        i = i + 1;
+    }
+}
+
+// ========================================
+// DS18B20 Temperature Reading
+// ========================================
+
+void ow_convert_all() {
+    // Use MATCH_ROM per sensor (not SKIP_ROM) to avoid
+    // sending CONVERT_T to DS2406 switches on the same bus
+    int i = 0;
+    while (i < ow_cnt) {
+        if (ow_reset()) {
+            ow_select(i);
+            ow_write(DS_CONVERT);
+        }
+        i = i + 1;
+    }
+}
+
+void ow_read_temp(int idx) {
+    if (!ow_reset()) return;
+    ow_select(idx);
+    ow_write(DS_READ_SCRATCH);
+
+    int i = 0;
+    while (i < 9) {
+        ow_buf[i] = ow_read();
+        i = i + 1;
+    }
+
+    if (ow_crc8(9) != 0) return;
+
+    int fam = ow_rom[idx * 8] & 0xFF;
+    int lsb = ow_buf[0] & 0xFF;
+    int msb = ow_buf[1] & 0xFF;
+    int raw = (msb << 8) | lsb;
+
+    if (raw & 0x8000) {
+        raw = raw | 0xFFFF0000;
+    }
+
+    if (fam == FAM_DS18S20) {
+        ow_temp[idx] = raw / 2.0;
+    } else {
+        ow_temp[idx] = raw / 16.0;
+    }
+    ow_valid[idx] = 1;
+}
+
+// ========================================
+// DS2413 — 2-channel switch
+// ========================================
+
+// Write output state to DS2413
+// state bits: bit0=PIO-A, bit1=PIO-B (0=conducting/ON, 1=off)
+int ow_ds2413_write(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2413_ACCESS_WRITE);
+
+    int st = ow_sw_state[idx] & 0x03;
+    ow_write(st);
+    ow_write((~st) & 0xFF);  // complement for verification
+
+    int confirm = ow_read();
+    if ((confirm & 0xFF) != 0xAA) return 0;  // write failed
+
+    // read back status
+    int status = ow_read();
+    ow_sw_input[idx] = status & 0xFF;
+    ow_sw_valid[idx] = 1;
+    return 1;
+}
+
+// Read status from DS2413
+// Returns status byte: bit0=PIO-A_latch, bit1=PIO-A_pin,
+//                      bit2=PIO-B_latch, bit3=PIO-B_pin
+// Upper nibble = complement of lower (for verification)
+int ow_ds2413_read(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2413_ACCESS_READ);
+
+    int status = ow_read();
+    int lo = status & 0x0F;
+    int hi = (status >> 4) & 0x0F;
+    // verify: upper nibble should be complement of lower
+    if ((lo ^ hi) != 0x0F) return 0;
+
+    ow_sw_input[idx] = status & 0xFF;
+    ow_sw_valid[idx] = 1;
+    return 1;
+}
+
+// ========================================
+// DS2406 — 2-channel switch
+// ========================================
+
+// Write output state to DS2406
+// ow_sw_state uses DS2413 convention: 0=conducting/ON, 1=off
+// DS2406 hardware: 1=conducting, 0=off → invert before writing
+// CCB1 layout: [ALR(7) IM(6) TOG(5) IC(4) CHS1(3) CHS0(2) CRC1(1) CRC0(0)]
+int ow_ds2406_write(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2406_CH_ACCESS);
+
+    // CCB1: IM=0(write), CHS based on channel count, no CRC
+    if (ow_sw_ch[idx] >= 2) {
+        ow_write(0x0C);  // CHS=11 both channels
+    } else {
+        ow_write(0x04);  // CHS=01 channel A only
+    }
+    ow_write(0xFF);  // CCB2
+
+    // read Channel Info byte (always sent by device)
+    int info = ow_read();
+
+    // Invert: ow_sw_state has 0=ON (DS2413 convention)
+    // DS2406 needs 1=conducting, so invert bits
+    int st = (~ow_sw_state[idx]) & 0x03;
+
+    // DS2406 Channel Access writes bits sequentially to PIO flip-flops.
+    // Only the LAST bit for each channel determines the final state.
+    // CHS=01: all 8 bits → PIO-A, bit7 is last
+    // CHS=11: bits alternate A,B,A,B... bit6→A(last), bit7→B(last)
+    int data = 0;
+    if (ow_sw_ch[idx] >= 2) {
+        // CHS=11: 0x55 pattern sets A bits, 0xAA sets B bits
+        if (st & 0x01) data = data | 0x55;  // PIO-A conducting
+        if (st & 0x02) data = data | 0xAA;  // PIO-B conducting
+    } else {
+        // CHS=01: 0xFF for A=ON, 0x00 for A=OFF
+        if (st & 0x01) data = 0xFF;
+    }
+    ow_write(data);
+
+    // End channel access
+    ow_reset();
+
+    // Set expected input state immediately (DS2413-compatible format)
+    // This prevents the readback from overriding the button on the same tick
+    int mapped = 0x05;  // default: both OFF
+    if (st & 0x01) mapped = mapped & 0xFE;  // PIO-A on → clear bit0
+    if (st & 0x02) mapped = mapped & 0xFB;  // PIO-B on → clear bit2
+    ow_sw_input[idx] = mapped;
+    ow_sw_valid[idx] = 1;
+    return 1;
+}
+
+// Read status from DS2406 via Channel Access
+// Returns data in DS2413-compatible format:
+//   bit0=PIO-A (0=conducting/ON), bit2=PIO-B (0=conducting/ON)
+int ow_ds2406_read(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2406_CH_ACCESS);
+
+    // CCB1: IM=1(read), CHS based on channel count, no CRC
+    if (ow_sw_ch[idx] >= 2) {
+        ow_write(0x4C);  // CHS=11 both channels
+    } else {
+        ow_write(0x44);  // CHS=01 channel A only
+    }
+    ow_write(0xFF);  // CCB2
+
+    // Channel Info byte:
+    //   bit0=PIO-A flip-flop (1=conducting)
+    //   bit1=PIO-B flip-flop (1=conducting)
+    //   bit6=has PIO-B (1=2ch, 0=1ch 3-pin device)
+    //   bit7=supply (1=VDD, 0=parasitic)
+    int info = ow_read();
+
+    // Detect single-channel DS2406P (bit 6 = 0 → no PIO-B)
+    if (info & 0x40) {
+        ow_sw_ch[idx] = 2;
+    } else {
+        ow_sw_ch[idx] = 1;
+    }
+
+    // Convert to DS2413-compatible format:
+    // DS2413: bit0=PIO-A(0=conducting), bit2=PIO-B(0=conducting)
+    int mapped = 0x05;  // default: both OFF
+    if (info & 0x01) mapped = mapped & 0xFE;  // PIO-A conducting → clear bit0
+    if (info & 0x02) mapped = mapped & 0xFB;  // PIO-B conducting → clear bit2
+    ow_sw_input[idx] = mapped;
+    ow_sw_valid[idx] = 1;
+
+    ow_reset();
+    return 1;
+}
+
+// ========================================
+// DS2408 — 8-channel GPIO
+// ========================================
+
+// Write output state to DS2408 (all 8 channels)
+int ow_ds2408_write(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2408_CHANNEL_WRITE);
+
+    int st = ow_sw_state[idx] & 0xFF;
+    ow_write(st);
+    ow_write((~st) & 0xFF);  // complement for verification
+
+    int confirm = ow_read();
+    if ((confirm & 0xFF) != 0xAA) return 0;
+
+    // read back PIO state
+    int status = ow_read();
+    ow_sw_input[idx] = status & 0xFF;
+    ow_sw_valid[idx] = 1;
+    return 1;
+}
+
+// Read PIO input register from DS2408
+int ow_ds2408_read(int idx) {
+    if (!ow_reset()) return 0;
+    ow_sw_select(idx);
+    ow_write(DS2408_READ_PIO);
+    // read PIO Logic State register at address 0x0088
+    ow_write(0x88);  // address LSB
+    ow_write(0x00);  // address MSB
+
+    int status = ow_read();
+    ow_sw_input[idx] = status & 0xFF;
+    ow_sw_valid[idx] = 1;
+    return 1;
+}
+
+// Is this a 2-channel switch? (DS2413 or DS2406 with 2 channels)
+int ow_is_2ch(int idx) {
+    if (ow_sw_type[idx] == FAM_DS2413) return 1;
+    if (ow_sw_type[idx] == FAM_DS2406 && ow_sw_ch[idx] >= 2) return 1;
+    return 0;
+}
+
+// Is this a 1-channel switch? (DS2406P — 3-pin package)
+int ow_is_1ch(int idx) {
+    return (ow_sw_type[idx] == FAM_DS2406 && ow_sw_ch[idx] == 1);
+}
+
+// ========================================
+// Switch write helper — writes current state
+// ========================================
+
+void ow_sw_write(int idx) {
+    if (ow_sw_type[idx] == FAM_DS2413) {
+        ow_ds2413_write(idx);
+    } else if (ow_sw_type[idx] == FAM_DS2406) {
+        ow_ds2406_write(idx);
+    } else {
+        ow_ds2408_write(idx);
+    }
+}
+
+void ow_sw_read(int idx) {
+    if (ow_sw_type[idx] == FAM_DS2413) {
+        ow_ds2413_read(idx);
+    } else if (ow_sw_type[idx] == FAM_DS2406) {
+        ow_ds2406_read(idx);
+    } else {
+        ow_ds2408_read(idx);
+    }
+}
+
+// ========================================
+// Sync WebUI button vars → sw_state[] and vice versa
+// ========================================
+
+// Copy WebUI button/number vars to sw_state array
+// All 2-ch devices use DS2413 convention: 0=conducting/ON, 1=off
+// DS2406 write function handles the inversion internally
+void ow_ui_to_state() {
+    if (ow_sw_cnt > 0) {
+        if (ow_is_2ch(0) || ow_is_1ch(0)) {
+            int st = 0x03;  // default: both off
+            if (ow_sw0a) st = st & 0xFE;  // clear bit 0 = PIO-A on
+            if (ow_is_2ch(0) && ow_sw0b) st = st & 0xFD;  // clear bit 1 = PIO-B on
+            ow_sw_state[0] = st;
+        } else {
+            ow_sw_state[0] = ow_port0 & 0xFF;
+        }
+    }
+    if (ow_sw_cnt > 1) {
+        if (ow_is_2ch(1) || ow_is_1ch(1)) {
+            int st = 0x03;
+            if (ow_sw1a) st = st & 0xFE;
+            if (ow_is_2ch(1) && ow_sw1b) st = st & 0xFD;
+            ow_sw_state[1] = st;
+        } else {
+            ow_sw_state[1] = ow_port1 & 0xFF;
+        }
+    }
+}
+
+// Copy sw_input readback to WebUI variables
+// All 2-ch devices now use DS2413-compatible format:
+//   bit0=PIO-A (0=conducting=ON), bit2=PIO-B (0=conducting=ON)
+void ow_state_to_ui() {
+    if (ow_sw_cnt > 0 && ow_sw_valid[0]) {
+        if (ow_is_2ch(0) || ow_is_1ch(0)) {
+            if ((ow_sw_input[0] & 0x01) == 0) { ow_sw0a = 1; } else { ow_sw0a = 0; }
+            if (ow_is_2ch(0)) {
+                if ((ow_sw_input[0] & 0x04) == 0) { ow_sw0b = 1; } else { ow_sw0b = 0; }
+            }
+        } else {
+            ow_port0 = ow_sw_input[0] & 0xFF;
+        }
+    }
+    if (ow_sw_cnt > 1 && ow_sw_valid[1]) {
+        if (ow_is_2ch(1) || ow_is_1ch(1)) {
+            if ((ow_sw_input[1] & 0x01) == 0) { ow_sw1a = 1; } else { ow_sw1a = 0; }
+            if (ow_is_2ch(1)) {
+                if ((ow_sw_input[1] & 0x04) == 0) { ow_sw1b = 1; } else { ow_sw1b = 0; }
+            }
+        } else {
+            ow_port1 = ow_sw_input[1] & 0xFF;
+        }
+    }
+}
+
+// Check if any WebUI var changed and write to device
+void ow_check_ui_changes() {
+    if (ow_sw_cnt > 0) {
+        if (ow_is_2ch(0) || ow_is_1ch(0)) {
+            if (ow_sw0a != ow_sw0a_prev || ow_sw0b != ow_sw0b_prev) {
+                ow_ui_to_state();
+                ow_sw_write(0);
+                ow_sw0a_prev = ow_sw0a;
+                ow_sw0b_prev = ow_sw0b;
+            }
+        } else {
+            if (ow_port0 != ow_port0_prev) {
+                ow_ui_to_state();
+                ow_sw_write(0);
+                ow_port0_prev = ow_port0;
+            }
+        }
+    }
+    if (ow_sw_cnt > 1) {
+        if (ow_is_2ch(1) || ow_is_1ch(1)) {
+            if (ow_sw1a != ow_sw1a_prev || ow_sw1b != ow_sw1b_prev) {
+                ow_ui_to_state();
+                ow_sw_write(1);
+                ow_sw1a_prev = ow_sw1a;
+                ow_sw1b_prev = ow_sw1b;
+            }
+        } else {
+            if (ow_port1 != ow_port1_prev) {
+                ow_ui_to_state();
+                ow_sw_write(1);
+                ow_port1_prev = ow_port1;
+            }
+        }
+    }
+}
+
+// ========================================
+// Re-initialize 1-Wire bus with current config
+// ========================================
+
+void ow_reinit() {
+    // close existing serial if open
+    if (ow_serial) {
+        serialClose();
+        ow_serial = 0;
+    }
+    ow_ok = 0;
+    ow_cnt = 0;
+    ow_sw_cnt = 0;
+
+    // save active config (even if init fails, so we don't retry every second)
+    ow_act_mode = ow_mode;
+    ow_act_pin = ow_pin;
+    ow_act_rx = ow_rxpin;
+    ow_act_tx = ow_txpin;
+
+    if (ow_mode == 0) {
+        owSetPin(ow_pin);
+        if (!owReset()) {
+            print("1-Wire: no devices (GPIO mode)");
+            return;
+        }
+    } else {
+        if (!ow_ds_init()) {
+            print("1-Wire: DS2480B serial failed");
+            return;
+        }
+        if (!ow_ds_reset()) {
+            print("1-Wire: no devices (DS2480B mode)");
+            return;
+        }
+    }
+
+    ow_scan();
+
+    if (ow_cnt == 0 && ow_sw_cnt == 0) {
+        print("1-Wire: no devices found");
+        return;
+    }
+
+    char dt[48];
+    sprintfInt(dt, "1-Wire: %d temp", ow_cnt);
+    print(dt);
+    sprintfInt(dt, "1-Wire: %d switch", ow_sw_cnt);
+    print(dt);
+
+    // initial switch state read
+    if (ow_sw_cnt > 0) {
+        int i = 0;
+        while (i < ow_sw_cnt) {
+            ow_sw_read(i);
+            i = i + 1;
+        }
+        ow_state_to_ui();
+        ow_sw0a_prev = ow_sw0a;
+        ow_sw0b_prev = ow_sw0b;
+        ow_sw1a_prev = ow_sw1a;
+        ow_sw1b_prev = ow_sw1b;
+        ow_port0_prev = ow_port0;
+        ow_port1_prev = ow_port1;
+    }
+
+    ow_ok = 1;
+}
+
+// ========================================
+// Callbacks
+// ========================================
+
+void EverySecond() {
+    // detect config change from WebUI pulldowns
+    if (ow_mode != ow_act_mode || ow_pin != ow_act_pin ||
+        ow_rxpin != ow_act_rx || ow_txpin != ow_act_tx) {
+        ow_reinit();
+        return;
+    }
+
+    if (!ow_ok) return;
+
+    ow_tick = ow_tick + 1;
+
+    // Temperature cycle (if any temp sensors)
+    if (ow_cnt > 0) {
+        if ((ow_tick & 1) == 1) {
+            ow_convert_all();
+        } else {
+            int i = 0;
+            while (i < ow_cnt) {
+                ow_read_temp(i);
+                i = i + 1;
+            }
+        }
+    }
+
+    // Switch devices: check UI changes and read back state
+    if (ow_sw_cnt > 0) {
+        ow_check_ui_changes();
+        // poll input state every 2 seconds
+        if ((ow_tick & 1) == 0) {
+            int i = 0;
+            while (i < ow_sw_cnt) {
+                ow_sw_read(i);
+                i = i + 1;
+            }
+            ow_state_to_ui();
+        }
+    }
+}
+
+// ---- Alias helpers (ROM-based) ----
+
+void ow_copy_trom(int idx) {
+    int base = idx * 8;
+    int i = 0;
+    while (i < 8) { ow_arom[i] = ow_rom[base + i]; i = i + 1; }
+}
+
+void ow_copy_srom(int idx) {
+    int base = idx * 8;
+    int i = 0;
+    while (i < 8) { ow_arom[i] = ow_sw_rom[base + i]; i = i + 1; }
+}
+
+// Find alias for ROM in ow_arom. Copies name to dst, returns 1 if found.
+int ow_get_alias(char dst[]) {
+    int e = 0;
+    while (e < OW_MAX_ALIAS) {
+        int aoff = e * OW_ALEN;
+        if (ow_alias[aoff] != 0) {
+            int match = 1;
+            int b = 0;
+            while (b < 8) {
+                if ((ow_alias[aoff + b] & 0xFF) != (ow_arom[b] & 0xFF)) {
+                    match = 0;
+                    break;
+                }
+                b = b + 1;
+            }
+            if (match) {
+                // copy name byte-by-byte to global buffer
+                int c = 0;
+                while (c < OW_NLEN) {
+                    ow_aname[c] = ow_alias[aoff + 8 + c];
+                    c = c + 1;
+                }
+                strcpy(dst, ow_aname);
+                return 1;
+            }
+        }
+        e = e + 1;
+    }
+    return 0;
+}
+
+// Store alias for ROM in ow_arom
+void ow_set_alias(char name[], int nlen) {
+    char nm[16];
+    strcpy(nm, name);
+    int found = -1;
+    int empty = -1;
+    int e = 0;
+    while (e < OW_MAX_ALIAS) {
+        int aoff = e * OW_ALEN;
+        if (ow_alias[aoff] == 0) {
+            if (empty < 0) empty = e;
+        } else {
+            int match = 1;
+            int b = 0;
+            while (b < 8) {
+                if ((ow_alias[aoff + b] & 0xFF) != (ow_arom[b] & 0xFF)) {
+                    match = 0;
+                    break;
+                }
+                b = b + 1;
+            }
+            if (match) { found = e; break; }
+        }
+        e = e + 1;
+    }
+    int slot = found;
+    if (slot < 0) slot = empty;
+    if (slot < 0) return;
+    int aoff = slot * OW_ALEN;
+    int b = 0;
+    while (b < 8) { ow_alias[aoff + b] = ow_arom[b]; b = b + 1; }
+    b = 0;
+    while (b < OW_NLEN) {
+        if (b < nlen) { ow_alias[aoff + 8 + b] = nm[b]; }
+        else { ow_alias[aoff + 8 + b] = 0; }
+        b = b + 1;
+    }
+}
+
+// Clear alias for ROM in ow_arom. Returns 1 if found and cleared.
+int ow_clear_alias() {
+    int e = 0;
+    while (e < OW_MAX_ALIAS) {
+        int aoff = e * OW_ALEN;
+        if (ow_alias[aoff] != 0) {
+            int match = 1;
+            int b = 0;
+            while (b < 8) {
+                if ((ow_alias[aoff + b] & 0xFF) != (ow_arom[b] & 0xFF)) {
+                    match = 0;
+                    break;
+                }
+                b = b + 1;
+            }
+            if (match) {
+                b = 0;
+                while (b < OW_ALEN) { ow_alias[aoff + b] = 0; b = b + 1; }
+                return 1;
+            }
+        }
+        e = e + 1;
+    }
+    return 0;
+}
+
+void ow_temp_label(char dst[], int idx) {
+    ow_copy_trom(idx);
+    if (ow_get_alias(dst)) return;
+    int base = idx * 8;
+    strcpy(dst, "DS18x20-");
+    char hx[4];
+    sprintfInt(hx, "%02X", ow_rom[base + 6] & 0xFF);
+    strcat(dst, hx);
+}
+
+void ow_sw_label(char dst[], int idx) {
+    ow_copy_srom(idx);
+    if (ow_get_alias(dst)) return;
+    if (ow_sw_type[idx] == FAM_DS2413) {
+        sprintfInt(dst, "DS2413-%d", idx);
+    } else if (ow_sw_type[idx] == FAM_DS2408) {
+        sprintfInt(dst, "DS2408-%d", idx);
+    } else {
+        sprintfInt(dst, "DS2406-%d", idx);
+    }
+}
+
+// ---- WebCall: show sensor values on main page ----
+
+void ow_web_sensor(int idx) {
+    char vt[64];
+    if (!ow_valid[idx]) return;
+
+    char name[16];
+    ow_temp_label(name, idx);
+
+    LGetString(0, ow_lbl);  // 0 = Temperature
+    strcpy(vt, "{s}");
+    strcat(vt, name);
+    strcat(vt, " ");
+    strcat(vt, ow_lbl);
+    strcat(vt, "{m}");
+    webSend(vt);
+    sprintfFloat(vt, "%.1f °C{e}", ow_temp[idx]);
+    webSend(vt);
+}
+
+void ow_web_switch(int idx) {
+    char vt[64];
+    if (!ow_sw_valid[idx]) return;
+
+    char name[16];
+    ow_sw_label(name, idx);
+
+    if (ow_is_2ch(idx) || ow_is_1ch(idx)) {
+        int a_on = 0;
+        int b_on = 0;
+        if ((ow_sw_input[idx] & 0x01) == 0) a_on = 1;
+        if ((ow_sw_input[idx] & 0x04) == 0) b_on = 1;
+
+        strcpy(vt, "{s}");
+        strcat(vt, name);
+        strcat(vt, " A{m}");
+        webSend(vt);
+        if (a_on) {
+            webSend("ON{e}");
+        } else {
+            webSend("OFF{e}");
+        }
+
+        if (ow_is_2ch(idx)) {
+            strcpy(vt, "{s}");
+            strcat(vt, name);
+            strcat(vt, " B{m}");
+            webSend(vt);
+            if (b_on) {
+                webSend("ON{e}");
+            } else {
+                webSend("OFF{e}");
+            }
+        }
+    } else {
+        // DS2408: show hex port state
+        strcpy(vt, "{s}");
+        strcat(vt, name);
+        strcat(vt, "{m}");
+        webSend(vt);
+        sprintfInt(vt, "0x%02X{e}", ow_sw_input[idx] & 0xFF);
+        webSend(vt);
+    }
+}
+
+void WebCall() {
+    if (!ow_ok) {
+        webSend("{s}1-Wire{m}no devices{e}");
+        return;
+    }
+    int i = 0;
+    while (i < ow_cnt) {
+        ow_web_sensor(i);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < ow_sw_cnt) {
+        ow_web_switch(i);
+        i = i + 1;
+    }
+}
+
+// ---- JsonCall: MQTT sensor output ----
+
+void JsonCall() {
+    if (!ow_ok) return;
+    char buf[64];
+
+    // temperature sensors
+    int i = 0;
+    char name[16];
+    while (i < ow_cnt) {
+        if (ow_valid[i]) {
+            ow_temp_label(name, i);
+            strcpy(buf, ",\"");
+            strcat(buf, name);
+            strcat(buf, "\":{");
+            responseAppend(buf);
+            sprintfFloat(buf, "\"Temperature\":%.1f}", ow_temp[i]);
+            responseAppend(buf);
+        }
+        i = i + 1;
+    }
+
+    // switch devices
+    i = 0;
+    while (i < ow_sw_cnt) {
+        if (ow_sw_valid[i]) {
+            ow_sw_label(name, i);
+            strcpy(buf, ",\"");
+            strcat(buf, name);
+            strcat(buf, "\":{");
+            responseAppend(buf);
+            if (ow_is_2ch(i) || ow_is_1ch(i)) {
+                int a_on = 0;
+                int b_on = 0;
+                if ((ow_sw_input[i] & 0x01) == 0) a_on = 1;
+                if ((ow_sw_input[i] & 0x04) == 0) b_on = 1;
+                if (ow_is_1ch(i)) {
+                    sprintfInt(buf, "\"PIO_A\":%d}", a_on);
+                    responseAppend(buf);
+                } else {
+                    sprintfInt(buf, "\"PIO_A\":%d,", a_on);
+                    responseAppend(buf);
+                    sprintfInt(buf, "\"PIO_B\":%d}", b_on);
+                    responseAppend(buf);
+                }
+            } else {
+                sprintfInt(buf, "\"State\":%d,", ow_sw_state[i] & 0xFF);
+                responseAppend(buf);
+                sprintfInt(buf, "\"Input\":%d}", ow_sw_input[i] & 0xFF);
+                responseAppend(buf);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// ---- WebUI: configuration page ----
+
+void WebUI() {
+    webPulldown(ow_mode, "Mode", "GPIO|DS2480B");
+    if (ow_mode == 0) {
+        webPulldown(ow_pin, "1-Wire Pin", "@getfreepins");
+    } else {
+        webPulldown(ow_rxpin, "DS2480B RX", "@getfreepins");
+        webPulldown(ow_txpin, "DS2480B TX", "@getfreepins");
+    }
+
+    // switch controls
+    if (ow_sw_cnt > 0) {
+        if (ow_is_2ch(0)) {
+            webButton(ow_sw0a, "SW0 PIO-A");
+            webButton(ow_sw0b, "SW0 PIO-B");
+        } else if (ow_is_1ch(0)) {
+            webButton(ow_sw0a, "SW0 PIO-A");
+        } else {
+            webNumber(ow_port0, 0, 255, "SW0 Port");
+        }
+    }
+    if (ow_sw_cnt > 1) {
+        if (ow_is_2ch(1)) {
+            webButton(ow_sw1a, "SW1 PIO-A");
+            webButton(ow_sw1b, "SW1 PIO-B");
+        } else if (ow_is_1ch(1)) {
+            webButton(ow_sw1a, "SW1 PIO-A");
+        } else {
+            webNumber(ow_port1, 0, 255, "SW1 Port");
+        }
+    }
+}
+
+// ========================================
+// Command handler: OW <dev> [channel] <state>
+//   OW              → show status
+//   OW 0 1          → 1-ch/2-ch: set PIO-A on
+//   OW 0 A 1        → set device 0 PIO-A on
+//   OW 0 B 0        → set device 0 PIO-B off
+//   OW 0 255        → DS2408: set port byte
+//   OW NAME T 0 Kitchen → set temp sensor 0 alias
+//   OW NAME S 1 Relay   → set switch 1 alias
+//   OW NAME T 0         → clear temp sensor 0 alias
+// ========================================
+
+// Handle NAME subcommand — set/clear alias for a device
+void ow_cmd_name(char cmd[], int pos, int len) {
+    char cs[64];
+    strcpy(cs, cmd);
+
+    while (pos < len && cs[pos] == ' ') pos = pos + 1;
+
+    if (pos >= len) {
+        responseCmnd("OW NAME T/S idx [name]");
+        return;
+    }
+
+    int is_temp = 0;
+    if (cs[pos] == 'T') {
+        is_temp = 1;
+    } else if (cs[pos] != 'S') {
+        responseCmnd("Use T or S");
+        return;
+    }
+    pos = pos + 1;
+    while (pos < len && cs[pos] == ' ') pos = pos + 1;
+
+    if (pos >= len) {
+        responseCmnd("Missing index");
+        return;
+    }
+
+    char arg[4];
+    strSub(arg, cs, pos, 1);
+    int idx = atoi(arg);
+    pos = pos + 1;
+    while (pos < len && cs[pos] == ' ') pos = pos + 1;
+
+    if (is_temp) {
+        if (idx < 0 || idx >= ow_cnt) { responseCmnd("Bad index"); return; }
+        ow_copy_trom(idx);
+    } else {
+        if (idx < 0 || idx >= ow_sw_cnt) { responseCmnd("Bad index"); return; }
+        ow_copy_srom(idx);
+    }
+
+    if (pos >= len) {
+        // no name → clear alias
+        if (ow_clear_alias()) {
+            responseCmnd("Alias cleared");
+        } else {
+            responseCmnd("No alias set");
+        }
+        return;
+    }
+
+    // extract name (max OW_NLEN-1 chars)
+    char name[16];
+    int nlen = len - pos;
+    if (nlen >= OW_NLEN) nlen = OW_NLEN - 1;
+    strSub(name, cs, pos, nlen);
+    name[nlen] = 0;
+
+    ow_set_alias(name, nlen);
+
+    char resp[32];
+    strcpy(resp, "Alias: ");
+    strcat(resp, name);
+    responseCmnd(resp);
+}
+
+void ow_cmd_status(char resp[]) {
+    int i = 0;
+    strcpy(resp, "{");
+    char tmp[32];
+    char name[16];
+    while (i < ow_sw_cnt) {
+        if (i > 0) strcat(resp, ",");
+        ow_sw_label(name, i);
+        strcpy(tmp, "\"");
+        strcat(tmp, name);
+        strcat(tmp, "\":{");
+        strcat(resp, tmp);
+        if (ow_is_2ch(i) || ow_is_1ch(i)) {
+            int a_on = 0;
+            int b_on = 0;
+            if ((ow_sw_input[i] & 0x01) == 0) a_on = 1;
+            if ((ow_sw_input[i] & 0x04) == 0) b_on = 1;
+            sprintfInt(tmp, "\"A\":%d", a_on);
+            strcat(resp, tmp);
+            if (ow_is_2ch(i)) {
+                sprintfInt(tmp, ",\"B\":%d", b_on);
+                strcat(resp, tmp);
+            }
+            strcat(resp, "}");
+        } else {
+            sprintfInt(tmp, "\"State\":%d}", ow_sw_input[i] & 0xFF);
+            strcat(resp, tmp);
+        }
+        i = i + 1;
+    }
+    strcat(resp, "}");
+}
+
+void Command(char cmd[]) {
+    char resp[192];
+    char arg[16];
+    char cs[64];
+    strcpy(cs, cmd);
+    int len = strlen(cs);
+
+    // skip leading space
+    int pos = 0;
+    while (pos < len && cs[pos] == ' ') pos = pos + 1;
+
+    // no args → show status
+    if (pos >= len) {
+        ow_cmd_status(resp);
+        responseCmnd(resp);
+        return;
+    }
+
+    // check for NAME subcommand
+    if (len - pos >= 4 && cs[pos] == 'N' && cs[pos+1] == 'A' && cs[pos+2] == 'M' && cs[pos+3] == 'E') {
+        ow_cmd_name(cs, pos + 4, len);
+        return;
+    }
+
+    // check for SCAN subcommand
+    if (len - pos >= 4 && cs[pos] == 'S' && cs[pos+1] == 'C' && cs[pos+2] == 'A' && cs[pos+3] == 'N') {
+        ow_reinit();
+        char dt[48];
+        char dt2[16];
+        sprintfInt(dt, "%d temp, ", ow_cnt);
+        sprintfInt(dt2, "%d switch", ow_sw_cnt);
+        strcat(dt, dt2);
+        responseCmnd(dt);
+        return;
+    }
+
+    // parse device index
+    strSub(arg, cs, pos, 1);
+    int dev = atoi(arg);
+    pos = pos + 1;
+
+    if (dev < 0 || dev >= ow_sw_cnt) {
+        responseCmnd("Invalid device");
+        return;
+    }
+
+    // skip space
+    while (pos < len && cs[pos] == ' ') pos = pos + 1;
+
+    if (pos >= len) {
+        // just "OW 0" → show single device status
+        ow_cmd_status(resp);
+        responseCmnd(resp);
+        return;
+    }
+
+    // check for A/B channel specifier
+    int ch = cs[pos];
+    int val = 0;
+
+    if (ch == 'A' || ch == 'a' || ch == 'B' || ch == 'b') {
+        // channel letter
+        pos = pos + 1;
+        while (pos < len && cs[pos] == ' ') pos = pos + 1;
+        if (pos < len) {
+            strSub(arg, cs, pos, 0);
+            val = atoi(arg);
+        }
+
+        if (ch == 'A' || ch == 'a') {
+            // set PIO-A
+            if (ow_is_2ch(dev) || ow_is_1ch(dev)) {
+                if (dev == 0) { ow_sw0a = val; }
+                if (dev == 1) { ow_sw1a = val; }
+            }
+        } else {
+            // set PIO-B
+            if (ow_is_2ch(dev)) {
+                if (dev == 0) { ow_sw0b = val; }
+                if (dev == 1) { ow_sw1b = val; }
+            } else {
+                responseCmnd("No PIO-B on this device");
+                return;
+            }
+        }
+    } else {
+        // numeric value
+        strSub(arg, cs, pos, 0);
+        val = atoi(arg);
+
+        if (ow_sw_type[dev] == FAM_DS2408) {
+            // DS2408: set full port byte
+            if (dev == 0) ow_port0 = val;
+            if (dev == 1) ow_port1 = val;
+        } else {
+            // 1-ch or 2-ch: treat as PIO-A
+            if (dev == 0) { ow_sw0a = val; }
+            if (dev == 1) { ow_sw1a = val; }
+        }
+    }
+
+    // trigger write
+    ow_ui_to_state();
+    ow_sw_write(dev);
+
+    // sync prev to avoid double-write from ow_check_ui_changes
+    ow_sw0a_prev = ow_sw0a;
+    ow_sw0b_prev = ow_sw0b;
+    ow_sw1a_prev = ow_sw1a;
+    ow_sw1b_prev = ow_sw1b;
+    ow_port0_prev = ow_port0;
+    ow_port1_prev = ow_port1;
+
+    // respond with current state
+    ow_cmd_status(resp);
+    responseCmnd(resp);
+}
+
+void OnExit() {
+    if (ow_serial) {
+        serialClose();
+    }
+}
+
+int main() {
+    // first-run defaults (persist vars start at 0)
+    if (ow_pin == 0 && ow_rxpin == 0 && ow_txpin == 0) {
+        ow_mode = 1;    // DS2480B
+        ow_pin = 4;
+        ow_rxpin = 6;
+        ow_txpin = 5;
+    }
+
+    // DS2480B needs delay to avoid serial boot conflicts
+    if (ow_mode == 1) {
+        delay(5000);
+    }
+
+    // setup WebUI pulldowns (persist handles storage, webPulldown handles UI)
+    webPulldown(ow_mode, "Mode", "GPIO|DS2480B");
+    webPulldown(ow_pin, "1-Wire Pin", "@getfreepins");
+    webPulldown(ow_rxpin, "DS2480B RX", "@getfreepins");
+    webPulldown(ow_txpin, "DS2480B TX", "@getfreepins");
+
+    ow_reinit();
+    addCommand("OW");
+    return 0;
+}

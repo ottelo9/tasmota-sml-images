@@ -1,0 +1,36 @@
+// Touch Button & Slider Demo
+// Creates GFX touch buttons and a slider on the display
+// Requires a touchscreen display (e.g. ILI9341 + FT5206)
+
+int light_state = 0;
+int dimmer_val = 50;
+char buf[16];
+
+void TouchButton(int btn, int val) {
+    // Button 0: Toggle light
+    if (btn == 0) {
+        light_state = val;
+        sprintfInt(buf, "%d", val);
+        tasmCmd("Power1", buf);
+    }
+    // Button 1: Slider -> dimmer
+    if (btn == 1) {
+        dimmer_val = val;
+        sprintfInt(buf, "%d", val);
+        tasmCmd("Dimmer", buf);
+    }
+}
+
+int main() {
+    dspClear();
+
+    // Toggle button for light (virtual toggle)
+    dspTButton(0, 10, 20, 140, 50, WHITE, BLUE, WHITE, 2, "Light");
+
+    // Slider for dimmer
+    dspSlider(1, 10, 90, 200, 40, 10, DARKGREY, WHITE, CYAN);
+    dspButtonState(1, dimmer_val);  // initial slider position
+
+    printStr("Touch buttons demo active\n");
+    return 0;
+}

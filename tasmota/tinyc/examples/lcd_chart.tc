@@ -1,0 +1,306 @@
+// lcd_chart.tc — 3-Channel Line Chart Demo for TinyC
+// Draws real-time scrolling line charts on any LCD/TFT display
+// Simulates Temperature, Humidity, and Pressure waveforms
+// One sample per second, chart fills in ~3 minutes
+//
+// Drawing strategy:
+//   Filling phase — only draw the new segment (fast, no flicker)
+//   Wrapped/full  — full redraw (data scrolled, everything shifts)
+
+#define NPTS 200          // data points per channel
+#define NCH  3            // number of channels
+
+// RGB565 color palette
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define RED     0xF800
+#define GREEN   0x07E0
+#define BLUE    0x001F
+#define CYAN    0x07FF
+#define YELLOW  0xFFE0
+#define ORANGE  0xFD20
+#define DKGRAY  0x4208
+#define LTGRAY  0xC618
+
+// --- Data storage (flat ring buffer) ---
+// Layout: data[ch * NPTS + idx]
+float data[NCH * NPTS];
+int pos = 0;              // ring buffer write position
+int count = 0;            // valid entries (saturates at NPTS)
+int tick = 0;             // simulation time counter
+float cur[NCH];           // current values per channel
+
+// --- Display geometry (set in main) ---
+int scrW = 0;
+int scrH = 0;
+int cx = 0;
+int cy = 0;
+int cw = 0;
+int cht = 0;              // chart box: x, y, width, height
+
+// --- Channel configuration ---
+int   ch_clr[NCH];       // RGB565 color per channel
+float ch_lo[NCH];        // Y-axis minimum per channel
+float ch_hi[NCH];        // Y-axis maximum per channel
+
+// ============================================================
+// Coordinate mapping — X always based on NPTS (fixed spacing)
+// ============================================================
+
+int mapY(float val, float vmin, float vmax) {
+    float f = (val - vmin) / (vmax - vmin);
+    if (f < 0.0) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    return cy + cht - (int)(f * (float)cht);
+}
+
+int mapX(int i) {
+    return cx + (i * cw) / (NPTS - 1);
+}
+
+// ============================================================
+// Drawing — full redraw (used on wrap / initial)
+// ============================================================
+
+void draw_grid() {
+    dspColor(DKGRAY, BLACK);
+    int i;
+    for (i = 1; i < 4; i++) {
+        dspPos(cx + 1, cy + (cht * i) / 4);
+        dspHLine(cw - 2);
+    }
+    int nv = cw / 60;
+    if (nv < 3) nv = 3;
+    for (i = 1; i < nv; i++) {
+        dspPos(cx + (cw * i) / nv, cy + 1);
+        dspVLine(cht - 2);
+    }
+}
+
+void draw_series(int c) {
+    if (count < 2) return;
+    dspColor(ch_clr[c], BLACK);
+    int base = c * NPTS;
+    int n = count;
+    int i;
+    int idx = pos - n;
+    if (idx < 0) idx = idx + NPTS;
+    int py = mapY(data[base + idx], ch_lo[c], ch_hi[c]);
+    if (py < cy) py = cy;
+    if (py > cy + cht) py = cy + cht;
+    dspPos(mapX(0), py);
+    for (i = 1; i < n; i++) {
+        idx = pos - n + i;
+        if (idx < 0) idx = idx + NPTS;
+        py = mapY(data[base + idx], ch_lo[c], ch_hi[c]);
+        if (py < cy) py = cy;
+        if (py > cy + cht) py = cy + cht;
+        dspLine(mapX(i), py);
+    }
+}
+
+void draw_legend() {
+    char buf[24];
+    dspFont(0);
+    dspSize(1);
+    int ly = cy + cht + 4;
+    int sp = cw / NCH;
+
+    // Clear legend area
+    dspColor(BLACK, BLACK);
+    dspPos(cx, ly);
+    dspFillRect(cw, 10);
+
+    // Ch0 — Temperature (red)
+    dspColor(RED, BLACK);
+    dspPos(cx + 2, ly);
+    dspFillRect(10, 8);
+    sprintfFloat(buf, " %.1fC", cur[0]);
+    dspPos(cx + 14, ly);
+    dspDraw(buf);
+
+    // Ch1 — Humidity (cyan)
+    dspColor(CYAN, BLACK);
+    dspPos(cx + sp, ly);
+    dspFillRect(10, 8);
+    sprintfFloat(buf, " %.0f%%", cur[1]);
+    dspPos(cx + sp + 12, ly);
+    dspDraw(buf);
+
+    // Ch2 — Pressure (yellow)
+    dspColor(YELLOW, BLACK);
+    dspPos(cx + 2 * sp, ly);
+    dspFillRect(10, 8);
+    sprintfFloat(buf, " %.0fhPa", cur[2]);
+    dspPos(cx + 2 * sp + 12, ly);
+    dspDraw(buf);
+}
+
+void draw_header() {
+    char hdr[32];
+    dspFont(0);
+    dspSize(1);
+    // Clear header area
+    dspColor(BLACK, BLACK);
+    dspPos(cx, 0);
+    dspFillRect(cw, 12);
+    // Title
+    dspColor(WHITE, BLACK);
+    dspPos(cx, 2);
+    dspDraw("3-Channel Chart");
+    // Counter
+    sprintfInt(hdr, "[%d/", count);
+    sprintfAppendInt(hdr, "%d]", NPTS);
+    dspPos(cx + cw - 48, 2);
+    dspDraw(hdr);
+}
+
+void draw_chart() {
+    // Full clear + redraw
+    dspColor(BLACK, BLACK);
+    dspPos(0, 0);
+    dspFillRect(scrW, scrH);
+
+    draw_header();
+    draw_grid();
+    dspColor(LTGRAY, BLACK);
+    dspPos(cx, cy);
+    dspRect(cw, cht);
+
+    draw_series(2);
+    draw_series(1);
+    draw_series(0);
+
+    draw_legend();
+}
+
+// ============================================================
+// Incremental draw — only the new segment (filling phase)
+// ============================================================
+
+void draw_segment(int c) {
+    dspColor(ch_clr[c], BLACK);
+    int base = c * NPTS;
+    int n = count;
+
+    // Previous point (n-2 in display order)
+    int idx1 = pos - 2;
+    if (idx1 < 0) idx1 = idx1 + NPTS;
+    int py1 = mapY(data[base + idx1], ch_lo[c], ch_hi[c]);
+    if (py1 < cy) py1 = cy;
+    if (py1 > cy + cht) py1 = cy + cht;
+
+    // New point (n-1 in display order)
+    int idx2 = pos - 1;
+    if (idx2 < 0) idx2 = idx2 + NPTS;
+    int py2 = mapY(data[base + idx2], ch_lo[c], ch_hi[c]);
+    if (py2 < cy) py2 = cy;
+    if (py2 > cy + cht) py2 = cy + cht;
+
+    dspPos(mapX(n - 2), py1);
+    dspLine(mapX(n - 1), py2);
+}
+
+void draw_incremental() {
+    // Just add the latest segment for each channel + update text
+    draw_segment(2);
+    draw_segment(1);
+    draw_segment(0);
+    draw_header();
+    draw_legend();
+}
+
+// ============================================================
+// Simulation — 3 waveforms with different characteristics
+// ============================================================
+
+void simulate() {
+    tick++;
+    float t = (float)tick * 0.05;
+
+    // Ch0: Temperature — sine, 15–30 °C
+    cur[0] = 22.5 + 7.5 * sin(t);
+
+    // Ch1: Humidity — cosine (different freq), 30–80 %
+    cur[1] = 55.0 + 25.0 * cos(t * 0.7);
+
+    // Ch2: Pressure — slow drift + random noise, 1000–1020 hPa
+    cur[2] = 1010.0 + 10.0 * sin(t * 0.3)
+           + (float)random(-20, 21) * 0.1;
+}
+
+void store_sample() {
+    int c;
+    for (c = 0; c < NCH; c++) {
+        data[c * NPTS + pos] = cur[c];
+    }
+    pos++;
+    if (pos >= NPTS) pos = 0;
+    if (count < NPTS) count++;
+}
+
+// ============================================================
+// Callbacks
+// ============================================================
+
+void EverySecond() {
+    simulate();
+    store_sample();
+
+    if (count >= NPTS) {
+        // Buffer full + wrapping — full redraw (data scrolls)
+        draw_chart();
+    } else if (count >= 2) {
+        // Filling — just add the new segment
+        draw_incremental();
+    } else {
+        // First point — draw initial chart frame
+        draw_chart();
+    }
+}
+
+int main() {
+    scrW = dspWidth();
+    scrH = dspHeight();
+    if (scrW < 100 || scrH < 64) {
+        printStr("ERROR: no display found\n");
+        return 1;
+    }
+
+    // Chart layout — adapts to any display size
+    cx  = 5;
+    cy  = 14;
+    cw  = scrW - 10;
+    cht = scrH - cy - 16;
+
+    // Channel colors
+    ch_clr[0] = RED;
+    ch_clr[1] = CYAN;
+    ch_clr[2] = YELLOW;
+
+    // Y-axis ranges
+    ch_lo[0] = 10.0;   ch_hi[0] = 35.0;    // Temperature °C
+    ch_lo[1] = 20.0;   ch_hi[1] = 90.0;    // Humidity %
+    ch_lo[2] = 985.0;  ch_hi[2] = 1035.0;  // Pressure hPa
+
+    // Splash screen
+    dspClear();
+    dspColor(WHITE, BLACK);
+    dspFont(0);
+    dspSize(2);
+    dspPos(scrW / 2 - 60, scrH / 2 - 16);
+    dspDraw("Chart Demo");
+    dspSize(1);
+    dspPos(scrW / 2 - 55, scrH / 2 + 10);
+    dspDraw("Starting in 1 sec...");
+
+    char buf[64];
+    sprintfInt(buf, "Display: %dx", scrW);
+    sprintfAppendInt(buf, "%d\n", scrH);
+    printString(buf);
+    sprintfInt(buf, "Chart area: %dx", cw);
+    sprintfAppendInt(buf, "%d\n", cht);
+    printString(buf);
+
+    return 0;
+}
