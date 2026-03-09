@@ -1715,7 +1715,7 @@ void Script_udp_ensure(void) {
 void Script_Init_UDP() {
 #ifdef USE_TINYC
   // TinyC manages its own multicast socket on the same port — don't open a competing one
-  return;
+  //return;
 #endif
   if (TasmotaGlobal.global_state.network_down) return;
   if (!glob_script_mem.udp_flags.udp_used) return;
