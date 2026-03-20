@@ -12,6 +12,10 @@
 #define HARDWARE_FALLBACK 2
 #endif
 
+#ifdef USE_SML_M
+uint32_t SML_SetOptions(uint32_t in);
+#endif
+
 #include <OneWire.h>
 
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
@@ -5486,11 +5490,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         case 20: val = (int32_t)ESP.getFreePsram(); break;  // tasm_pheap
 #endif
 #ifdef USE_SML_M
-        case 21: {  // tasm_smlj
-          SML_TABLE *smlp = get_sml_table();
-          if (smlp) { val = (int32_t)smlp->SML_SetOptions(0); }
-          break;
-        }
+        case 21: val = (int32_t)SML_SetOptions(0); break;  // tasm_smlj
 #endif
         case 22: val = (int32_t)TasmotaGlobal.devices_present; break;  // tasm_npwr
         case 23: val = bitRead(Settings->rule_enabled, 0); break;  // tasm_rule
@@ -5581,11 +5581,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
 #endif
           break;
 #ifdef USE_SML_M
-        case 21: {  // tasm_smlj
-          SML_TABLE *smlp = get_sml_table();
-          if (smlp) { smlp->SML_SetOptions(0x100 | (uint8_t)val); }
-          break;
-        }
+        case 21: SML_SetOptions(0x100 | (uint8_t)val); break;  // tasm_smlj
 #endif
         case 23:  // tasm_rule
           if (val) {

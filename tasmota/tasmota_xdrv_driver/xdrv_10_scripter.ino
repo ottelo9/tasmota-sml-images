@@ -6923,7 +6923,9 @@ void tmod_directModeOutput(uint32_t pin);
             glob_script_mem.Script_PortUdp_1->beginPacket(glob_script_mem.Script_PortUdp_1->remoteIP(), glob_script_mem.Script_PortUdp_1->remotePort());
             glob_script_mem.Script_PortUdp_1->write((unsigned char*)payload, strlen(payload));
             glob_script_mem.Script_PortUdp_1->endPacket();
+#ifdef ESP32
             glob_script_mem.Script_PortUdp_1->flush();
+#endif
           }
           if (sel == 3 && glob_script_mem.Script_PortUdp_1) {
             char url[SCRIPT_MAX_SBSIZE];
