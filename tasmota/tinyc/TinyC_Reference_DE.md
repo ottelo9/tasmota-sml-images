@@ -394,6 +394,12 @@ Definieren Sie einfach Funktionen mit diesen bekannten Namen — keine Registrie
 | `Command(char cmd[])` | Benutzerdefinierter Konsolenbefehl | Wenn Benutzer registriertes Praefix in Konsole eingibt | Benutzerdefinierte Tasmota-Befehle verarbeiten (z.B. MP3Play, MP3Stop) |
 | `Event(char cmd[])` | Tasmota-Event-Regel-Trigger | Bei `Event`-Befehl aus Regeln oder Konsole | Auf Tasmota-Regel-Events reagieren |
 | `OnExit()` | Skript-Stopp | Wenn VM gestoppt oder Skript ersetzt wird | Serielle Ports schliessen, Ressourcen freigeben |
+| `OnMqttConnect()` | FUNC_MQTT_INIT | MQTT-Broker verbunden | Topics abonnieren, Status publizieren |
+| `OnMqttDisconnect()` | mqtt_disconnected Flag | MQTT-Broker getrennt | Offline-Status setzen, Publizierung stoppen |
+| `OnInit()` | Erstes FUNC_NETWORK_UP | Einmal nach erster WiFi-Verbindung | Einmalige Init: Dienste starten, MQTT abonnieren |
+| `OnWifiConnect()` | FUNC_NETWORK_UP | WiFi/Netzwerk verbunden (jedes Mal) | Reconnect-Behandlung |
+| `OnWifiDisconnect()` | FUNC_NETWORK_DOWN | WiFi/Netzwerk getrennt | Netzwerkabhaengige Aufgaben pausieren |
+| `OnTimeSet()` | FUNC_TIME_SYNCED | NTP-Zeit synchronisiert | Zeitbasierte Aktionen planen |
 
 ### Ausfuehrungsmodell
 
@@ -570,6 +576,39 @@ TinyC stellt virtuelle `tasm_*`-Variablen bereit, die den Tasmota-Systemzustand 
 | `tasm_sunrise` | int | lesen | Sonnenaufgang, Minuten seit Mitternacht (erfordert USE_SUNRISE) |
 | `tasm_sunset` | int | lesen | Sonnenuntergang, Minuten seit Mitternacht (erfordert USE_SUNRISE) |
 | `tasm_time` | int | lesen | Aktuelle Uhrzeit, Minuten seit Mitternacht |
+| `tasm_pheap` | int | lesen | Freier PSRAM-Speicher in Bytes (nur ESP32) |
+| `tasm_smlj` | int | lesen/schreiben | SML JSON-Ausgabe aktivieren/deaktivieren (erfordert USE_SML_M) |
+| `tasm_npwr` | int | lesen | Anzahl der Power-Geraete (Relais) |
+
+### Indizierte Tasmota-Zustandsfunktionen
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `int tasmPower(int index)` | Power-Zustand des Relais `index` (0-basiert). Gibt 0 oder 1 zurueck |
+| `int tasmSwitch(int index)` | Schalter-Zustand (0-basiert, Switch1 = Index 0). Gibt -1 bei ungueltigem Index zurueck |
+| `int tasmCounter(int index)` | Impulszaehler-Wert (0-basiert, Counter1 = Index 0). Erfordert USE_COUNTER |
+
+### Tasmota String-Info
+
+`int tasmInfo(int sel, char buf[])` — fuellt `buf` mit einem Tasmota-Info-String. Gibt Stringlaenge zurueck.
+
+| sel | Inhalt |
+|-----|--------|
+| 0 | MQTT-Topic |
+| 1 | MAC-Adresse |
+| 2 | Lokale IP-Adresse |
+| 3 | Friendly Name |
+| 4 | Device Name |
+| 5 | MQTT Group-Topic |
+| 6 | Reset-Grund (String) |
+
+**Beispiel:**
+```c
+char topic[64];
+tasmInfo(0, topic);    // MQTT-Topic holen
+char ip[20];
+tasmInfo(2, ip);       // lokale IP holen
+```
 
 ### Verwendung
 
@@ -645,7 +684,13 @@ int data[10];                       // nicht initialisiert
 int primes[5] = {2, 3, 5, 7, 11};  // mit Initialisierer
 float values[3] = {1.5, 2.5};      // teilweise initialisiert
 char name[32] = "TinyC";           // Zeichenketten-Initialisierung (null-terminiert)
+char greeting[] = "Hello World";    // Groesse aus String abgeleitet (12)
+int flags[] = {1, 0, 1, 1};        // Groesse aus Initialisierer abgeleitet (4)
 ```
+
+Wenn die Groesse weggelassen wird (`[]`), leitet der Compiler sie automatisch ab:
+- **String-Initialisierer:** Groesse = Stringlaenge + 1 (fuer Null-Terminator)
+- **Array-Initialisierer:** Groesse = Anzahl der Elemente
 
 ### Zugriff
 ```c
@@ -655,26 +700,27 @@ data[i + 1] = data[i]; // berechneter Index
 ```
 
 ### Gueltigkeitsbereich
-- **Globale Arrays** — im globalen Datenspeicher gespeichert (bis zu 255 Elemente)
-- **Lokale Arrays** — im lokalen Rahmen der Funktion gespeichert (bis zu 255 Elemente)
-- **Heap-Arrays** — Arrays mit mehr als 255 Elementen werden automatisch auf dem dynamischen Heap gespeichert
+- **Kleine Arrays (≤16 Elemente)** — inline im globalen Datenspeicher oder lokalen Rahmen (schneller Direktzugriff)
+- **Grosse Arrays (>16 Elemente)** — automatisch auf dem VM-Heap allokiert
 
-### Grosse Arrays (Heap)
+### Array-Speicher
 
-Arrays mit mehr als 255 Elementen werden vom Compiler **automatisch** in den Heap-Speicher weitergeleitet. Keine spezielle Syntax noetig — der Compiler erkennt die Groesse und allokiert transparent auf dem Heap:
+Arrays mit bis zu 16 Elementen werden inline im globalen oder lokalen Rahmen gespeichert fuer schnellen Direktzugriff. Arrays mit mehr als 16 Elementen werden vom Compiler automatisch auf dem VM-Heap allokiert — keine spezielle Syntax noetig:
 
 ```c
-float data[2000];      // automatisch -> Heap (2000 > 255)
-int small[10];         // bleibt in Globalen (10 <= 255)
+int rgb[3];            // inline (3 ≤ 16) — schneller Direktzugriff
+char buf[128];         // Heap (128 > 16) — automatische Allokation
+float data[2000];      // Heap (2000 > 16)
 
 int main() {
-    data[1999] = 3.14;  // Heap-Zugriff — gleiche Syntax wie regulaere Arrays
-    small[0] = 42;      // globaler Zugriff
+    rgb[0] = 255;       // direkter Rahmenzugriff
+    buf[0] = 'H';       // Heap-Zugriff — gleiche Syntax
+    data[1999] = 3.14;  // Heap-Zugriff
     return 0;
 }
 ```
 
-Heap-Arrays unterstuetzen alle gleichen Operationen wie regulaere Arrays: Elementzugriff, Zeichenkettenoperationen auf `char[]`, Uebergabe an Funktionen usw.
+Sowohl Inline- als auch Heap-Arrays unterstuetzen alle gleichen Operationen: Elementzugriff, Zeichenkettenoperationen auf `char[]`, Uebergabe an Funktionen usw.
 
 **Heap-Grenzen:**
 
@@ -732,37 +778,37 @@ printString(greeting);                  // Zeichenkette ausgeben
 
 ### Formatierte Zeichenkettenausgabe (sprintf)
 
-Einen einzelnen Wert in ein char-Array formatieren:
+Einen einzelnen Wert in ein char-Array formatieren. Der Compiler erkennt den Werttyp automatisch:
 
 ```c
 char line[64];
-sprintfInt(line, "x = %d", 42);            // "x = 42"
-sprintfFloat(line, "pi = %.2f", 3.14);     // "pi = 3.14"
-sprintfStr(line, "name: %s", name);        // "name: World"
+char name[16];
+float pi = 3.14;
+
+sprintf(line, "x = %d", 42);              // "x = 42"
+sprintf(line, "pi = %.2f", pi);           // "pi = 3.14"
+sprintf(line, "name: %s", name);          // "name: World"
 ```
 
 ### Mehrteilige Zeichenketten erstellen (sprintfAppend)
 
-Da TinyC keine variadischen Funktionen hat, verwenden Sie `sprintfAppend`-Varianten, um
-mehrere Werte in einen Puffer zu verketten. Sie fuegen am aktuellen Ende der Zeichenkette an:
+Verwenden Sie `sprintfAppend`, um mehrere Werte in einen Puffer zu verketten. Es fuegt am aktuellen Ende der Zeichenkette an:
 
 ```c
 char report[128];
-sprintfInt(report, "Sensor %d", 1);              // "Sensor 1"
-sprintfAppendStr(report, " name=%s", name);       // "Sensor 1 name=World"
-sprintfAppendInt(report, " val=%d", 42);          // "Sensor 1 name=World val=42"
-sprintfAppendFloat(report, " temp=%.1f", 3.14);   // "Sensor 1 name=World val=42 temp=3.1"
+sprintf(report, "Sensor %d", 1);               // "Sensor 1"
+sprintfAppend(report, " name=%s", name);        // "Sensor 1 name=World"
+sprintfAppend(report, " val=%d", 42);           // "Sensor 1 name=World val=42"
+sprintfAppend(report, " temp=%.1f", 3.14);      // "Sensor 1 name=World val=42 temp=3.1"
 printString(report);
 ```
 
 | Funktion | Beschreibung |
 |----------|-------------|
-| `sprintfInt(char dst[], "fmt", int val)` | Int in dst formatieren (ueberschreibt) |
-| `sprintfFloat(char dst[], "fmt", float val)` | Float in dst formatieren (ueberschreibt) |
-| `sprintfStr(char dst[], "fmt", char src[])` | Zeichenkette in dst formatieren (ueberschreibt) |
-| `sprintfAppendInt(char dst[], "fmt", int val)` | Int formatieren und an dst anfuegen |
-| `sprintfAppendFloat(char dst[], "fmt", float val)` | Float formatieren und an dst anfuegen |
-| `sprintfAppendStr(char dst[], "fmt", char src[])` | Zeichenkette formatieren und an dst anfuegen |
+| `sprintf(char dst[], "fmt", val)` | Wert in dst formatieren (ueberschreibt). Typ wird automatisch erkannt. |
+| `sprintfAppend(char dst[], "fmt", val)` | Wert formatieren und an dst anfuegen. Typ wird automatisch erkannt. |
+
+> **Alte Varianten:** `sprintfInt`, `sprintfFloat`, `sprintfStr`, `sprintfAppendInt`, `sprintfAppendFloat`, `sprintfAppendStr` funktionieren weiterhin.
 
 **Format-Spezifikatoren:** `%d` (int), `%f` `%.2f` `%e` `%g` (float), `%s` (Zeichenkette). Jeder Aufruf verarbeitet genau einen `%`-Spezifikator.
 
@@ -789,6 +835,17 @@ int no = strFind(src, "xyz");          // no = -1
 | `strToken(char dst[], char src[], int delim, int n)` | N-tes Token (1-basiert) durch Trennzeichen `delim` in dst kopieren. Gibt die Token-Laenge zurueck. |
 | `strSub(char dst[], char src[], int pos, int len)` | `len` Zeichen ab `pos` (0-basiert, negativ=vom Ende) in dst kopieren. `len=0` kopiert bis zum Ende der Zeichenkette. Gibt die tatsaechliche Laenge zurueck. |
 | `strFind(char haystack[], char needle[])` | Erstes Vorkommen von needle in haystack finden. Gibt die Position (0-basiert) oder -1 zurueck, wenn nicht gefunden. |
+| `int strToInt(char str[])` | String in Integer umwandeln (wie `atoi`) |
+| `float strToFloat(char str[])` | String in Float umwandeln (wie `atof`) |
+
+### Array-Sortierung
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `sortArray(int arr[], int count, int flags)` | Array sortieren. `flags`: 0=int aufsteigend, 1=float aufsteigend, 2=int absteigend, 3=float absteigend |
+| `arrayFill(int arr[], int value, int count)` | Erste `count` Elemente mit `value` fuellen |
+| `arrayCopy(int dst[], int src[], int count)` | `count` Elemente von `src` nach `dst` kopieren |
+| `int smlCopy(int arr[], int count)` | SML-Decoderwerte in Float-Array kopieren. Gibt Anzahl zurueck (erfordert USE_SML_M) |
 
 ### Zeichenzugriff
 ```c
@@ -980,7 +1037,7 @@ float c = a + b;    // a wird zu float heraufgestuft, Ergebnis = 7.5
 
 | Funktion                             | Beschreibung                          |
 |--------------------------------------|---------------------------------------|
-| `pinMode(int pin, int mode)`         | Pin-Modus setzen (0=INPUT, 1=OUTPUT)  |
+| `pinMode(int pin, int mode)`         | Pin-Modus setzen (1=INPUT, 3=OUTPUT, 5=INPUT_PULLUP, 9=INPUT_PULLDOWN) |
 | `digitalWrite(int pin, int value)`   | HIGH(1) oder LOW(0) schreiben         |
 | `int digitalRead(int pin)`           | Pin-Zustand lesen                     |
 | `int analogRead(int pin)`            | Analogwert lesen (0–4095)             |
@@ -1040,6 +1097,10 @@ void EveryLoop() {
 | `serialPrintln("literal")`        | Zeichenkette + Zeilenumbruch auf seriell |
 | `int serialRead()`                | Byte lesen (-1 wenn keines verfuegbar)  |
 | `int serialAvailable()`           | Verfuegbare Bytes zum Lesen             |
+| `serialClose()`                   | Seriellen Port schließen                |
+| `serialWriteByte(int b)`          | Einzelnes Byte an serielle Schnittstelle senden |
+| `serialWriteStr(char str[])`      | Char-Array an serielle Schnittstelle senden |
+| `serialWriteBuf(char buf[], int len)` | `len` Bytes aus Buffer an serielle Schnittstelle senden |
 
 ### 1-Wire
 
@@ -1070,6 +1131,8 @@ void EveryLoop() {
 | `float cos(float x)`                                | Kosinus (Bogenmass)              |
 | `float exp(float x)`                                | Exponentialfunktion (e^x)        |
 | `float log(float x)`                                | Natürlicher Logarithmus (ln x)  |
+| `float pow(float basis, float exp)`                  | Potenz (basis^exp)               |
+| `float acos(float x)`                               | Arkuskosinus (Bogenmass)         |
 | `float intBitsToFloat(int bits)`                     | Int als IEEE 754 Float interpretieren |
 | `int floor(float x)`                                | Ganzzahlanteil (Richtung −∞)     |
 | `int ceil(float x)`                                 | Ganzzahlanteil + 1 (Richtung +∞) |
@@ -1091,16 +1154,14 @@ void EveryLoop() {
 
 ### sprintf — Formatierte Zeichenketten
 
-Einen einzelnen Wert in ein char-Array formatieren. Jede Funktion verarbeitet einen `%`-Spezifikator.
+Einen einzelnen Wert in ein char-Array formatieren. Der Compiler erkennt den Werttyp automatisch. Jeder Aufruf verarbeitet einen `%`-Spezifikator.
 
 | Funktion | Beschreibung |
 |----------|-------------|
-| `int sprintfInt(char dst[], "fmt", int val)` | Int in dst formatieren (ueberschreibt) |
-| `int sprintfFloat(char dst[], "fmt", float val)` | Float in dst formatieren (ueberschreibt) |
-| `int sprintfStr(char dst[], "fmt", char src[])` | Zeichenkette in dst formatieren (ueberschreibt) |
-| `int sprintfAppendInt(char dst[], "fmt", int val)` | Int formatieren, an Ende von dst anfuegen |
-| `int sprintfAppendFloat(char dst[], "fmt", float val)` | Float formatieren, an Ende von dst anfuegen |
-| `int sprintfAppendStr(char dst[], "fmt", char src[])` | Zeichenkette formatieren, an Ende von dst anfuegen |
+| `int sprintf(char dst[], "fmt", val)` | Wert in dst formatieren (ueberschreibt). Typ automatisch erkannt. |
+| `int sprintfAppend(char dst[], "fmt", val)` | Wert formatieren, an Ende von dst anfuegen. Typ automatisch erkannt. |
+
+> **Alte Varianten:** `sprintfInt`, `sprintfFloat`, `sprintfStr`, `sprintfAppendInt`, `sprintfAppendFloat`, `sprintfAppendStr` funktionieren weiterhin.
 
 **Format-Spezifikatoren:** `%d` (int), `%f` `%.Nf` `%e` `%g` (float), `%s` (Zeichenkette).
 Alle Funktionen geben die Gesamtlaenge der Zeichenkette zurueck.
@@ -1108,9 +1169,9 @@ Alle Funktionen geben die Gesamtlaenge der Zeichenkette zurueck.
 ```c
 // Mehrteilige Zeichenkette durch Verkettung von Append-Aufrufen erstellen:
 char buf[128];
-sprintfInt(buf, "ID=%d", 1);
-sprintfAppendStr(buf, " name=%s", name);
-sprintfAppendFloat(buf, " val=%.1f", 3.14);
+sprintf(buf, "ID=%d", 1);
+sprintfAppend(buf, " name=%s", name);
+sprintfAppend(buf, " val=%.1f", 3.14);
 // buf = "ID=1 name=World val=3.1"
 ```
 
@@ -1130,13 +1191,15 @@ Dateien auf dem ESP32-Dateisystem (LittleFS) lesen und schreiben. In der Browser
 | `int fileSeek(handle, offset, whence)`     | Zur Position springen. Gibt 1=ok, 0=Fehler zurueck   |
 | `int fileTell(handle)`                     | Aktuelle Position in Datei, -1 bei Fehler             |
 | `int fsInfo(int sel)`                      | Dateisystem-Info: sel=0 → Gesamtgroesse KB, sel=1 → frei KB |
+| `int fileOpenDir("path")`                  | Verzeichnis zum Auflisten oeffnen, gibt Handle oder -1 zurueck |
+| `int fileReadDir(handle, char name[])`     | Naechsten Dateinamen in name lesen. Gibt 1=Eintrag, 0=Ende zurueck |
 
 **Dateimodi:** `0` = Lesen, `1` = Schreiben (Erstellen/Abschneiden), `2` = Anfuegen
 
 **Seek-Modus (whence):** `0` = SEEK_SET (vom Anfang), `1` = SEEK_CUR (von aktueller Position), `2` = SEEK_END (vom Ende)
 
 **Hinweise:**
-- Dateipfade muessen Zeichenketten-Literale sein (z.B. `"/data.txt"`)
+- Dateipfade können Zeichenketten-Literale oder char[]-Variablen sein (z.B. `"/data.txt"`)
 - **Dateisystem-Auswahl** (Scripter-kompatibel): Standard ist SD-Karte (`ufsp`). Praefix `/ffs/` fuer Flash, `/sdfs/` fuer SD-Karte explizit: `fileOpen("/ffs/config.txt", 0)` oeffnet von Flash, `fileOpen("/data.txt", 0)` oeffnet von SD-Karte
 - Maximal 4 gleichzeitig geoeffnete Dateien (ESP32), 8 im Browser
 - Puffer-Argumente (`buf`) muessen `char`-Arrays sein, keine Zeichenketten-Literale
@@ -1160,7 +1223,23 @@ fileClose(f);
 printString(buf);                    // gibt "Hello!" aus
 
 fileDelete("/test.txt");             // aufraeumen
+
+// Beispiel: Dateien in einem Verzeichnis auflisten
+char fname[64];
+int dir = fileOpenDir("/images");
+if (dir >= 0) {
+    while (fileReadDir(dir, fname)) {
+        printString(fname);
+        print("\n");
+    }
+    fileClose(dir);
+}
 ```
+
+**Hinweise zur Verzeichnisauflistung:**
+- `fileOpenDir` belegt einen Datei-Handle-Slot (gleicher Pool wie `fileOpen`), mit `fileClose` schliessen
+- `fileReadDir` gibt nur Dateinamen zurueck (kein Pfad-Praefix), ueberspringt Unterverzeichnisse
+- Pfad-Argument kann ein String-Literal oder eine char-Array-Variable sein
 
 ### Erweiterte Dateioperationen
 
@@ -1322,9 +1401,10 @@ Einen beliebigen Tasmota-Konsolenbefehl ausfuehren und die JSON-Antwort erfassen
 | Funktion                                     | Beschreibung                                          |
 |----------------------------------------------|-------------------------------------------------------|
 | `int tasmCmd("command", char response[])`    | Befehl ausfuehren, Antwort speichern, Laenge zurueckgeben |
+| `int tasmCmd(char cmd[], char response[])`   | Befehl ausfuehren (char-Array), Antwort speichern |
 
 **Hinweise:**
-- Der Befehl muss ein Zeichenketten-Literal sein (z.B. `"Status 0"`, `"Power ON"`)
+- Befehl kann ein String-Literal oder ein char[]-Array sein
 - Der Antwortpuffer sollte ein `char`-Array sein (empfohlene Groesse: 256)
 - Gibt die Laenge der Antwortzeichenkette zurueck, oder -1 bei Fehler
 - In der Browser-IDE wird eine simulierte Scheinantwort zurueckgegeben
@@ -1443,6 +1523,7 @@ Daten direkt an Tasmota's Telemetrie- und Websysteme aus Callback-Funktionen sen
 | `void webFlush()` | Web-Inhaltspuffer zum Client leeren (`WSContentFlush`) |
 | `void addLog(char buf[])` | Nachricht ins Tasmota-Log schreiben (`AddLog` auf INFO-Ebene) |
 | `void addLog("literal")` | Zeichenketten-Literal ins Tasmota-Log schreiben |
+| `webSendJsonArray(float arr[], int count)` | Float-Array als JSON-Integer-Array ausgeben |
 
 **Hinweise:**
 - `addLog`, `webSend` und `responseAppend` akzeptieren sowohl ein char-Array als auch ein Zeichenketten-Literal
@@ -1760,6 +1841,7 @@ void WebPage() {
 - **Auto-Skalierung** (`0, 0`) fuer Daten mit variablem Bereich (Helligkeit, Wind, Regen)
 - Aufruf aus `WebPage()`-Callback — jeder Aufruf erzeugt eine Datenserie
 - Mehrere Serien in einem Diagramm: erster Aufruf hat Titel, weitere verwenden `""` als Titel
+- **Benutzerdefinierte Diagrammgroesse:** `webChartSize(width, height)` vor dem ersten `WebChart()`-Aufruf aufrufen, um benutzerdefinierte Diagrammabmessungen in Pixeln festzulegen
 
 **HTML aus Dateien einbinden:**
 
@@ -1847,6 +1929,7 @@ Kompatibel mit Tasmota Scripter's globalem Variablenprotokoll.
 | `int udpReady("name")` | Gibt 1 zurueck wenn neuer Wert seit letzter Pruefung empfangen |
 | `void udpSendArray("name", float_arr, count)` | Float-Array per binaeren Multicast senden |
 | `int udpRecvArray("name", float_arr, maxcount)` | Float-Array empfangen, gibt tatsaechliche Anzahl zurueck |
+| `udpSendStr("name", char str[])` | String über UDP-Multicast senden |
 
 **Protokoll:**
 - Einzelner Float: sende `=>name:[4 Bytes IEEE-754 Float]`
@@ -1859,6 +1942,8 @@ Kompatibel mit Tasmota Scripter's globalem Variablenprotokoll.
 **Callback:** Definieren Sie `void UdpCall()`, um bei jeder empfangenen Variable benachrichtigt zu werden.
 Der UDP-Socket wird beim ersten Schreibzugriff auf eine globale Variable, `udpRecv()`- oder `udpReady()`-Aufruf automatisch initialisiert.
 Skalare `global` Float-Variablen werden bei Zuweisung automatisch per UDP gesendet (kein expliziter Aufruf noetig).
+
+**Socket-Watchdog:** Der Multicast-Socket hat einen eingebauten Inaktivitaets-Watchdog (Standard: 60 Sekunden). Wenn innerhalb der Timeout-Periode kein Paket empfangen wird, wird der Socket automatisch geschlossen und neu geoeffnet. Dies behebt das bekannte ESP32-Problem, bei dem der UDP-Empfangspfad nach variabler Zeit stillschweigend aufhoert zu funktionieren. Mit `udp(8, 0, sekunden)` kann der Timeout geaendert werden (0 = deaktiviert).
 
 **Beispiel (Skalar — automatischer Broadcast):**
 ```c
@@ -1905,12 +1990,14 @@ Scripter-kompatible `udp()`-Funktion fuer beliebige UDP-Kommunikation. Verwendet
 | `int udp(5)` | Remote-Absender-Port zurueckgeben |
 | `int udp(6, char url[], int port, char str[])` | String an beliebige url:port senden |
 | `int udp(7, char url[], int port, int arr[], int count)` | Array als Rohbytes an url:port senden |
+| `int udp(8, int welcher, int sekunden)` | Socket-Inaktivitaets-Timeout setzen (welcher: 0=Multicast, 1=Allgemeiner Port; 0=deaktiviert) |
 
 **Hinweise:**
-- Das erste Argument (Modus) muss ein ganzzahliges Literal (0-7) sein
+- Das erste Argument (Modus) muss ein ganzzahliges Literal (0-8) sein
 - Modi 6 und 7 erstellen einen temporaeren Socket (kein vorheriges `udp(0)` noetig)
 - Modus 1 ist nicht-blockierend: gibt sofort 0 zurueck wenn kein Paket verfuegbar
 - Modus 7 sendet das untere Byte jedes Array-Elements
+- Modus 8 konfiguriert den Socket-Watchdog: wenn innerhalb von `sekunden` kein Paket empfangen wird, wird der Socket automatisch zurueckgesetzt. Standard ist 60 Sekunden. 0 zum Deaktivieren.
 
 ### I2C-Bus
 
@@ -1927,6 +2014,8 @@ Direkter I2C-Bus-Zugriff fuer Sensortreiber (erfordert `USE_I2C`). Alle Funktion
 | `int i2cWrite0(int addr, int reg, int bus)` | Nur Register-Byte schreiben (keine Daten). Gibt 1=ok zurueck |
 | `int i2cSetDevice(int addr, int bus)` | Pruefen ob Adresse **nicht belegt** und ansprechbar. Gibt 1=verfuegbar zurueck |
 | `i2cSetActiveFound(int addr, "type", int bus)` | Adresse als belegt registrieren. Loggt Erkennung |
+| `int i2cReadRS(int addr, int reg, char buf[], int len, int bus)` | I2C-Lesen mit Repeated-Start (SMBus) |
+| `I2cResetActive(int addr, int bus)` | Beanspruchte I2C-Adresse freigeben |
 
 **Hinweise:**
 - `bus` = 0 oder 1 — waehlt welcher I2C-Bus verwendet wird
@@ -2175,6 +2264,10 @@ Alle Primitiven verwenden die aktuelle Position, die durch `dspPos()` gesetzt wu
 | Funktion | Beschreibung |
 |----------|-------------|
 | `dspPicture("file.jpg", scale)` | Bilddatei vom Dateisystem an aktueller Position zeichnen (scale: 0=Original) |
+| `int dspLoadImage("file.jpg")` | JPG in PSRAM als RGB565-Pixelspeicher laden, gibt Slot 0-3 zurueck (-1 bei Fehler). Bleibt im Speicher bis VM stoppt. Nur ESP32+JPEG_PICTS |
+| `dspPushImageRect(slot, sx, sy, dx, dy, w, h)` | Teilrechteck aus geladenem Bild auf Bildschirm zeichnen. Liest aus Bild bei (sx,sy), schreibt auf Bildschirm bei (dx,dy), Groesse w×h. Fuer Hintergrund-Wiederherstellung (z.B. Uhrzeiger ueber Zifferblatt) |
+| `int dspImageWidth(slot)` | Breite des geladenen Bildes im Slot abfragen (0 bei ungueltigem Slot) |
+| `int dspImageHeight(slot)` | Hoehe des geladenen Bildes im Slot abfragen (0 bei ungueltigem Slot) |
 | `dspText(buf)` | Rohen DisplayText-Befehl ausfuehren (z.B. `"[z][x50][y20]Hello"`) |
 
 #### Vordefinierte Farbkonstanten (RGB565)
@@ -2347,6 +2440,15 @@ deepSleep(300);  // 300 Sekunden schlafen
 deepSleepGpio(3600, 12, 1);
 ```
 
+### Hardware-Register
+
+Direkt auf Peripherie-Register des ESP32 zugreifen (fuer Low-Level-Treiber und Debugging).
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `int peekReg(int addr)` | 32-Bit-Wert aus Peripherie-Register lesen |
+| `pokeReg(int addr, int val)` | 32-Bit-Wert in Peripherie-Register schreiben |
+
 ### Email (ESP32 — benoetigt USE_SENDMAIL)
 
 | Funktion | Beschreibung |
@@ -2499,6 +2601,118 @@ int hueToRGB(int h) {
 
 ---
 
+### ESP Kamera (ESP32)
+
+Kamera-Unterstuetzung fuer ESP32-Boards mit OV2640/OV3660/OV5640-Sensoren. Zwei Modi verfuegbar:
+
+- **Tasmota Webcam-Treiber** (sel 0-7): Verwendet den Standard `USE_WEBCAM` Treiber. `USE_WEBCAM` in `user_config_override.h` definieren.
+- **TinyC integrierte Kamera** (sel 8-18): Direkter esp_camera-Treiber mit boardspezifischen Pins, MJPEG-Streaming auf Port 81 und PSRAM-Slot-Verwaltung. `USE_TINYC_CAMERA` definieren (via `-DTINYC_CAMERA` Build-Flag). Keine `USE_WEBCAM` Abhaengigkeit.
+
+Beide Modi unterstuetzen `mailAttachPic()` fuer E-Mail-Bildanhaenge (bis zu 4 Bilder pro E-Mail).
+
+#### Kamera-Init mit eigenen Pins (TinyC integrierter Modus)
+
+```c
+// Pin-Reihenfolge: pwdn, reset, xclk, sda, scl, d7..d0, vsync, href, pclk
+int campins[] = {-1, -1, 15, 4, 5, 16, 17, 18, 12, 10, 8, 9, 11, 6, 7, 13};
+int ok = cameraInit(campins, PIXFORMAT_JPEG, FRAMESIZE_VGA, 12, 0, 0, -1);
+```
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `cameraInit(pins[], format, framesize, quality, fb_count, grab_mode, xclk_freq)` | Kamera mit Pin-Array initialisieren. Gibt 0=ok, sonst Fehler zurueck. `fb_count`=0 auto, `grab_mode`=0 auto, `xclk_freq`=-1 Standard 20MHz. |
+
+#### Kamerasteuerung (camControl)
+
+Alle Kamera-Operationen nutzen `camControl(sel, p1, p2)`:
+
+**Tasmota Webcam-Treiber (sel 0-7, benoetigt USE_WEBCAM):**
+
+| sel | Funktion | Beschreibung |
+|-----|----------|-------------|
+| 0 | `camControl(0, resolution, 0)` | Init ueber Tasmota-Treiber (WcSetup) |
+| 1 | `camControl(1, bufnum, 0)` | Bild in Tasmota Pic-Buffer aufnehmen (1-4) |
+| 2 | `camControl(2, option, wert)` | Optionen setzen (WcSetOptions) |
+| 3 | `camControl(3, 0, 0)` | Breite abfragen |
+| 4 | `camControl(4, 0, 0)` | Hoehe abfragen |
+| 5 | `camControl(5, on_off, 0)` | Tasmota Stream-Server starten/stoppen |
+| 6 | `camControl(6, param, 0)` | Bewegungserkennung (-1=Bewegung lesen, -2=Helligkeit lesen, ms=Intervall) |
+
+**TinyC integrierte Kamera (sel 7-18, benoetigt USE_WEBCAM oder USE_TINYC_CAMERA):**
+
+| sel | Funktion | Beschreibung |
+|-----|----------|-------------|
+| 7 | `camControl(7, bufnum, dateiHandle)` | Bild-Buffer in Datei speichern, gibt Bytes zurueck |
+| 8 | `camControl(8, 0, 0)` | Sensor-PID abfragen (z.B. 0x2642 = OV2640, 0x3660 = OV3660) |
+| 9 | `camControl(9, param, wert)` | Sensor-Parameter setzen (siehe Tabelle) |
+| 10 | `camControl(10, slot, 0)` | Bild in PSRAM-Slot aufnehmen (1-4), gibt JPEG-Groesse zurueck |
+| 11 | `camControl(11, slot, dateiHandle)` | PSRAM-Slot in Datei speichern, gibt Bytes zurueck |
+| 12 | `camControl(12, slot, 0)` | PSRAM-Slot freigeben (0 = alle Slots) |
+| 13 | `camControl(13, 0, 0)` | Kamera deinitialisieren + alle Slots + Stream stoppen |
+| 14 | `camControl(14, slot, 0)` | Slot-Groesse in Bytes abfragen (0 wenn leer) |
+| 15 | `camControl(15, on_off, 0)` | MJPEG Stream-Server auf Port 81 starten/stoppen |
+| 16 | `camControl(16, intervall_ms, schwelle)` | Bewegungserkennung aktivieren (0=deaktivieren) |
+| 17 | `camControl(17, sel, 0)` | Bewegungswert: 0=Trigger, 1=Helligkeit, 2=ausgeloest, 3=Intervall |
+| 18 | `camControl(18, 0, 0)` | Bewegungs-Referenzbuffer freigeben |
+| 19 | `camControl(19, addr, mask)` | Rohes Sensorregister lesen |
+| 20 | `camControl(20, addr, val)` | Rohes Sensorregister schreiben |
+
+Aufnahme (sel 10) kopiert das JPEG vom Kamera-Framebuffer in einen PSRAM-Slot und gibt den Framebuffer sofort zurueck, was schnelle aufeinanderfolgende Aufnahmen ermoeglicht. Bis zu 4 Slots koennen gleichzeitig Bilder halten.
+
+**Wichtig:** Kamera-Aufnahme (`camControl(10, ...)`) muss in `TaskLoop()` (VM-Task-Thread) laufen. Aufruf aus `EverySecond()` (Haupt-Thread) friert das Geraet ein.
+
+**Stream-Server (sel 15):** Startet einen MJPEG-Server auf Port 81 mit `/stream`, `/cam.mjpeg` und `/cam.jpg` Endpunkten. Wird automatisch verzoegert, wenn WiFi noch nicht bereit ist (sicher fuer Autoexec). Der Stream wird auf der Tasmota-Hauptseite eingebettet.
+
+#### Sensor-Parameter (sel=9)
+
+| param | Einstellung | Bereich |
+|-------|------------|---------|
+| 0 | vflip | 0/1 |
+| 1 | Helligkeit | -2..2 |
+| 2 | Saettigung | -2..2 |
+| 3 | hmirror | 0/1 |
+| 4 | Kontrast | -2..2 |
+| 5 | Bildgroesse | FRAMESIZE_* |
+| 6 | Qualitaet | 10..63 |
+| 7 | Schaerfe | -2..2 |
+
+#### E-Mail Bildanhaenge
+
+In PSRAM-Slots aufgenommene Bilder koennen per `mailAttachPic()` an E-Mails angehaengt werden. Bis zu 4 Bilder pro E-Mail:
+
+```c
+// 2 Bilder in Slot 1 und 2 aufnehmen
+camControl(10, 1, 0);
+camControl(10, 2, 0);
+
+// E-Mail mit beiden Bildern senden
+mailBody("Bewegungsalarm");
+mailAttachPic(1);
+mailAttachPic(2);
+mailSend("[*:*:*:*:*:user@example.com:Alarm]");
+```
+
+#### Aufnahme und Speichern Beispiel
+
+```c
+// Bild in PSRAM-Slot 1 aufnehmen
+int size = camControl(10, 1, 0);
+
+// Slot 1 in Datei speichern
+int fh = fileOpen(path, 1);    // zum Schreiben oeffnen
+int written = camControl(11, 1, fh);
+fileClose(fh);
+
+// MJPEG Stream auf Port 81 starten
+camControl(15, 1, 0);
+```
+
+#### Komplettes Kamera-Skript
+
+Siehe `webcam_tinyc.tc` fuer ein vollstaendiges Sicherheitskamera-Beispiel mit MJPEG-Streaming, Bewegungserkennung, PIR-Alarm, E-Mail-Benachrichtigung, Zeitraffer und automatischem Aufraeumen. Siehe `webcam.tc` fuer die Variante mit dem Tasmota Webcam-Treiber.
+
+---
+
 ### HomeKit (ESP32 — benoetigt USE_HOMEKIT)
 
 Apple HomeKit-Integration — Geraete direkt aus TinyC als HomeKit-Zubehoer bereitstellen. Sensoren, Lichter, Schalter und Steckdosen werden ueber Apple Home steuerbar. Alle HomeKit-gebundenen Variablen verwenden **native Float-Werte** — keine x10-Skalierung noetig.
@@ -2527,6 +2741,7 @@ Apple HomeKit-Integration — Geraete direkt aus TinyC als HomeKit-Zubehoer bere
 | `hkVar(variable)` | Float-Variable an das aktuelle Geraet binden |
 | `int hkReady(variable)` | Gibt 1 zurueck wenn HomeKit diese Variable geaendert hat (loescht Flag automatisch) |
 | `int hkStart()` | Deskriptor fertigstellen und HomeKit starten. Gibt 0=ok zurueck |
+| `int hkInit(char descriptor[])` | HomeKit mit Raw-Deskriptor starten |
 | `hkReset()` | Alle Kopplungsdaten loeschen (Werksreset). Nach Neustart erneut koppeln |
 | `hkStop()` | HomeKit-Server beenden |
 
@@ -2638,6 +2853,12 @@ Fuer `fileOpen()` stehen folgende Kurzformen zur Verfuegung:
 int f = fileOpen("/daten.csv", r);   // statt fileOpen("/daten.csv", 0)
 f = fileOpen("/log.txt", a);          // statt fileOpen("/log.txt", 2)
 ```
+
+### Plugin-Abfrage
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `int pluginQuery(char dst[], int index, int p1, int p2)` | Binäres Plugin abfragen. Gibt Ergebnis zurueck und schreibt optionale String-Antwort in `dst` |
 
 ### Debug
 
@@ -2775,7 +2996,7 @@ Jeder VM-Slot verbraucht ca. **3,2 KB RAM** (nur Struct, ohne Programm-Bytecode)
 | Pointer-Array         | 16 Bytes (4 Zeiger)          |
 | Pro-Slot Struct       | ~3,2 KB                      |
 | Programm-Bytecode     | variabel (malloc)            |
-| Heap (grosse Arrays)  | max 32 KB, bei Bedarf allokiert |
+| Heap (alle Arrays)    | max 32 KB, bei Bedarf allokiert |
 
 ### Callbacks mit mehreren Slots
 
@@ -2825,10 +3046,10 @@ Beide zeigen ihre Sensorzeilen gleichzeitig auf der Tasmota-Hauptseite an.
 |--------------------|----------|----------|----------|------------------------------------|
 | Stack-Tiefe        | 64       | 256      | 256      | Operandenstack-Eintraege           |
 | Aufrufrahmen       | 8        | 32       | 32       | Maximale Rekursions-/Aufruftiefe   |
-| Lokale pro Rahmen  | 256      | 256      | 256      | Einschliesslich Arrays (1 Slot pro Element) |
-| Globale Variablen  | 64       | 256      | 256      | Einschliesslich globaler Arrays (<=255 Elem.) |
+| Lokale pro Rahmen  | 256      | 256      | 256      | Skalare + kleine Arrays ≤16 inline  |
+| Globale Variablen  | 64       | 256      | 256      | Skalare + kleine Arrays ≤16 inline  |
 | Codegroesse        | 4 KB     | 16 KB    | 64 KB    | Bytecode (16-Bit-Adressierung)     |
-| Heap-Speicher      | 8 KB     | 32 KB    | 64 KB    | Fuer Arrays >255 Elemente + malloc |
+| Heap-Speicher      | 8 KB     | 32 KB    | 64 KB    | Fuer Arrays >16 Elemente (autom. Allokation) |
 | Heap-Handles       | 8        | 16       | 32       | Max. gleichzeitige Heap-Allokationen |
 | Konstantenpool     | 32       | 64       | 65536    | Zeichenketten- & Float-Konstanten  |
 | Instruktionslimit  | 1M       | 1M       | 1M       | Sicherheitslimit pro Ausfuehrung   |
@@ -2842,9 +3063,9 @@ Beide zeigen ihre Sensorzeilen gleichzeitig auf der Tasmota-Hauptseite an.
 
 ### IDE-Installation
 
-Die IDE-Datei (`tinyc_ide.html.gz`) muss auf das **Flash-Dateisystem** (`ffsp`) hochgeladen werden, nicht auf die SD-Karte. Auf Geraeten mit SD-Karte mountet Tasmota die SD-Karte als Benutzer-Dateisystem (`ufsp`) — aber der `/ide`-Endpunkt liest speziell vom Flash-Dateisystem. Verwenden Sie die Tasmota-Seite **Dateisystem verwalten**, um `tinyc_ide.html.gz` in den Flash-Speicher hochzuladen.
+Die IDE-Datei (`tinyc_ide.html.gz`) kann entweder auf dem **Flash-Dateisystem** oder der **SD-Karte** liegen — je nachdem, welches als Benutzer-Dateisystem (`ufsp`) gemountet ist. Laden Sie `tinyc_ide.html.gz` ueber die Tasmota-Seite **Dateisystem verwalten** hoch.
 
-> **Hinweis:** TinyC-Skripte und Datendateien (`.tc`, `.tcb` usw.) werden auf dem Benutzer-Dateisystem (`ufsp`) gespeichert, das die SD-Karte ist, wenn eine vorhanden ist. Nur die IDE-HTML-Datei selbst muss auf dem Flash sein.
+> **Hinweis:** TinyC-Skripte und Datendateien (`.tc`, `.tcb` usw.) werden ebenfalls auf dem Benutzer-Dateisystem (`ufsp`) gespeichert.
 
 ### Dateioperationen
 
@@ -2953,7 +3174,10 @@ int main() {
 ### LED-Blinken
 ```c
 #define LED 2
-#define OUTPUT 1
+#define INPUT         0x01
+#define OUTPUT        0x03
+#define INPUT_PULLUP  0x05
+#define INPUT_PULLDOWN 0x09
 
 int main() {
     gpioInit(LED, OUTPUT);
@@ -3005,14 +3229,14 @@ int main() {
 
     // Formatierte Zeichenketten
     char line[64];
-    sprintfInt(line, "count = %d", 42);
+    sprintf(line, "count = %d", 42);
     printString(line);      // count = 42
 
     // Mehrere Werte mit sprintfAppend
     char report[128];
-    sprintfInt(report, "Sensor %d", 1);
-    sprintfAppendStr(report, " name=%s", name);
-    sprintfAppendFloat(report, " temp=%.1f", 23.5);
+    sprintf(report, "Sensor %d", 1);
+    sprintfAppend(report, " name=%s", name);
+    sprintfAppend(report, " temp=%.1f", 23.5);
     printString(report);    // Sensor 1 name=World temp=23.5
 
     return 0;
@@ -3077,7 +3301,7 @@ int main() {
 | Zeiger                   | Volle Unterstuetzung | **Nicht unterstuetzt**  |
 | Structs / Unions         | Volle Unterstuetzung | **Nicht unterstuetzt**  |
 | Enums                    | Volle Unterstuetzung | **Nicht unterstuetzt**  |
-| Dynamischer Speicher     | malloc/free    | Automatischer Heap fuer Arrays >255 (kein explizites malloc) |
+| Dynamischer Speicher     | malloc/free    | Auto-Heap fuer Arrays >16 Elemente (kein explizites malloc) |
 | Mehrdimensionale Arrays  | `int a[3][4]`  | **Nicht unterstuetzt**       |
 | Zeichenkettentyp         | `char*`        | Nur `char arr[N]`            |
 | Praeprozessor            | Volles CPP     | `#define`, `#ifdef`, `#if`, `#else`, `#endif` (kein `#include`, keine Makros) |

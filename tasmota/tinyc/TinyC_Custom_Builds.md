@@ -47,12 +47,28 @@ necessary defines in `user_config_override.h`. This includes:
 #define USE_SUNRISE            // Sunrise/sunset calculation
 ```
 
-## Optional Build Flags
+## Build Flags
 
-| Flag | Effect |
-|---|---|
-| `-DTINYC_HOMEKIT` | Enable Apple HomeKit support |
-| `-DTINYC_NO_SCRIPTER` | Exclude Tasmota Scripter engine (~98 KB flash saved). SML smart meter remains available. Use this when TinyC fully replaces Scripter. |
+| Flag | Effect | Default |
+|---|---|---|
+| `-DTINYC_TESTING` | Enable TinyC with all standard features | Required |
+| `-DTINYC_HOMEKIT` | Enable Apple HomeKit support | All builds |
+| `-DTINYC_CAMERA` | Enable integrated camera driver (ESP32/S3 only, not RISC-V) | ESP32/S3 builds |
+| `-DTINYC_NO_SCRIPTER` | Exclude Tasmota Scripter engine (~98 KB flash saved). SML smart meter remains available | Optional |
+
+## What's Included in Pre-Built Firmware
+
+All pre-built firmware includes:
+- **HomeKit** — Apple Home integration via `-DTINYC_HOMEKIT`
+- **Display** — Universal display + touch support
+- **SML** — Smart meter interface
+- **Email** — SMTP with file/picture attachments
+- **I2C / SPI / Serial** — Hardware bus access
+
+ESP32 and ESP32-S3 builds additionally include:
+- **Camera** — Integrated camera driver via `-DTINYC_CAMERA` (+34 KB). Supports OV2640, OV3660, OV5640 with MJPEG streaming, PSRAM slot management, and motion detection
+
+ESP32-C3 (RISC-V) does **not** include camera support — the esp32-camera library requires Xtensa.
 
 ## platformio_override.ini Sections
 
@@ -63,14 +79,121 @@ configuration. Build with: `pio run -e <environment-name>`
 
 ```ini
 [env:tinyc_base]
-; Common TinyC test build settings
+; Common TinyC build settings — inherits from tasmota32_base
+; All builds get HomeKit + display support
 build_flags             = ${env:tasmota32_base.build_flags}
                           -DTINYC_TESTING
+                          -DTINYC_HOMEKIT
 ```
 
 ---
 
-### ESP32-S2 (4MB)
+### ESP32 (4MB) — with Camera
+
+Classic ESP32 WROOM module. The standard build for most ESP32 devices.
+
+```ini
+[env:tinyc32-4M]
+extends                 = env:tasmota32_base
+board                   = esp32
+board_build.f_cpu       = 240000000L
+board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
+build_flags             = ${env:tinyc_base.build_flags}
+                          -DTINYC_CAMERA
+lib_ignore              = ${env:tasmota32_base.lib_ignore}
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+lib_extra_dirs          = ${common.lib_extra_dirs}
+                          lib/libesp32
+                          lib/libesp32_div
+```
+
+### ESP32-S3 (16MB) — with Camera
+
+Dual-core Xtensa S3 with 16MB flash. Default for S3 devkits.
+
+```ini
+[env:tinyc32s3]
+extends                 = env:tasmota32_base
+board                   = esp32s3_16M
+board_build.f_cpu       = 240000000L
+board_build.mcu         = esp32s3
+build_flags             = ${env:tinyc_base.build_flags}
+                          -DTINYC_CAMERA
+lib_ignore              = ${env:tasmota32_base.lib_ignore}
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+lib_extra_dirs          = ${common.lib_extra_dirs}
+                          lib/libesp32
+                          lib/libesp32_div
+```
+
+### ESP32-C3 (4MB) — no Camera
+
+RISC-V single-core. Camera library not available (requires Xtensa).
+
+```ini
+[env:tinyc32c3]
+extends                 = env:tasmota32_base
+board                   = esp32c3
+board_build.f_cpu       = 160000000L
+board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
+build_flags             = ${env:tinyc_base.build_flags}
+lib_ignore              = ${env:tasmota32_base.lib_ignore}
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+                          lib/libesp32/CORE2_Library
+                          libesp32_lvgl
+                          esp32-camera
+lib_extra_dirs          = ${common.lib_extra_dirs}
+                          lib/libesp32
+                          lib/libesp32_div
+```
+
+---
+
+### Additional Variants
+
+#### ESP32-S3 with USB CDC (DFRobot, native USB)
+
+For boards with native USB (no UART chip), like DFRobot Firebeetle 2 ESP32-S3:
+
+```ini
+[env:tinyc32s3-usb]
+extends                 = env:tinyc32s3
+build_unflags           = -DARDUINO_USB_MODE=0
+                          -DARDUINO_USB_CDC_ON_BOOT=0
+build_flags             = ${env:tinyc_base.build_flags}
+                          -DTINYC_CAMERA
+                          -DARDUINO_USB_MODE=1
+                          -DARDUINO_USB_CDC_ON_BOOT=1
+                          -DUSE_USB_CDC_CONSOLE
+```
+
+#### ESP32-S3 Sunton (QIO/OPI, RGB Display)
+
+For Sunton boards with PSRAM in OPI mode and RGB displays:
+
+```ini
+[env:tinyc32s3-sunton]
+extends                 = env:tasmota32_base
+board                   = esp32s3ser-qio_opi_120
+board_build.f_cpu       = 240000000L
+board_build.mcu         = esp32s3
+build_flags             = ${env:tinyc_base.build_flags}
+lib_ignore              = ${env:tasmota32_base.lib_ignore}
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+lib_extra_dirs          = ${common.lib_extra_dirs}
+                          lib/libesp32
+                          lib/libesp32_div
+```
+
+#### ESP32-S2 (4MB)
 
 Single-core Xtensa, 4MB flash. Good for simple USB-connected devices.
 
@@ -81,19 +204,19 @@ board                   = esp32s2
 board_build.f_cpu       = 240000000L
 board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
                           epdiy
                           lib/libesp32/CORE2_Library
                           libesp32_lvgl
+                          esp32-camera
 lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32
                           lib/libesp32_div
 ```
 
-### ESP32-C6 (4MB)
+#### ESP32-C6 (4MB)
 
 RISC-V single-core with WiFi 6 and Zigbee/Thread. Same architecture as C3.
 
@@ -104,19 +227,19 @@ board                   = esp32c6
 board_build.f_cpu       = 160000000L
 board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
                           epdiy
                           lib/libesp32/CORE2_Library
                           libesp32_lvgl
+                          esp32-camera
 lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32
                           lib/libesp32_div
 ```
 
-### ESP32 Solo1 (4MB)
+#### ESP32 Solo1 (4MB)
 
 Single-core ESP32 (some Sonoff devices, ESP32-SOLO1 module).
 
@@ -127,7 +250,7 @@ board                   = esp32_solo1_4M
 board_build.f_cpu       = 160000000L
 board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
+                          -DTINYC_CAMERA
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
@@ -137,7 +260,7 @@ lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32_div
 ```
 
-### ESP32-S3 (8MB)
+#### ESP32-S3 (8MB)
 
 Dual-core Xtensa with 8MB flash. Many devkits and modules use 8MB.
 
@@ -148,7 +271,7 @@ board                   = esp32s3_8M
 board_build.f_cpu       = 240000000L
 board_build.mcu         = esp32s3
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
+                          -DTINYC_CAMERA
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
@@ -158,7 +281,7 @@ lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32_div
 ```
 
-### ESP32-S3 (4MB)
+#### ESP32-S3 (4MB)
 
 Dual-core Xtensa S3 with only 4MB flash. Use optimized partition.
 
@@ -170,7 +293,7 @@ board_build.f_cpu       = 240000000L
 board_build.mcu         = esp32s3
 board_build.partitions  = partitions/esp32_partition_app1856k_fs1344k.csv
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
+                          -DTINYC_CAMERA
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
@@ -180,7 +303,7 @@ lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32_div
 ```
 
-### ESP32 (16MB)
+#### ESP32 (16MB)
 
 Classic ESP32 with 16MB flash (e.g., ESP32-WROVER-E 16MB).
 
@@ -190,7 +313,7 @@ extends                 = env:tasmota32_base
 board                   = esp32_16M
 board_build.f_cpu       = 240000000L
 build_flags             = ${env:tinyc_base.build_flags}
-                          -DTINYC_HOMEKIT
+                          -DTINYC_CAMERA
 lib_ignore              = ${env:tasmota32_base.lib_ignore}
                           TTGO TWatch Library
                           Micro-RTSP
@@ -199,6 +322,79 @@ lib_extra_dirs          = ${common.lib_extra_dirs}
                           lib/libesp32
                           lib/libesp32_div
 ```
+
+#### E-Paper Variants (Legacy UDisplay)
+
+For e-paper displays that require the legacy UDisplay library instead of UDisplay_legacy:
+
+```ini
+[env:tinyc32c3-epd]
+extends                 = env:tinyc32c3
+lib_ignore              = Servo(esp8266)
+                          ESP8266AVRISP
+                          ESP8266LLMNR
+                          ESP8266NetBIOS
+                          ESP8266SSDP
+                          SP8266WiFiMesh
+                          Ethernet(esp8266)
+                          GDBStub
+                          TFT_Touch_Shield_V2
+                          ESP8266HTTPUpdateServer
+                          ESP8266WiFiMesh
+                          EspSoftwareSerial
+                          SPISlave
+                          universal display Library
+                          ArduinoOTA
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+                          lib/libesp32/CORE2_Library
+                          libesp32_lvgl
+                          esp32-camera
+
+[env:tinyc32s3-epd]
+extends                 = env:tinyc32s3
+lib_ignore              = Servo(esp8266)
+                          ESP8266AVRISP
+                          ESP8266LLMNR
+                          ESP8266NetBIOS
+                          ESP8266SSDP
+                          SP8266WiFiMesh
+                          Ethernet(esp8266)
+                          GDBStub
+                          TFT_Touch_Shield_V2
+                          ESP8266HTTPUpdateServer
+                          ESP8266WiFiMesh
+                          EspSoftwareSerial
+                          SPISlave
+                          universal display Library
+                          ArduinoOTA
+                          TTGO TWatch Library
+                          Micro-RTSP
+                          epdiy
+```
+
+---
+
+## Camera Support Notes
+
+The `-DTINYC_CAMERA` flag enables the integrated TinyC camera driver, which provides:
+- Board-specific pin configuration via `cameraInit(pins[], ...)`
+- MJPEG stream server on port 81
+- PSRAM slot management (up to 4 concurrent captures)
+- Motion detection
+- Direct sensor register access
+
+**Supported targets:** ESP32 and ESP32-S3 (Xtensa). The esp32-camera library does **not** compile on RISC-V targets (C3, C6) — add `esp32-camera` to `lib_ignore` for those.
+
+**Size impact:** Adding camera support adds ~34 KB to firmware size.
+
+**Camera boards tested:**
+- AI-Thinker ESP32-CAM (OV2640)
+- Goouuu ESP32-S3-CAM (OV2640)
+- DFRobot Firebeetle 2 ESP32-S3 AI CAM DFR1154 (OV3660)
+
+Camera pin definitions are in the TinyC source file (`camera.tc`, `webcam_tinyc.tc`), not in the firmware — any camera board can be used by defining the correct pin array.
 
 ---
 
@@ -216,13 +412,13 @@ For 4MB boards: the TinyC firmware is ~1,650 KB, leaving ~200 KB headroom in the
 
 ```bash
 # Build a specific environment
-pio run -e tinyc32c6
+pio run -e tinyc32-4M
 
 # Build and upload via serial
-pio run -e tinyc32c6 --target upload
+pio run -e tinyc32-4M --target upload
 
 # Build and upload via OTA
-pio run -e tinyc32c6 --target upload --upload-port <device-ip>
+pio run -e tinyc32-4M --target upload --upload-port <device-ip>
 ```
 
 ## OTA Partition Management

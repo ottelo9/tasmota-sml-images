@@ -1,0 +1,242 @@
+// SML eBus Solar Monitor with 24h and weekly charts
+// Displays Außentemperatur, Solarspeicher, Kollektortemperatur
+// with min/max tracking and Google Charts history
+
+// --- Chart sizes ---
+#define DAY_LEN     288       // 24h at 1 sample/5 min
+#define DAY_INT     300       // sample interval in seconds (5 min)
+#define WEEK_LEN    336       // 7 days at 1 sample/30 min
+#define WEEK_INT    1800      // sample interval in seconds (30 min)
+
+persist watch int sml_activ;
+float min_at;
+float max_at;
+float min_ss;
+float max_ss;
+float min_ct;
+float max_ct;
+int startup;        // countdown to skip initial zero readings
+int last_day;       // to detect midnight rollover
+int atmp_valid;     // 1 once atmp received a real value
+
+// date/time strings
+char wdays[] = "So Mo Di Mi Do Fr Sa";
+char mons[]  = "JanFebMrzAprMaiJunJulAugSepOktNovDez";
+char s1[8];
+char s2[8];
+
+global float atmp;
+float scol;
+float ssp;
+float spmp;
+
+// 24h history (1 sample/5 min)
+persist float d_at[DAY_LEN];
+persist float d_ss[DAY_LEN];
+persist float d_ct[DAY_LEN];
+persist int d_pos;
+int d_tick;
+
+// weekly history (1 sample/30 min)
+persist float w_at[WEEK_LEN];
+persist float w_ss[WEEK_LEN];
+persist float w_ct[WEEK_LEN];
+persist int w_pos;
+int w_tick;
+
+void resetMinMax() {
+    min_at = 999.0; max_at = -999.0;
+    min_ss = 999.0; max_ss = -999.0;
+    min_ct = 999.0; max_ct = -999.0;
+}
+
+int main() {
+    if (sml_activ != tasm_rule) {
+        sml_activ = tasm_rule;
+    }
+    atmp_valid = 0;
+    startup = 10;           // skip first 10 seconds for SML to deliver data
+    last_day = tasm_day;
+    resetMinMax();
+    // d_pos, w_pos are persist — keep chart history across restarts
+    d_tick = DAY_INT - 1;    // first sample after 1 second
+    w_tick = WEEK_INT - 1;   // first sample after 1 second
+}
+
+void EverySecond() {
+    if (changed(sml_activ)) {
+        tasm_rule = sml_activ;
+        snapshot(sml_activ);
+    }
+    scol = smlGet(1);
+    ssp = smlGet(2);
+    spmp = smlGet(3);
+
+    // skip first seconds — SML hasn't delivered valid data yet
+    if (startup > 0) {
+        startup = startup - 1;
+        return;
+    }
+
+    // reset daily min/max at midnight
+    if (tasm_day != last_day) {
+        last_day = tasm_day;
+        atmp_valid = 0;
+        resetMinMax();
+    }
+
+    // track daily min/max
+    // atmp is global from external device — skip until first real value arrives
+    if (atmp_valid == 0 && atmp != 0.0) {
+        atmp_valid = 1;
+        min_at = atmp;
+        max_at = atmp;
+    }
+    if (atmp_valid) {
+        if (atmp > max_at) { max_at = atmp; }
+        if (atmp < min_at) { min_at = atmp; }
+    }
+    if (scol > max_ss) { max_ss = scol; }
+    if (scol < min_ss) { min_ss = scol; }
+    if (ssp > max_ct) { max_ct = ssp; }
+    if (ssp < min_ct) { min_ct = ssp; }
+
+    // 24h chart: sample every 5 min
+    d_tick = d_tick + 1;
+    if (d_tick >= DAY_INT) {
+        d_tick = 0;
+        int di;
+        di = d_pos % DAY_LEN;
+        d_at[di] = atmp;
+        d_ss[di] = scol;
+        d_ct[di] = ssp;
+        d_pos = d_pos + 1;
+    }
+
+    // weekly chart: sample every 30 min
+    w_tick = w_tick + 1;
+    if (w_tick >= WEEK_INT) {
+        w_tick = 0;
+        int wi;
+        wi = w_pos % WEEK_LEN;
+        w_at[wi] = atmp;
+        w_ss[wi] = scol;
+        w_ct[wi] = ssp;
+        w_pos = w_pos + 1;
+    }
+}
+
+
+void WebCall() {
+    char buf[128];
+
+    webSend("{s}<b style='color:#2196F3'>Aussentemperatur</b>{m}{e}");
+    sprintfFloat(buf, "{s}Zur Zeit{m}<span style='color:#fff'>%.2f", atmp);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Maximum{m}<span style='color:#F44'>%.2f", max_at);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Minimum{m}<span style='color:#4AF'>%.2f", min_at);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+
+    webSend("{s}<b style='color:#FF5722'>Solarspeicher</b>{m}{e}");
+    sprintfFloat(buf, "{s}Zur Zeit{m}<span style='color:#fff'>%.2f", scol);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Maximum{m}<span style='color:#F44'>%.2f", max_ss);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Minimum{m}<span style='color:#4AF'>%.2f", min_ss);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+
+    webSend("{s}<b style='color:#4CAF50'>Kollektortemperatur</b>{m}{e}");
+    sprintfFloat(buf, "{s}Zur Zeit{m}<span style='color:#fff'>%.2f", ssp);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Maximum{m}<span style='color:#F44'>%.2f", max_ct);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+    sprintfFloat(buf, "{s}Minimum{m}<span style='color:#4AF'>%.2f", min_ct);
+    strcat(buf, " &deg;C</span>{e}");
+    webSend(buf);
+
+    sprintfInt(buf, "{s}Heap{m}%d kB{e}", tasm_heap / 1024);
+    webSend(buf);
+}
+
+
+void WebPage() {
+    char buf[128];
+    int sr;
+    int ss;
+    int dl;
+    sr = tasm_sunrise;
+    ss = tasm_sunset;
+    dl = ss - sr;
+
+    // ─── Clock with JS auto-update + move to top of page ───
+    webSend("<div id='tc_clock' style='text-align:center;background:#333;padding:8px;border-radius:8px;margin:8px 0'>");
+    webSend("<span id='tc_clk' style='color:green;font-size:40px;font-weight:bold'></span><br>");
+    webSend("<span id='tc_dat'></span><br>");
+    // Sunrise / sunset (static, set once from server)
+    webSend("&#127774; ");
+    sprintfInt(buf, "%02d:", sr / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", sr % 60);
+    webSend(buf);
+    webSend(" &lt;--- ");
+    sprintfInt(buf, "%d:", dl / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", dl % 60);
+    webSend(buf);
+    webSend(" ---&gt; ");
+    sprintfInt(buf, "%02d:", ss / 60);
+    webSend(buf);
+    sprintfInt(buf, "%02d", ss % 60);
+    webSend(buf);
+    webSend(" &#127769;");
+    webSend("</div>");
+    // JS: update clock + date every second client-side
+    webSend("<script>");
+    webSend("var wd=['So','Mo','Di','Mi','Do','Fr','Sa'];");
+    webSend("var mn=['Jan','Feb','Mrz','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];");
+    webSend("function tc(){var d=new Date();");
+    webSend("var h=('0'+d.getHours()).slice(-2);");
+    webSend("var m=('0'+d.getMinutes()).slice(-2);");
+    webSend("var s=('0'+d.getSeconds()).slice(-2);");
+    webSend("document.getElementById('tc_clk').innerHTML=h+':'+m+':'+s;");
+    webSend("document.getElementById('tc_dat').innerHTML=");
+    webSend("wd[d.getDay()]+' '+d.getDate()+'. '+mn[d.getMonth()]+' '+d.getFullYear();");
+    webSend("}tc();setInterval(tc,1000);");
+    // move clock div before l1 (AJAX sensor content)
+    webSend("var e=document.getElementById('tc_clock');");
+    webSend("var l=document.getElementById('l1');");
+    webSend("if(e&&l)l.parentNode.insertBefore(e,l);");
+    webSend("</script>");
+    webFlush();
+
+    if (d_pos < 1) {
+        webSend("<p>Daten werden gesammelt...</p>");
+        return;
+    }
+
+    // --- 24h chart: 3 series, interval = 5 min ---
+    WebChart(0, "Temperaturen 24h", "Aussen|C", 0x2196F3, d_pos, DAY_LEN, d_at, 1, 5, 0.0, 0.0);
+    WebChart(0, "", "Speicher|C", 0xFF5722, d_pos, DAY_LEN, d_ss, 1, 5, 0.0, 0.0);
+    WebChart(0, "", "Kollektor|C", 0x4CAF50, d_pos, DAY_LEN, d_ct, 1, 5, 0.0, 0.0);
+
+    // --- weekly chart: 3 series, interval = 30 min ---
+    if (w_pos > 0) {
+        WebChart(0, "Temperaturen Woche", "Aussen|C", 0x2196F3, w_pos, WEEK_LEN, w_at, 1, 30, 0.0, 0.0);
+        WebChart(0, "", "Speicher|C", 0xFF5722, w_pos, WEEK_LEN, w_ss, 1, 30, 0.0, 0.0);
+        WebChart(0, "", "Kollektor|C", 0x4CAF50, w_pos, WEEK_LEN, w_ct, 1, 30, 0.0, 0.0);
+    }
+}
+
+
+void WebUI() {
+    webCheckbox(sml_activ, "Enable SML");
+}

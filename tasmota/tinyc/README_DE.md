@@ -37,7 +37,7 @@ Callbacks werden automatisch aus Tasmotas Hauptschleife aufgerufen:
 **Seriell:** `serialBegin`, `serialPrint`, `serialPrintInt`, `serialPrintFloat`, `serialPrintln`, `serialRead`, `serialAvailable`
 **Mathe:** `abs`, `min`, `max`, `map`, `random`, `sqrt`, `sin`, `cos`
 **Strings:** `strlen`, `strcpy`, `strcat`, `strcmp`, `printString`, `printStr`, `strToken`, `strSub`, `strFind`
-**Format:** `sprintfInt`, `sprintfFloat`, `sprintfStr`, `sprintfAppendInt`, `sprintfAppendFloat`, `sprintfAppendStr`
+**Format:** `sprintf`, `sprintfAppend` (Typ automatisch erkannt; alt: `sprintfInt`, `sprintfFloat`, `sprintfStr`, `sprintfAppendInt`, `sprintfAppendFloat`, `sprintfAppendStr`)
 **I2C:** `i2cRead8`, `i2cWrite8`, `i2cRead`, `i2cWrite`, `i2cExists`, `i2cRead0`, `i2cWrite0`
 **SPI:** `spiInit`, `spiSetCS`, `spiTransfer`
 **Dateien:** `fileOpen`, `fileClose`, `fileRead`, `fileWrite`, `fileExists`, `fileDelete`, `fileSize`

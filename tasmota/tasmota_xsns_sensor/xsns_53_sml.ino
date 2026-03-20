@@ -1353,6 +1353,7 @@ double dval;
 
 uint8_t sb_counter;
 uint32_t lastmath;
+uint8_t math_run;
 
 // need double precision in this driver
 double CharToDouble(const char *str)
@@ -1966,6 +1967,12 @@ void SML_Decode(uint8_t index) {
     return;
   }
 
+  // check once per decode call if 1 second has elapsed for math lines
+  if ((millis() - lastmath) > 1000) {
+    lastmath = millis();
+    math_run = 1;
+  }
+
   while (mp != NULL) {
     // check list of defines
     if (*mp == 0) break;
@@ -2004,10 +2011,8 @@ void SML_Decode(uint8_t index) {
       // calculated entry, check syntax
       mp++;
       // do math m 1+2+3
-      if (*mp == 'm' && !sb_counter) {
-      //if (*mp == 'm' && (millis()-lastmath)>1000) {
-        lastmath = millis();
-        // only every 256 th byte
+      if (*mp == 'm' && math_run) {
+        // once per second — flag set at top of SML_Decode
         // else it would be calculated every single serial byte
         mp++;
         while (*mp == ' ') mp++;
@@ -2135,7 +2140,20 @@ void SML_Decode(uint8_t index) {
           continue;
         }
         if (sml_globs.mp[mindex].type == 'o' || sml_globs.mp[mindex].type == 'c') {
-          if (*mp++ != *cp++) {
+          // handle escapes
+          if (*mp == '/' && *(mp + 1) == 'n') {
+            // line feed escape
+            mp += 2;
+            if ('\n' != *cp++) {
+              found = 0;
+            }
+          } else if (*mp == '/' && *(mp + 1) == 'r') {
+            // carriage return escape
+            mp += 2;
+            if ('\r' != *cp++) {
+              found = 0;
+            }
+          } else if (*mp++ != *cp++) {
             found = 0;
           }
         } else {
@@ -2678,6 +2696,7 @@ nextsect:
     mp = strchr(mp, '|');
     if (mp) mp++;
   }
+  math_run = 0;
 }
 
 //"1-0:1.8.0*255(@1," D_TPWRIN ",kWh," DJ_TPWRIN ",4|"

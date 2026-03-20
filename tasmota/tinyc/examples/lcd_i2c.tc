@@ -1,0 +1,424 @@
+// ═══════════════════════════════════════════════════════════════════
+// lcd_i2c.tc — I2C LCD Character Display Driver (HD44780 + PCF8574)
+// For ESP8266/ESP32 with standard I2C LCD backpack (address 0x27 or 0x3F)
+// Supports 16x2 and 20x2 displays (set LCD_COLS below)
+//
+// Features: Auto-detect I2C address, backlight control, custom text,
+//           clock display, heap/WiFi status, console commands
+//
+// Line 1: Time + date  |  Line 2: Heap + WiFi status or custom text
+// Web UI: editable text for both lines, backlight toggle
+//
+// Console commands:
+//   LCDPrint1 Hello   — print "Hello" on line 1 (switches to custom mode)
+//   LCDPrint2 World   — print "World" on line 2
+//   LCDClear          — clear display
+//   LCDOn / LCDOff    — backlight control
+//   LCDAuto           — switch back to auto mode (time/heap)
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── PCF8574 I2C backpack pin mapping ───
+// P0=RS  P1=RW  P2=EN  P3=Backlight  P4-P7=D4-D7
+#define LCD_RS          0x01
+#define LCD_RW          0x02
+#define LCD_EN          0x04
+#define LCD_BL          0x08
+
+// ─── HD44780 commands ───
+#define LCD_CLEAR       0x01
+#define LCD_HOME        0x02
+#define LCD_ENTRY_MODE  0x06
+#define LCD_DISPLAY_ON  0x0C
+#define LCD_DISPLAY_OFF 0x08
+#define LCD_FUNC_4BIT2L 0x28
+#define LCD_LINE1       0x80
+#define LCD_LINE2       0xC0
+
+// Set to 16 for 16x2 display, 20 for 20x2 or 20x4 display
+#define LCD_COLS        16
+
+// ─── State ───
+int lcd_addr;           // detected I2C address
+int lcd_bus;            // detected I2C bus (0 or 1)
+int lcd_ok;             // 1 = LCD initialized
+int lcd_bl;             // backlight state (LCD_BL or 0)
+
+// ─── Display mode ───
+// 0 = auto (time/heap), 1 = custom text
+persist watch int dmode;
+persist watch int backlight;
+int line2_timer;        // countdown for line 2 refresh
+
+char line1[24];         // line buffer (max LCD_COLS chars displayed)
+char line2[24];         // line buffer
+char line1_custom[24];  // user-set custom text line 1
+char line2_custom[24];  // user-set custom text line 2
+char buf[64];
+char tmp[32];
+
+// ═══════════════════════════════════════════════════════════════════
+// Low-level: write a single byte to PCF8574
+// ═══════════════════════════════════════════════════════════════════
+void lcd_i2c_write(int val) {
+    i2cWrite0(lcd_addr, val | lcd_bl, lcd_bus);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Pulse EN line (data latched on falling edge)
+// I2C transaction time (~100us at 100kHz) provides sufficient delay
+// ═══════════════════════════════════════════════════════════════════
+void lcd_pulse(int val) {
+    lcd_i2c_write(val | LCD_EN);
+    lcd_i2c_write(val);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Send 4 bits (one nibble)
+// ═══════════════════════════════════════════════════════════════════
+void lcd_send4(int nibble, int mode) {
+    // mode: 0=command, LCD_RS=data
+    int val = (nibble & 0xF0) | mode;
+    lcd_pulse(val);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Send full byte as two nibbles (high first, then low)
+// ═══════════════════════════════════════════════════════════════════
+void lcd_send(int byte, int mode) {
+    lcd_send4(byte & 0xF0, mode);
+    lcd_send4((byte * 16) & 0xF0, mode);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Send command byte
+// ═══════════════════════════════════════════════════════════════════
+void lcd_cmd(int cmd) {
+    lcd_send(cmd, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Send data byte (character)
+// ═══════════════════════════════════════════════════════════════════
+void lcd_data(int ch) {
+    lcd_send(ch, LCD_RS);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Print string at current cursor position
+// ═══════════════════════════════════════════════════════════════════
+void lcd_print(char str[]) {
+    char lbuf[20];
+    strcpy(lbuf, str);
+    int i = 0;
+    while (lbuf[i] != 0 && i < LCD_COLS) {
+        lcd_data(lbuf[i]);
+        i = i + 1;
+    }
+    // Pad with spaces to clear remainder of line
+    while (i < LCD_COLS) {
+        lcd_data(0x20);
+        i = i + 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Set cursor to line (0 or 1), column (0-15)
+// ═══════════════════════════════════════════════════════════════════
+void lcd_setCursor(int row, int col) {
+    if (row == 0) {
+        lcd_cmd(LCD_LINE1 + col);
+    } else {
+        lcd_cmd(LCD_LINE2 + col);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Print string on specific line (0 or 1)
+// ═══════════════════════════════════════════════════════════════════
+void lcd_printLine(int row, char str[]) {
+    lcd_setCursor(row, 0);
+    lcd_print(str);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Clear display
+// ═══════════════════════════════════════════════════════════════════
+void lcd_clear() {
+    lcd_cmd(LCD_CLEAR);
+    delay(2);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Backlight on/off
+// ═══════════════════════════════════════════════════════════════════
+void lcd_backlight(int on) {
+    if (on) {
+        lcd_bl = LCD_BL;
+    } else {
+        lcd_bl = 0;
+    }
+    lcd_i2c_write(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HD44780 4-bit initialization sequence (must be called from main)
+// ═══════════════════════════════════════════════════════════════════
+int lcd_init() {
+    // Auto-detect PCF8574 address on both I2C buses
+    int found = 0;
+    int bus = 0;
+    while (bus <= 1 && found == 0) {
+        if (i2cExists(0x27, bus)) {
+            lcd_addr = 0x27;
+            lcd_bus = bus;
+            found = 1;
+        } else if (i2cExists(0x3F, bus)) {
+            lcd_addr = 0x3F;
+            lcd_bus = bus;
+            found = 1;
+        }
+        bus = bus + 1;
+    }
+    if (found == 0) {
+        addLog("LCD: no PCF8574 found on bus 0/1");
+        return -1;
+    }
+    sprintfInt(buf, "LCD: found at 0x%x bus ", lcd_addr);
+    sprintfAppendInt(buf, "%d", lcd_bus);
+    addLog(buf);
+
+    lcd_bl = LCD_BL;
+
+    // HD44780 requires specific init sequence to enter 4-bit mode
+    // Wait >40ms after power-on
+    delay(50);
+
+    // Send 0x30 three times to ensure 8-bit mode first
+    lcd_i2c_write(0);
+    delay(5);
+
+    lcd_send4(0x30, 0);
+    delay(5);
+    lcd_send4(0x30, 0);
+    delay(5);
+    lcd_send4(0x30, 0);
+    delay(2);
+
+    // Switch to 4-bit mode
+    lcd_send4(0x20, 0);
+    delay(2);
+
+    // Now in 4-bit mode — configure display
+    lcd_cmd(LCD_FUNC_4BIT2L);   // 4-bit, 2 lines, 5x8 font
+    lcd_cmd(LCD_DISPLAY_ON);     // display on, cursor off, blink off
+    lcd_cmd(LCD_CLEAR);          // clear display
+    delay(2);
+    lcd_cmd(LCD_ENTRY_MODE);     // increment cursor, no shift
+
+    i2cSetActiveFound(lcd_addr, "LCD", lcd_bus);
+    addLog("LCD: initialized 16x2");
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Build auto-mode display content
+// ═══════════════════════════════════════════════════════════════════
+void build_auto_display() {
+    // Line 1: HH:MM:SS  DD.MM
+    strcpy(line1, "");
+    sprintfInt(tmp, "%02d", tasm_hour);
+    strcat(line1, tmp);
+    strcat(line1, ":");
+    sprintfInt(tmp, "%02d", tasm_minute);
+    strcat(line1, tmp);
+    strcat(line1, ":");
+    sprintfInt(tmp, "%02d", tasm_second);
+    strcat(line1, tmp);
+    strcat(line1, "  ");
+    sprintfInt(tmp, "%02d", tasm_day);
+    strcat(line1, tmp);
+    strcat(line1, ".");
+    sprintfInt(tmp, "%02d", tasm_month);
+    strcat(line1, tmp);
+
+    // Line 2: Heap + WiFi status
+    sprintfInt(line2, "Heap:%dkB ", tasm_heap / 1000);
+    if (tasm_wifi) {
+        strcat(line2, "WiFi:OK");
+    } else {
+        strcat(line2, "WiFi:--");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EverySecond — update LCD content
+// ═══════════════════════════════════════════════════════════════════
+void EverySecond() {
+    if (lcd_ok != 1) { return; }
+
+    // Handle backlight change
+    if (changed(backlight)) {
+        snapshot(backlight);
+        lcd_backlight(backlight);
+        saveVars();
+    }
+
+    // Handle mode change
+    if (changed(dmode)) {
+        snapshot(dmode);
+        lcd_clear();
+        saveVars();
+    }
+
+    if (dmode == 0) {
+        // Auto mode: update time (line 1) every second
+        build_auto_display();
+        lcd_printLine(0, line1);
+        // Update line 2 (heap/wifi) every 10 seconds to save instructions
+        line2_timer = line2_timer - 1;
+        if (line2_timer <= 0) {
+            line2_timer = 10;
+            lcd_printLine(1, line2);
+        }
+    } else {
+        // Custom text mode — only update when text changes
+        lcd_printLine(0, line1_custom);
+        lcd_printLine(1, line2_custom);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Web UI — configuration
+// ═══════════════════════════════════════════════════════════════════
+void WebCall() {
+    webSend("{s}<b style='color:cyan'>LCD 16x2</b>{m}{e}");
+    if (lcd_ok == 1) {
+        sprintfInt(buf, "{s}I2C Address{m}0x%x{e}", lcd_addr);
+        webSend(buf);
+        webSend("{s}Status{m}OK{e}");
+    } else {
+        webSend("{s}Status{m}NOT FOUND{e}");
+    }
+}
+
+void WebUI() {
+    webCheckbox(backlight, "Backlight");
+    webCheckbox(dmode, "Custom text mode");
+    if (dmode == 1) {
+        webText(line1_custom, 20, "Line 1");
+        webText(line2_custom, 20, "Line 2");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Command handler — registered as "LCD" prefix
+// Commands:
+//   LCDPrint1 <text>  — print text on line 1
+//   LCDPrint2 <text>  — print text on line 2
+//   LCDClear          — clear display
+//   LCDOn             — backlight on
+//   LCDOff            — backlight off
+// ═══════════════════════════════════════════════════════════════════
+void Command(char cmd[]) {
+    char arg[24];
+    char resp[64];
+
+    if (strFind(cmd, "Print1") == 0) {
+        if (strlen(cmd) > 7) {
+            strSub(arg, cmd, 7, 0);
+        } else {
+            strcpy(arg, "");
+        }
+        dmode = 1;
+        strcpy(line1_custom, arg);
+        lcd_printLine(0, line1_custom);
+        sprintf(resp, "{\"LCDPrint1\":\"%s\"}", line1_custom);
+        responseCmnd(resp);
+    } else if (strFind(cmd, "Print2") == 0) {
+        if (strlen(cmd) > 7) {
+            strSub(arg, cmd, 7, 0);
+        } else {
+            strcpy(arg, "");
+        }
+        dmode = 1;
+        strcpy(line2_custom, arg);
+        lcd_printLine(1, line2_custom);
+        sprintf(resp, "{\"LCDPrint2\":\"%s\"}", line2_custom);
+        responseCmnd(resp);
+    } else if (strFind(cmd, "Clear") == 0) {
+        lcd_clear();
+        strcpy(line1_custom, "");
+        strcpy(line2_custom, "");
+        responseCmnd("{\"LCDClear\":\"done\"}");
+    } else if (strFind(cmd, "On") == 0) {
+        backlight = 1;
+        lcd_backlight(1);
+        saveVars();
+        responseCmnd("{\"LCDOn\":\"done\"}");
+    } else if (strFind(cmd, "Off") == 0) {
+        backlight = 0;
+        lcd_backlight(0);
+        saveVars();
+        responseCmnd("{\"LCDOff\":\"done\"}");
+    } else if (strFind(cmd, "Auto") == 0) {
+        dmode = 0;
+        lcd_clear();
+        responseCmnd("{\"LCDAuto\":\"done\"}");
+    } else {
+        responseCmnd("{\"LCD\":\"cmds: Print1,Print2,Clear,On,Off,Auto\"}");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// JSON output
+// ═══════════════════════════════════════════════════════════════════
+void JsonCall() {
+    sprintfInt(buf, ",\"LCD\":{\"Address\":\"0x%x\"", lcd_addr);
+    responseAppend(buf);
+    sprintfInt(buf, ",\"Backlight\":%d}", backlight);
+    responseAppend(buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// OnExit — release I2C address
+// ═══════════════════════════════════════════════════════════════════
+void OnExit() {
+    if (lcd_ok == 1) {
+        I2cResetActive(lcd_addr, lcd_bus);
+        addLog("LCD: released I2C address");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════
+int main() {
+    lcd_ok = 0;
+    strcpy(line1_custom, "Hello TinyC!");
+    strcpy(line2_custom, "");
+
+    // Defaults
+    if (backlight == 0 && dmode == 0) {
+        backlight = 1;
+    }
+    snapshot(backlight);
+    snapshot(dmode);
+
+    int ok = lcd_init();
+    if (ok != 0) {
+        return -1;
+    }
+    lcd_ok = 1;
+
+    lcd_backlight(backlight);
+
+    // Register console command prefix
+    addCommand("LCD");
+
+    // Show welcome message
+    lcd_printLine(0, "TinyC LCD Driver");
+    lcd_printLine(1, "Initializing...");
+    delay(1500);
+
+    return 0;
+}

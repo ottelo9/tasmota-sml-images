@@ -14,6 +14,69 @@
 
 #include <OneWire.h>
 
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+#include "esp_camera.h"
+#include "img_converters.h"
+
+// C-linkage wrapper so camera C library can call Tasmota's AddLog
+// Only compiled when TC_CAM_DEBUG is defined (add -DTC_CAM_DEBUG to build_flags)
+#ifdef TC_CAM_DEBUG
+extern "C" void TcCamLog(const char* fmt, ...) {
+    char buf[160];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    AddLog(2, PSTR("CAM: %s"), buf);
+}
+#endif
+// PSRAM picture slots — capture copies JPEG here, camera fb returned immediately
+#define TC_CAM_MAX_SLOTS 4
+static struct {
+  uint8_t *buf;
+  uint32_t len;
+  uint16_t width;
+  uint16_t height;
+  volatile uint8_t writing;   // 1 while memcpy in progress — skip reads
+} tc_cam_slot[TC_CAM_MAX_SLOTS] = {};
+
+// ── MJPEG streaming server (port 81) ──
+#define TC_CAM_STREAM_PORT 81
+#define TC_CAM_BOUNDARY "tc-cam-boundary-0123456789"
+static struct {
+  ESP8266WebServer *server;
+  WiFiClient client;
+  uint8_t stream_active;      // 0=off, 1=starting, 2=streaming
+  uint8_t pending;            // 1 = init requested but WiFi not ready yet
+  uint8_t *send_buf;          // copy of frame for sending (avoids torn reads)
+  uint32_t send_len;
+  uint32_t send_alloc;        // allocated size of send_buf
+} tc_cam_stream = {};
+
+// ── Motion detection ──
+static struct {
+  uint16_t interval_ms;       // 0 = disabled
+  uint32_t last_time;
+  uint32_t motion_trigger;    // accumulated pixel diff per 100 pixels
+  uint32_t motion_brightness; // average brightness per 100 pixels
+  uint8_t *ref_buf;           // previous frame grayscale (PSRAM)
+  uint32_t ref_size;          // width*height of ref_buf
+  uint8_t triggered;          // 1 if motion exceeded threshold
+  uint32_t threshold;         // trigger level (0 = report only)
+} tc_cam_motion = {};
+
+// Bridge: provide WcGetPicstore() from tc_cam_slot when USE_WEBCAM is NOT available
+// This allows the email driver's $N picture attachment to work with the TinyC camera
+#if !defined(USE_WEBCAM)
+uint32_t WcGetPicstore(int32_t num, uint8_t **buff) {
+  if (num < 0) { return TC_CAM_MAX_SLOTS; }
+  if (num >= TC_CAM_MAX_SLOTS) { if (buff) *buff = nullptr; return 0; }
+  if (buff) *buff = tc_cam_slot[num].buf;
+  return tc_cam_slot[num].len;
+}
+#endif  // !USE_WEBCAM
+#endif
+
 #ifdef USE_UFILESYS
 extern FS *ffsp;
 extern FS *ufsp;
@@ -56,18 +119,23 @@ static FS *tc_file_path(char *path) {
   #define TC_INSTR_PER_TICK  500     // instructions per 50ms tick
   #define TC_OUTPUT_SIZE     128     // output buffer for MQTT
 #else  // ESP32
-  #define TC_MAX_PROGRAM     16384   // max bytecode size
+  #define TC_MAX_PROGRAM     32768   // max bytecode size
   #define TC_STACK_SIZE      256     // operand stack (1KB)
   #define TC_MAX_FRAMES      32      // call depth
   #define TC_MAX_LOCALS      256     // locals per frame (1KB) - enough for char arrays
-  #define TC_MAX_GLOBALS     256     // global slots (1KB)
-  #define TC_MAX_CONSTANTS   256     // constant pool entries (dynamic alloc, uint16_t)
-  #define TC_MAX_CONST_DATA  4096    // string constant bytes
+  #define TC_MAX_GLOBALS     512     // global slots (2KB)
+  #define TC_MAX_CONSTANTS   512     // constant pool entries (dynamic alloc, uint16_t)
+  #define TC_MAX_CONST_DATA  8192    // string constant bytes
   #define TC_INSTR_PER_TICK  1000    // instructions per 50ms tick
   #define TC_OUTPUT_SIZE     128     // output buffer for MQTT (was 512)
 #endif
 
 #define TC_MAX_FILE_HANDLES  4      // max simultaneously open files
+
+// VM task stack size (bytes)
+#ifndef TC_VM_TASK_STACK
+  #define TC_VM_TASK_STACK   8192
+#endif
 
 // Heap memory for large arrays (> 255 elements)
 #ifdef ESP8266
@@ -75,11 +143,12 @@ static FS *tc_file_path(char *path) {
   #define TC_MAX_HEAP_HANDLES   8
 #else  // ESP32
   #define TC_MAX_HEAP           8192   // heap slots (32KB)
-  #define TC_MAX_HEAP_HANDLES   64     // max concurrent heap arrays (was 16, energy script needs 41+)
+  #define TC_MAX_HEAP_HANDLES   128    // max concurrent heap arrays (energy script uses 68+)
 #endif
 
 #define TC_MAGIC           0x54434300  // "TCC\0"
 #define TC_VERSION         5           // V5: global (UDP auto-update) variables
+#define TC_RELEASE         "1.1.0"     // unified sprintf/sprintfAppend, VM auto-pause during uploads
 #define TC_FILE_NAME       "/autoexec.tcb"
 #define TC_MAX_PERSIST     32          // max persist variable entries
 #define TC_MAX_UDP_GLOBALS 64          // max global (UDP auto-update) variable entries
@@ -111,7 +180,7 @@ static FS *tc_file_path(char *path) {
 #else
   #define TC_CALLBACK_MAX_INSTR 200000 // instruction limit per callback (ESP32)
 #endif
-#define TC_CALLBACK_NAME_MAX 16        // max callback name length
+#define TC_CALLBACK_NAME_MAX 20        // max callback name length (longest: OnMqttDisconnect=16+1)
 
 // UDP multicast support (Scripter-compatible protocol)
 #define TC_UDP_PORT          1999
@@ -119,6 +188,7 @@ static FS *tc_file_path(char *path) {
 #define TC_UDP_VAR_NAME_MAX  16         // max variable name length
 #define TC_UDP_BUF_SIZE      320        // receive buffer (max: 2+16+1+2+64*4 = 277)
 #define TC_UDP_MAX_ARRAY     64         // max float array elements per UDP variable
+#define TC_UDP_TIMEOUT_SEC   60         // default inactivity timeout (seconds), 0 = disabled
 
 /*********************************************************************************************\
  * VM Opcodes
@@ -169,7 +239,8 @@ enum TcOp {
   OP_ADDR_LOCAL   = 0x78,  // push packed ref: (fp << 16) | base_idx
   OP_ADDR_GLOBAL  = 0x79,  // push packed ref: 0x80000000 | base_idx
   // Syscalls
-  OP_SYSCALL      = 0x80,
+  OP_SYSCALL      = 0x80,  // u8 syscall_id
+  OP_SYSCALL2     = 0x81,  // u16 syscall_id (extended range 256+)
   // Heap arrays (large arrays > 255 elements)
   OP_LOAD_HEAP_ARR  = 0xA0,  // u8 handle; pop idx -> push value
   OP_STORE_HEAP_ARR = 0xA1,  // u8 handle; pop val, pop idx -> store
@@ -216,6 +287,7 @@ enum TcSyscall {
   SYS_MATH_SIN  = 36, SYS_MATH_COS   = 37,
   SYS_MATH_FLOOR= 38, SYS_MATH_CEIL  = 39, SYS_MATH_ROUND = 40,
   SYS_MATH_EXP  = 198, SYS_MATH_LOG  = 199, // exp(f)->float, log(f)->float (natural)
+  SYS_MATH_POW  = 19,  SYS_MATH_ACOS = 123, // pow(base,exp)->float, acos(f)->float
   SYS_INT_BITS_TO_FLOAT = 49, // (int_bits) -> float — reinterpret int32 as IEEE754 float
   // String operations (work with array refs from OP_ADDR_LOCAL/OP_ADDR_GLOBAL)
   SYS_STRLEN       = 50,  // (ref) -> int
@@ -352,6 +424,14 @@ enum TcSyscall {
   SYS_SORT_ARRAY      = 168, // (arr_ref, count, flags) -> void — sort array in-place
   // Webcam (ESP32 — requires USE_WEBCAM)
   SYS_CAM_CONTROL     = 169, // (sel, p1, p2) -> int — multiplexed webcam control
+  SYS_CAM_INIT_PINS   = 206, // (pins_ref, format, framesize, quality) -> int — init camera with custom pins
+  // Hardware register peek/poke (ESP32 memory-mapped I/O)
+  SYS_PEEK_REG         = 207, // (addr) -> int — read 32-bit from memory-mapped address
+  SYS_POKE_REG         = 208, // (addr, val) -> void — write 32-bit to memory-mapped address
+  SYS_TASM_GET_STR     = 209, // (sel, buf_ref) -> int — get Tasmota string info into char[]
+  SYS_TASM_POWER       = 217, // (index) -> int — power state of relay (0-based)
+  SYS_TASM_SWITCH      = 218, // (index) -> int — switch state (0-based)
+  SYS_TASM_COUNTER     = 219, // (index) -> int — pulse counter (0-based)
   // Display drawing (direct renderer calls — requires USE_DISPLAY)
   SYS_DSP_TEXT        = 170, // (buf_ref) -> void — raw DisplayText command string
   SYS_DSP_CLEAR       = 171, // () -> void — clear display
@@ -381,6 +461,10 @@ enum TcSyscall {
   SYS_DSP_TEXT_STR    = 195, // (const_idx) -> void — DisplayText from string literal
   SYS_DSP_DRAW_STR    = 196, // (const_idx) -> void — draw string literal at current pos
   SYS_DSP_PAD         = 197, // (n) -> void — set text padding for dspDraw (0=off)
+  SYS_DSP_LOAD_IMG    = 262, // (filename_const) -> int — load JPG to PSRAM, returns slot (0-3, -1=err)
+  SYS_DSP_IMG_RECT    = 263, // (slot, sx, sy, dx, dy, w, h) -> void — push sub-rect from image to screen
+  SYS_DSP_IMG_WIDTH   = 264, // (slot) -> int — get image width
+  SYS_DSP_IMG_HEIGHT  = 265, // (slot) -> int — get image height
   // Audio
   SYS_AUDIO_VOL       = 200, // (vol) -> void — set volume 0-100
   SYS_AUDIO_PLAY      = 201, // (file_const) -> void — play MP3 file
@@ -414,9 +498,11 @@ enum TcSyscall {
   SYS_FILE_OPENDIR    = 227, // (const_idx_path) -> int handle (-1=err)
   SYS_FILE_OPENDIR_REF= 228, // (path_ref) -> int handle (-1=err)
   SYS_FILE_READDIR    = 229, // (handle, name_buf_ref) -> int (1=entry, 0=end)
+  SYS_FILE_RANGE      = 260, // (handle, min_ref, max_ref) -> rows (first/last timestamp)
   SYS_TASM_CMD_REF   = 248, // (cmd_ref, out_buf_ref) -> int — tasmCmd with char array command
   SYS_I2C_FREE       = 249, // (addr, bus) -> void — release claimed I2C address
   SYS_WEB_CHART_SIZE  = 233, // (width, height) -> void — set chart div size in pixels (0=default)
+  SYS_WEB_CHART_TBASE = 261, // (minutes) -> void — set time base offset from "now" for chart x-axis
   // Console command callback
   SYS_ADD_COMMAND     = 45, // (const_idx_prefix) -> void — register command prefix
   SYS_RESPONSE_CMND  = 46, // (buf_ref) -> void — send console response
@@ -449,6 +535,10 @@ enum TcSyscall {
   // Debug
   SYS_DEBUG_PRINT     = 250, SYS_DEBUG_PRINT_STR = 251,
   SYS_DEBUG_DUMP      = 252,
+  // Extended syscalls (256+, requires OP_SYSCALL2)
+  SYS_SML_COPY        = 256, // (arr_ref, count) -> int — copy SML values to float array
+  SYS_ARRAY_FILL      = 257, // (arr_ref, value, count) -> void — fill array with value
+  SYS_ARRAY_COPY      = 258, // (dst_ref, src_ref, count) -> void — copy array to array
 };
 
 /*********************************************************************************************\
@@ -497,6 +587,22 @@ static const char* tc_error_str(int err) {
   strncpy_P(buf, p, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
   return buf;
+}
+
+// Write crash info to /crash.log (append, keeps last entries)
+static void tc_crash_log(int err, uint16_t pc, uint32_t instr_count, const char *context) {
+#ifdef ESP32
+  if (!ufsp) return;
+  FS *fs = ufsp;
+  File f = fs->open("/crash.log", "a");
+  if (!f) return;
+  char ts[24];
+  snprintf(ts, sizeof(ts), "%s", GetDateAndTime(DT_LOCAL).c_str());
+  f.printf("%s  err=%d (%s)  PC=%u  instr=%u  ctx=%s  heap=%u\n",
+    ts, err, tc_error_str(err), pc, instr_count, context ? context : "?", ESP.getFreeHeap());
+  f.close();
+  AddLog(LOG_LEVEL_ERROR, PSTR("TCC: crash logged to /crash.log"));
+#endif
 }
 
 /*********************************************************************************************\
@@ -677,6 +783,7 @@ struct TINYC {
   bool     autorun;
   bool     show_info;             // show TinyC status rows on main web page
   // Upload state (one upload at a time, shared)
+  bool     upload_active;           // true during upload — pauses VM callbacks
   uint8_t *upload_buf;
   uint32_t upload_size;
   uint32_t upload_received;
@@ -692,10 +799,15 @@ struct TINYC {
   // TinyC always owns its own UDP multicast socket for receiving
   WiFiUDP  udp;
   char     udp_buf[TC_UDP_BUF_SIZE];
+  // UDP socket inactivity watchdog — reset socket if no rx within timeout
+  uint32_t udp_last_rx;           // millis() of last received multicast packet
+  uint16_t udp_timeout;           // inactivity timeout in seconds (0 = disabled)
   // General-purpose UDP port (Scripter-compatible udp() function)
   WiFiUDP  udp_port;              // general-purpose UDP socket
   uint16_t udp_port_num;          // bound port number
   bool     udp_port_open;         // port is listening
+  uint32_t udp_port_last_rx;     // millis() of last received packet on general port
+  uint16_t udp_port_timeout;     // inactivity timeout in seconds (0 = disabled)
   // WebUI pages (up to 6, set by wLabel(), buttons on main page)
 #define TC_MAX_WEB_PAGES 6
   char     page_label[TC_MAX_WEB_PAGES][32];
@@ -775,7 +887,27 @@ static bool    tc_chart_lib_sent = false; // true after Google Charts loader emi
 static TcSlot *tc_sensor_get_slot = nullptr; // re-entry guard: skip this slot's JsonCall during sensorGet
 static uint16_t tc_chart_width = 0;     // chart div width in px (0 = 100%)
 static uint16_t tc_chart_height = 0;    // chart div height in px (0 = 300px)
+static int32_t  tc_chart_time_base = 0; // time base offset in minutes from "now" (0=now)
 static TasmotaSerial *tc_serial_port = nullptr; // TinyC serial port (shared across VMs)
+
+// Image store for dspLoadImage / dspPushImageRect (watchface backgrounds etc.)
+#define TC_IMG_SLOTS 4
+static struct {
+  uint16_t *buf;   // RGB565 pixel data in PSRAM (NULL = free)
+  uint16_t w, h;   // image dimensions
+} tc_img_store[TC_IMG_SLOTS] = {};
+
+// Helper: free all image store slots (called on VM stop)
+static void tc_img_store_free(void) {
+  for (int i = 0; i < TC_IMG_SLOTS; i++) {
+    if (tc_img_store[i].buf) {
+      free(tc_img_store[i].buf);
+      tc_img_store[i].buf = nullptr;
+      tc_img_store[i].w = 0;
+      tc_img_store[i].h = 0;
+    }
+  }
+}
 
 // Helper: allocate a new slot
 static TcSlot *tc_slot_alloc(void) {
@@ -852,11 +984,17 @@ static int32_t* tc_resolve_ref(TcVM *vm, int32_t ref) {
   if (tag == 3) {
     // Heap ref: 0xC0000000 | handle
     uint16_t handle = uref & 0xFFFF;
-    if (handle < TC_MAX_HEAP_HANDLES && vm->heap_data && vm->heap_handles &&
-        vm->heap_handles[handle].alive) {
-      return &vm->heap_data[vm->heap_handles[handle].offset];
+    if (handle >= TC_MAX_HEAP_HANDLES) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap handle %d >= max %d"), handle, TC_MAX_HEAP_HANDLES);
+      return nullptr;
     }
-    return nullptr;
+    if (!vm->heap_data || !vm->heap_handles || !vm->heap_handles[handle].alive) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap handle %d invalid (data=%d handles=%d alive=%d)"),
+             handle, vm->heap_data != nullptr, vm->heap_handles != nullptr,
+             vm->heap_handles ? vm->heap_handles[handle].alive : 0);
+      return nullptr;
+    }
+    return &vm->heap_data[vm->heap_handles[handle].offset];
   }
   if (tag == 2) {
     // Global ref: 0x80000000 | base_idx
@@ -1731,7 +1869,11 @@ static void tc_udp_init(void) {
   if (Tinyc->udp.beginMulticast(IPAddress(239,255,255,250), TC_UDP_PORT)) {
 #endif
     Tinyc->udp_connected = true;
-    AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP multicast started on port %d"), TC_UDP_PORT);
+    Tinyc->udp_last_rx = millis();  // reset watchdog on (re)connect
+    if (!Tinyc->udp_timeout) {
+      Tinyc->udp_timeout = TC_UDP_TIMEOUT_SEC;  // set default on first init
+    }
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP multicast started on port %d (timeout %ds)"), TC_UDP_PORT, Tinyc->udp_timeout);
   } else {
     Tinyc->udp_connected = false;
     AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: UDP multicast failed"));
@@ -1770,6 +1912,20 @@ static void tc_udp_poll(void) {
     return;
   }
 
+  // Inactivity watchdog: reset socket if no packet received within timeout
+  if (Tinyc->udp_timeout > 0) {
+    uint32_t elapsed = millis() - Tinyc->udp_last_rx;
+    if (elapsed > (uint32_t)Tinyc->udp_timeout * 1000) {
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP multicast rx timeout (%ds) — resetting socket"), Tinyc->udp_timeout);
+      Tinyc->udp.flush();
+      Tinyc->udp.stop();
+      Tinyc->udp_connected = false;
+      tc_udp_init();  // immediately reconnect
+      return;
+    }
+  }
+
+  bool got_packet = false;
   uint32_t timeout = millis();
   while (1) {
     uint16_t plen = Tinyc->udp.parsePacket();
@@ -1782,6 +1938,7 @@ static void tc_udp_poll(void) {
     }
     if (millis() - timeout > 100) break;  // max 100ms processing
 
+    got_packet = true;
     int32_t len = Tinyc->udp.read(Tinyc->udp_buf, TC_UDP_BUF_SIZE - 1);
     Tinyc->udp_buf[len] = 0;
 
@@ -1808,6 +1965,11 @@ static void tc_udp_poll(void) {
     tc_udp_on_receive(lp, umode, data, datalen);
 
     optimistic_yield(100);
+  }
+
+  // Reset watchdog timer on any received packet
+  if (got_packet) {
+    Tinyc->udp_last_rx = millis();
   }
 }
 
@@ -2253,7 +2415,7 @@ static bool tc_pin_forbidden(int32_t pin) {
  * VM: Syscall dispatch
 \*********************************************************************************************/
 
-static int tc_syscall(TcVM *vm, uint8_t id) {
+static int tc_syscall(TcVM *vm, uint16_t id) {
   int32_t a, b;
   float fa;
 
@@ -2632,6 +2794,11 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       fa = TC_POPF(vm); TC_PUSHF(vm, expf(fa)); break;
     case SYS_MATH_LOG:
       fa = TC_POPF(vm); TC_PUSHF(vm, logf(fa)); break;
+    case SYS_MATH_POW: {
+      float fb = TC_POPF(vm); fa = TC_POPF(vm); TC_PUSHF(vm, powf(fa, fb)); break;
+    }
+    case SYS_MATH_ACOS:
+      fa = TC_POPF(vm); TC_PUSHF(vm, acosf(fa)); break;
     case SYS_INT_BITS_TO_FLOAT:
       // Identity: int32 bits ARE the float — just leave on stack
       // Compiler knows return type is float, so subsequent ops use FADD/FMUL etc.
@@ -3280,6 +3447,90 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       break;
     }
 
+    case SYS_FILE_RANGE: {
+      // fileRange(handle, min_ref, max_ref) -> total_rows
+      // Reads a tab-delimited log file, skips header, returns first and last timestamps
+#ifdef USE_UFILESYS
+      int32_t max_ref = TC_POP(vm);
+      int32_t min_ref = TC_POP(vm);
+      int32_t h = TC_POP(vm);
+      if (h < 0 || h >= TC_MAX_FILE_HANDLES || !Tinyc->file_used[h]) {
+        TC_PUSH(vm, 0);
+        break;
+      }
+      // Save and seek to start
+      tc_file_handles[h].seek(0, SeekSet);
+
+      char line[512];
+      int32_t rows = 0;
+      bool headerSkipped = false;
+      char first_ts[24] = {0};
+      char last_ts[24] = {0};
+
+      // Buffered read
+      const int FBUF_SZ = 4096;
+      uint8_t *fbuf = (uint8_t*)malloc(FBUF_SZ);
+      if (!fbuf) { TC_PUSH(vm, 0); break; }
+      int fbuf_len = 0, fbuf_pos = 0;
+
+      while (true) {
+        int llen = 0;
+        bool got_line = false;
+        while (true) {
+          if (fbuf_pos >= fbuf_len) {
+            fbuf_len = tc_file_handles[h].read(fbuf, FBUF_SZ);
+            fbuf_pos = 0;
+            if (fbuf_len <= 0) break;
+          }
+          char ch = (char)fbuf[fbuf_pos++];
+          if (ch == '\n') { got_line = true; break; }
+          if (ch == '\r') continue;
+          if (llen < (int)sizeof(line) - 1) line[llen++] = ch;
+        }
+        line[llen] = 0;
+        if (!got_line && llen == 0) break;
+
+        if (!headerSkipped) { headerSkipped = true; continue; }
+
+        // Extract timestamp (first column before tab)
+        char *tab = line;
+        while (*tab && *tab != '\t') tab++;
+        int tslen = tab - line;
+        if (tslen > 0 && tslen < 24) {
+          if (first_ts[0] == 0) {
+            memcpy(first_ts, line, tslen);
+            first_ts[tslen] = 0;
+          }
+          memcpy(last_ts, line, tslen);
+          last_ts[tslen] = 0;
+          rows++;
+        }
+      }
+      free(fbuf);
+
+      // Write timestamps to output buffers
+      int32_t *dst_min = tc_resolve_ref(vm, min_ref);
+      int32_t min_max = tc_ref_maxlen(vm, min_ref);
+      int32_t len = strlen(first_ts);
+      if (len >= min_max) len = min_max - 1;
+      for (int i = 0; i < len; i++) dst_min[i] = (int32_t)(uint8_t)first_ts[i];
+      dst_min[len] = 0;
+
+      int32_t *dst_max = tc_resolve_ref(vm, max_ref);
+      int32_t max_max = tc_ref_maxlen(vm, max_ref);
+      len = strlen(last_ts);
+      if (len >= max_max) len = max_max - 1;
+      for (int i = 0; i < len; i++) dst_max[i] = (int32_t)(uint8_t)last_ts[i];
+      dst_max[len] = 0;
+
+      TC_PUSH(vm, rows);
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
     case SYS_FILE_SIZE: {
 #ifdef USE_UFILESYS
       int32_t ci = TC_POP(vm);
@@ -3397,17 +3648,32 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       int32_t urlRef = TC_POP(vm);
       int32_t ci     = TC_POP(vm);
       const char *cpath = tc_get_const_str(vm, ci);
-      char url[256];
-      tc_ref_to_cstr(vm, urlRef, url, sizeof(url));
-      if (!cpath) { TC_PUSH(vm, -1); break; }
-      char path[128];
-      strlcpy(path, cpath, sizeof(path));
+      char *url = (char *)malloc(256);
+      if (!url) { TC_PUSH(vm, -1); break; }
+      tc_ref_to_cstr(vm, urlRef, url, 256);
+      if (!cpath) { free(url); TC_PUSH(vm, -1); break; }
+      char *path = (char *)malloc(128);
+      if (!path) { free(url); TC_PUSH(vm, -1); break; }
+      strlcpy(path, cpath, 128);
       FS *fsp = tc_file_path(path);
-      if (!fsp) { TC_PUSH(vm, -1); break; }
+      if (!fsp) { free(url); free(path); TC_PUSH(vm, -1); break; }
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+      HTTPClientLight http;
+#else
       WiFiClient http_client;
       HTTPClient http;
+#endif
       http.setTimeout(10000);
-      http.begin(http_client, url);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: fileDownload urlRef=%d len=%d url='%s'"), urlRef, strlen(url), url);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+      bool begun = http.begin(UrlEncode(url));
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: fileDownload begin=%d (HTTPClientLight)"), begun);
+#else
+      bool begun = http.begin(http_client, UrlEncode(url));
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: fileDownload begin=%d (WiFiClient)"), begun);
+#endif
+      free(url);
+      if (!begun) { http.end(); free(path); TC_PUSH(vm, -1); break; }
       int httpCode = http.GET();
       if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
         File f = fsp->open(path, "w");
@@ -3415,16 +3681,19 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
           WiFiClient *stream = http.getStreamPtr();
           int32_t len = http.getSize();
           if (len < 0) len = 99999999;  // unknown size
-          uint8_t buf[512];
-          while (http.connected() && (len > 0)) {
-            size_t avail = stream->available();
-            if (avail) {
-              if (avail > sizeof(buf)) avail = sizeof(buf);
-              int rd = stream->readBytes(buf, avail);
-              f.write(buf, rd);
-              len -= rd;
+          uint8_t *buf = (uint8_t *)malloc(512);
+          if (buf) {
+            while (http.connected() && (len > 0)) {
+              size_t avail = stream->available();
+              if (avail) {
+                if (avail > 512) avail = 512;
+                int rd = stream->readBytes(buf, avail);
+                f.write(buf, rd);
+                len -= rd;
+              }
+              delay(1);
             }
-            delay(1);
+            free(buf);
           }
           f.close();
           AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileDownload(\"%s\") -> %d"), path, httpCode);
@@ -3435,7 +3704,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: fileDownload HTTP error %d"), httpCode);
       }
       http.end();
-      http_client.stop();
+      free(path);
       TC_PUSH(vm, httpCode);
 #else
       TC_POP(vm); TC_POP(vm);
@@ -3558,32 +3827,78 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       int fbuf_len = 0, fbuf_pos = 0;
       char line[512];
       int32_t rowCount = 0;
-      int32_t subCount = 0;                     // sub-row counter for averaging
-      int32_t avgN = (accum < -1) ? -accum : 0; // e.g., accum=-4 → avgN=4
-      float prevVals[32];                        // previous row values for delta mode
-      memset(prevVals, 0, sizeof(prevVals));
-      bool firstRow = true;
+      bool dflg = (accum < 0);                  // delta mode for absolute columns
+      int32_t accumN = (accum < 0) ? -accum : (accum > 0 ? accum : 1);
+      // Per-column flags: bit0=absolute(delta), bit1=average(_a), bit7=has previous value
+      uint8_t mflg[32];
+      memset(mflg, 0, sizeof(mflg));
+      float lastv[32];                           // previous values for delta computation
+      memset(lastv, 0, sizeof(lastv));
+      float summs[32];                           // accumulation sums for averaging
+      memset(summs, 0, sizeof(summs));
+      uint16_t accnt[32];                        // per-column accumulation counters
+      memset(accnt, 0, sizeof(accnt));
+      bool headerParsed = false;
+
+      // Lambda: read one line from buffered file
+      #define TC_READ_LINE() \
+        { llen = 0; got_line = false; \
+          while (true) { \
+            if (fbuf_pos >= fbuf_len) { \
+              fbuf_len = tc_file_handles[h].read(fbuf, FBUF_SZ); \
+              fbuf_pos = 0; \
+              if (fbuf_len <= 0) break; \
+            } \
+            char ch = (char)fbuf[fbuf_pos++]; \
+            if (ch == '\n') { got_line = true; break; } \
+            if (ch == '\r') continue; \
+            if (llen < (int)sizeof(line) - 1) line[llen++] = ch; \
+          } \
+          line[llen] = 0; \
+        }
 
       while (true) {
         // ── Read next line from buffer ──
         int llen = 0;
         bool got_line = false;
-        while (true) {
-          if (fbuf_pos >= fbuf_len) {
-            fbuf_len = tc_file_handles[h].read(fbuf, FBUF_SZ);
-            fbuf_pos = 0;
-            if (fbuf_len <= 0) break;  // EOF
-          }
-          char c = (char)fbuf[fbuf_pos++];
-          if (c == '\n') { got_line = true; break; }
-          if (c == '\r') continue;
-          if (llen < (int)sizeof(line) - 1) line[llen++] = c;
-        }
+        TC_READ_LINE();
         if (!got_line && llen == 0) break;  // EOF
-        line[llen] = 0;
+
+        // ── Parse header line: detect _a suffix on column names ──
+        if (!headerParsed) {
+          headerParsed = true;
+          // Parse header columns to detect _a suffix
+          // col_offs matches Scripter: colpos 0=timestamp, 1=first data col
+          // curpos = colpos - col_offs → array index
+          char *hp = line;
+          int hcol = 0;
+          // Skip timestamp column (colpos=0)
+          while (*hp && *hp != '\t') hp++;
+          if (*hp == '\t') hp++;
+          hcol = 1;
+          // Iterate data columns
+          while (*hp) {
+            char *start = hp;
+            while (*hp && *hp != '\t') hp++;
+            int clen = hp - start;
+            if (hcol >= col_offs) {
+              int curpos = hcol - col_offs;
+              if (curpos < numArrays) {
+                if (dflg) {
+                  mflg[curpos] = 1;  // default: absolute (delta mode)
+                  if (clen >= 2 && start[clen-2] == '_' && start[clen-1] == 'a') {
+                    mflg[curpos] |= 2;  // _a suffix: average value, skip delta
+                  }
+                }
+              }
+            }
+            if (*hp == '\t') hp++;
+            hcol++;
+          }
+          continue;  // skip header, read next line
+        }
 
         // ── Parse timestamp in-place (first column before tab) ──
-        // Find tab to null-terminate timestamp temporarily
         char *tab = line;
         while (*tab && *tab != '\t') tab++;
         char saved = *tab;
@@ -3592,92 +3907,102 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         uint32_t cmp = tc_ts_cmp(line);  // fast: no mktime, no sscanf
         *tab = saved;  // restore
 
-        if (cmp == 0) continue;         // skip header / invalid
+        if (cmp == 0) continue;         // skip invalid
         if (cmp < cmp_from) continue;   // before range
         if (cmp > cmp_to) break;        // past range — done (data is chronological)
 
-        // ── Skip timestamp column + col_offs data columns ──
+        // ── Skip timestamp column, then parse data columns ──
+        // col_offs matches Scripter: colpos=1 is first data col
+        // curpos = colpos - col_offs → array index
         char *p = (saved == '\t') ? tab + 1 : tab;
-        for (int skip = 0; skip < col_offs && *p; skip++) {
-          while (*p && *p != '\t') p++;
-          if (*p == '\t') p++;
-        }
+        int colpos = 1;  // first data column
 
         // ── Parse float values into destination arrays ──
-        for (int c = 0; c < numArrays; c++) {
-          float val = 0;
-          if (*p) {
-            val = strtof(p, &p);
-            if (*p == '\t') p++;
-          }
-          if (accum == -1) {
-            // Delta mode: output = current - previous
-            float delta = firstRow ? 0 : (val - prevVals[c]);
-            prevVals[c] = val;
-            if (arrBase[c] && rowCount < arrMax[c]) {
-              memcpy(&arrBase[c][rowCount], &delta, sizeof(float));
-            }
-          } else if (accum < -1) {
-            // Averaging mode: accumulate avgN rows, then divide
-            if (arrBase[c] && rowCount < arrMax[c]) {
-              if (subCount == 0) {
-                memcpy(&arrBase[c][rowCount], &val, sizeof(float));
+        // Following Scripter logic: per-column delta + per-column accumulation
+        while (*p) {
+          float val = strtof(p, &p);
+          if (*p == '\t') p++;
+
+          if (colpos < col_offs) { colpos++; continue; }
+          int c = colpos - col_offs;
+          colpos++;
+          if (c >= numArrays) break;
+
+          float fval = val;
+          bool flg = true;  // true = this value contributes to output
+
+          if (mflg[c] & 1) {
+            // Delta mode active for this column
+            if (!(mflg[c] & 2)) {
+              // No _a suffix: absolute counter → compute delta
+              if (!(mflg[c] & 0x80)) {
+                // First value: just store, no output yet
+                lastv[c] = val;
+                mflg[c] |= 0x80;
+                flg = false;
               } else {
-                float existing;
-                memcpy(&existing, &arrBase[c][rowCount], sizeof(float));
-                existing += val;
-                memcpy(&arrBase[c][rowCount], &existing, sizeof(float));
+                float tmp = val;
+                fval = val - lastv[c];
+                if (fval < 0) fval = 0;  // clamp negative deltas
+                lastv[c] = tmp;
               }
             }
-          } else if (accum > 0) {
-            // Simple accumulation (existing behavior)
-            if (arrBase[c] && rowCount < arrMax[c]) {
-              float existing;
-              memcpy(&existing, &arrBase[c][rowCount], sizeof(float));
-              val += existing;
-              memcpy(&arrBase[c][rowCount], &val, sizeof(float));
-            }
-          } else {
-            // Normal mode (accum == 0): direct store
-            if (arrBase[c] && rowCount < arrMax[c]) {
-              memcpy(&arrBase[c][rowCount], &val, sizeof(float));
+            // _a suffix (mflg & 2): fval stays as-is (current value, no delta)
+          }
+
+          // Accumulate into per-column sum and store when count reaches accumN
+          if (flg && arrBase[c]) {
+            summs[c] += fval;
+            accnt[c]++;
+            if (accnt[c] >= accumN) {
+              if (rowCount < arrMax[c]) {
+                float avg = summs[c] / (float)accumN;
+                memcpy(&arrBase[c][rowCount], &avg, sizeof(float));
+              }
+              summs[c] = 0;
+              accnt[c] = 0;
             }
           }
         }
-        // Row counting depends on mode
-        if (accum < -1) {
-          subCount++;
-          if (subCount >= avgN) {
-            // Divide accumulated sums by avgN
-            for (int c = 0; c < numArrays; c++) {
-              if (arrBase[c] && rowCount < arrMax[c]) {
-                float avg;
-                memcpy(&avg, &arrBase[c][rowCount], sizeof(float));
-                avg /= (float)avgN;
-                memcpy(&arrBase[c][rowCount], &avg, sizeof(float));
+
+        // Advance row counter when first column's accumulator fires
+        // Use column 0 as the reference (matches Scripter behavior where
+        // all _a columns accumulate in sync, and absolute columns may lag by 1)
+        // Find first active column to determine row advancement
+        {
+          bool advanced = false;
+          for (int c = 0; c < numArrays; c++) {
+            if (arrBase[c] && accnt[c] == 0 && rowCount < arrMax[c]) {
+              // This column just stored a value (counter reset to 0)
+              // Check if it actually had data (not just initialized)
+              if (mflg[c] & 0x80 || !(mflg[c] & 1)) {
+                advanced = true;
+                break;
               }
             }
-            rowCount++;
-            subCount = 0;
           }
-        } else {
-          rowCount++;
-          firstRow = false;
+          if (advanced) rowCount++;
         }
       }
 
-      // For averaging: if partial group remains, compute average of partial
-      if (accum < -1 && subCount > 0) {
+      // Partial accumulation: store remainder
+      {
+        bool has_partial = false;
         for (int c = 0; c < numArrays; c++) {
-          if (arrBase[c] && rowCount < arrMax[c]) {
-            float avg;
-            memcpy(&avg, &arrBase[c][rowCount], sizeof(float));
-            avg /= (float)subCount;
-            memcpy(&arrBase[c][rowCount], &avg, sizeof(float));
-          }
+          if (accnt[c] > 0) { has_partial = true; break; }
         }
-        rowCount++;
+        if (has_partial) {
+          for (int c = 0; c < numArrays; c++) {
+            if (accnt[c] > 0 && arrBase[c] && rowCount < arrMax[c]) {
+              float avg = summs[c] / (float)accnt[c];
+              memcpy(&arrBase[c][rowCount], &avg, sizeof(float));
+            }
+          }
+          rowCount++;
+        }
       }
+
+      #undef TC_READ_LINE
 
       free(fbuf);
 
@@ -4244,7 +4569,11 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
             if (Tinyc->udp_port.begin(port)) {
               Tinyc->udp_port_num = port;
               Tinyc->udp_port_open = true;
-              AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP port %d opened"), port);
+              Tinyc->udp_port_last_rx = millis();  // reset watchdog
+              if (!Tinyc->udp_port_timeout) {
+                Tinyc->udp_port_timeout = TC_UDP_TIMEOUT_SEC;
+              }
+              AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP port %d opened (timeout %ds)"), port, Tinyc->udp_port_timeout);
               TC_PUSH(vm, 1);
             } else {
               Tinyc->udp_port_open = false;
@@ -4259,8 +4588,21 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
           int32_t buf_ref = TC_POP(vm);
           int32_t result = 0;
           if (Tinyc->udp_port_open && !TasmotaGlobal.global_state.network_down) {
+            // Inactivity watchdog: reset socket if no packet within timeout
+            if (Tinyc->udp_port_timeout > 0) {
+              uint32_t elapsed = millis() - Tinyc->udp_port_last_rx;
+              if (elapsed > (uint32_t)Tinyc->udp_port_timeout * 1000) {
+                AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP port %d rx timeout (%ds) — resetting"),
+                       Tinyc->udp_port_num, Tinyc->udp_port_timeout);
+                uint16_t saved_port = Tinyc->udp_port_num;
+                Tinyc->udp_port.stop();
+                Tinyc->udp_port.begin(saved_port);
+                Tinyc->udp_port_last_rx = millis();
+              }
+            }
             int32_t plen = Tinyc->udp_port.parsePacket();
             if (plen > 0) {
+              Tinyc->udp_port_last_rx = millis();  // packet received — reset watchdog
               char packet[512];
               int32_t len = Tinyc->udp_port.read(packet, sizeof(packet) - 1);
               if (len > 0) {
@@ -4383,6 +4725,25 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
             }
           }
           TC_PUSH(vm, 0);
+          break;
+        }
+        case 8: { // udp(8, which, seconds) → set inactivity timeout
+          // which: 0 = multicast globalvars, 1 = general-purpose port
+          // seconds: timeout in seconds (0 = disable watchdog)
+          int32_t seconds = TC_POP(vm);
+          int32_t which = TC_POP(vm);
+          if (seconds < 0) seconds = 0;
+          if (seconds > 3600) seconds = 3600;
+          if (which == 0) {
+            Tinyc->udp_timeout = (uint16_t)seconds;
+            Tinyc->udp_last_rx = millis();  // reset watchdog now
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP multicast timeout set to %ds"), seconds);
+          } else {
+            Tinyc->udp_port_timeout = (uint16_t)seconds;
+            Tinyc->udp_port_last_rx = millis();
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP port timeout set to %ds"), seconds);
+          }
+          TC_PUSH(vm, 1);
           break;
         }
         default:
@@ -4562,6 +4923,8 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
     }
     case SYS_RESPONSE_CMND: {
       // responseCmnd(buf) — send text as console/MQTT command response
+      // If text starts with '{', write as-is (caller provides JSON)
+      // Otherwise wrap as {"COMMAND":"text"} via ResponseCmndChar
       a = TC_POP(vm);  // buf ref
       int32_t *arr = tc_resolve_ref(vm, a);
       int32_t maxLen = tc_ref_maxlen(vm, a);
@@ -4571,15 +4934,25 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         int32_t i;
         for (i = 0; i < n && arr[i]; i++) { tmpbuf[i] = (char)(arr[i] & 0xFF); }
         tmpbuf[i] = '\0';
-        Response_P(PSTR("%s"), tmpbuf);
+        if (tmpbuf[0] == '{') {
+          Response_P(PSTR("%s"), tmpbuf);
+        } else {
+          ResponseCmndChar(tmpbuf);
+        }
       }
       break;
     }
     case SYS_RESPONSE_CMND_STR: {
       // responseCmnd("literal") — send const string as console response
+      // If text starts with '{', write as-is; otherwise wrap via ResponseCmndChar
       int32_t ci = TC_POP(vm);
       if (ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
-        Response_P(PSTR("%s"), vm->constants[ci].str.ptr);
+        const char *s = vm->constants[ci].str.ptr;
+        if (s[0] == '{') {
+          Response_P(PSTR("%s"), s);
+        } else {
+          ResponseCmndChar(s);
+        }
       }
       break;
     }
@@ -4769,6 +5142,57 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
 #else
       TC_PUSH(vm, 0);
 #endif
+      break;
+    }
+
+    // ── SML bulk copy ──────────────────────────────────
+    case SYS_SML_COPY: {
+      // smlCopy(int arr[], int count) -> int — copy SML decoder values to float array
+      int32_t count = TC_POP(vm);
+      int32_t arr_ref = TC_POP(vm);
+      int32_t copied = 0;
+#if defined(USE_SML_M) || defined(USE_SML)
+      int32_t *arr = tc_resolve_ref(vm, arr_ref);
+      if (arr) {
+        int32_t nvals = (int32_t)SML_GetVal(0);  // index 0 = count
+        if (count > nvals) count = nvals;
+        for (int32_t i = 0; i < count; i++) {
+          float fv = (float)SML_GetVal(i + 1);  // 1-based
+          uint32_t fi; memcpy(&fi, &fv, 4);
+          arr[i] = (int32_t)fi;
+          copied++;
+        }
+      }
+#endif
+      TC_PUSH(vm, copied);
+      break;
+    }
+    // ── Array fill / copy ─────────────────────────────
+    case SYS_ARRAY_FILL: {
+      // arrayFill(int arr[], int value, int count) -> void
+      int32_t count = TC_POP(vm);
+      int32_t value = TC_POP(vm);
+      int32_t arr_ref = TC_POP(vm);
+      int32_t *arr = tc_resolve_ref(vm, arr_ref);
+      if (arr) {
+        for (int32_t i = 0; i < count; i++) {
+          arr[i] = value;
+        }
+      }
+      break;
+    }
+    case SYS_ARRAY_COPY: {
+      // arrayCopy(int dst[], int src[], int count) -> void
+      int32_t count = TC_POP(vm);
+      int32_t src_ref = TC_POP(vm);
+      int32_t dst_ref = TC_POP(vm);
+      int32_t *dst = tc_resolve_ref(vm, dst_ref);
+      int32_t *src = tc_resolve_ref(vm, src_ref);
+      if (dst && src) {
+        for (int32_t i = 0; i < count; i++) {
+          dst[i] = src[i];
+        }
+      }
       break;
     }
 
@@ -4998,6 +5422,10 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
     //  17 = tasm_sunrise    (ro) sunrise minutes since midnight
     //  18 = tasm_sunset     (ro) sunset minutes since midnight
     //  19 = tasm_time       (ro) current minutes since midnight
+    //  20 = tasm_pheap      (ro) free PSRAM in bytes (ESP32 only)
+    //  21 = tasm_smlj       (rw) SML JSON output enable/disable
+    //  22 = tasm_npwr       (ro) number of power devices
+    //  23 = tasm_rule       (rw) rule1 enabled (bit 0 of Settings->rule_enabled)
     case SYS_TASM_GET: {
       a = TC_POP(vm);  // variable index
       int32_t val = 0;
@@ -5057,10 +5485,77 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
 #ifdef ESP32
         case 20: val = (int32_t)ESP.getFreePsram(); break;  // tasm_pheap
 #endif
+#ifdef USE_SML_M
+        case 21: {  // tasm_smlj
+          SML_TABLE *smlp = get_sml_table();
+          if (smlp) { val = (int32_t)smlp->SML_SetOptions(0); }
+          break;
+        }
+#endif
+        case 22: val = (int32_t)TasmotaGlobal.devices_present; break;  // tasm_npwr
+        case 23: val = bitRead(Settings->rule_enabled, 0); break;  // tasm_rule
         default: break;
       }
       TC_PUSH(vm, val);
       tasm_get_done:
+      break;
+    }
+    // ── Tasmota string info getter ─────────────────────
+    case SYS_TASM_GET_STR: {
+      // tasmInfo(sel, char buf[]) -> int strlen
+      // sel: 0=topic, 1=mac, 2=ip, 3=friendly_name, 4=device_name, 5=group_topic
+      int32_t buf_ref = TC_POP(vm);
+      int32_t sel = TC_POP(vm);
+      const char *src = "";
+      char tmp[64];
+      tmp[0] = 0;
+      switch (sel) {
+        case 0: src = TasmotaGlobal.mqtt_topic; break;
+        case 1: strlcpy(tmp, NetworkUniqueId().c_str(), sizeof(tmp)); src = tmp; break;
+        case 2: strlcpy(tmp, IPGetListeningAddressStr().c_str(), sizeof(tmp)); src = tmp; break;
+        case 3: src = SettingsText(SET_FRIENDLYNAME1); break;
+        case 4: src = SettingsText(SET_DEVICENAME); break;
+#ifdef USE_MQTT
+        case 5: src = SettingsText(SET_MQTT_GRP_TOPIC); break;
+#endif
+        case 6: strlcpy(tmp, GetResetReason().c_str(), sizeof(tmp)); src = tmp; break;
+        default: break;
+      }
+      tc_cstr_to_ref(vm, buf_ref, src);
+      TC_PUSH(vm, (int32_t)strlen(src));
+      break;
+    }
+    // ── Indexed Tasmota state getters ─────────────────────
+    case SYS_TASM_POWER: {
+      // tasmPower(index) -> int — power state of relay (0-based)
+      a = TC_POP(vm);
+      int32_t val = 0;
+      if (a >= 0 && a < (int32_t)TasmotaGlobal.devices_present) {
+        val = (TasmotaGlobal.power >> a) & 1;
+      }
+      TC_PUSH(vm, val);
+      break;
+    }
+    case SYS_TASM_SWITCH: {
+      // tasmSwitch(index) -> int — switch state (0-based, Switch1=index 0)
+      a = TC_POP(vm);
+      int32_t val = -1;
+      if (a >= 0 && a < MAX_SWITCHES) {
+        val = SwitchGetState(a);
+      }
+      TC_PUSH(vm, val);
+      break;
+    }
+    case SYS_TASM_COUNTER: {
+      // tasmCounter(index) -> int — pulse counter (0-based, Counter1=index 0)
+      a = TC_POP(vm);
+      int32_t val = 0;
+#ifdef USE_COUNTER
+      if (a >= 0 && a < MAX_COUNTERS) {
+        val = (int32_t)RtcSettings.pulse_counter[a];
+      }
+#endif
+      TC_PUSH(vm, val);
       break;
     }
     case SYS_TASM_SET: {
@@ -5084,6 +5579,20 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
             snprintf_P(cmd, sizeof(cmd), PSTR("Dimmer %d"), val);
             ExecuteCommand(cmd, SRC_IGNORE); }
 #endif
+          break;
+#ifdef USE_SML_M
+        case 21: {  // tasm_smlj
+          SML_TABLE *smlp = get_sml_table();
+          if (smlp) { smlp->SML_SetOptions(0x100 | (uint8_t)val); }
+          break;
+        }
+#endif
+        case 23:  // tasm_rule
+          if (val) {
+            bitSet(Settings->rule_enabled, 0);
+          } else {
+            bitClear(Settings->rule_enabled, 0);
+          }
           break;
         default: break;  // read-only variables silently ignored
       }
@@ -5711,9 +6220,12 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       if (url && Tinyc && hn >= 1 && hn <= TC_MAX_WEB_HANDLERS) {
         strlcpy(Tinyc->web_handler_url[hn - 1], url, sizeof(Tinyc->web_handler_url[0]));
         if (hn > Tinyc->web_handler_count) Tinyc->web_handler_count = hn;
-        // Register with Tasmota web server — URL persists in Tinyc struct
-        Webserver->on(Tinyc->web_handler_url[hn - 1], TinyCWebOnHandlers[hn - 1]);
-        AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered"), hn, url);
+        if (Webserver) {
+          Webserver->on(Tinyc->web_handler_url[hn - 1], TinyCWebOnHandlers[hn - 1]);
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered"), hn, url);
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") deferred"), hn, url);
+        }
       }
 #endif
       break;
@@ -5837,6 +6349,13 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       break;
     }
 
+    case SYS_WEB_CHART_TBASE: {
+      // WebChartTimeBase(minutes) — set time base offset from "now" for chart x-axis
+      // 0 = anchored to "now" (default), negative = past (e.g., -1440 = yesterday midnight)
+      tc_chart_time_base = TC_POP(vm);
+      break;
+    }
+
     case SYS_WEB_CHART: {
       // WebChart(type, title, unit, color, pos, count, array, decimals, interval, ymin, ymax)
 #ifdef USE_WEBSERVER
@@ -5846,8 +6365,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       int32_t decimals = TC_POP(vm);
       int32_t arr_ref  = TC_POP(vm);
       int32_t count    = TC_POP(vm);
-      int32_t pos_bits = TC_POP(vm);
-      int32_t pos      = (int32_t)i2f(pos_bits);  // pos is float (from array[0])
+      int32_t pos      = TC_POP(vm);
       int32_t color    = TC_POP(vm);
       int32_t ci_unit  = TC_POP(vm);
       int32_t ci_title = TC_POP(vm);
@@ -5860,7 +6378,9 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       const char *title = tc_get_const_str(vm, ci_title);
       const char *unit  = tc_get_const_str(vm, ci_unit);
       if (!title || !unit) break;
-      if (decimals < 0) decimals = 0;
+      // decimals bits: 0-2 = decimal places (0-6), bit 3 = smooth (curveType:'function')
+      bool smooth = (decimals & 8) != 0;
+      decimals = decimals & 7;
       if (decimals > 6) decimals = 6;
 
       // Parse "name|unit" format: name goes to legend, unit to y-axis
@@ -5898,10 +6418,10 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
           "<script>"
           "var _tcC=[];"
           "function _tcA(ci,lbl,clr,d,mn,mx,u){_tcC[ci].s.push({l:lbl,c:clr,d:d,mn:mn,mx:mx,u:u||lbl});}"
-          "function _tcN(ci,t,u,tp,mn,mx){"
+          "function _tcN(ci,t,u,tp,mn,mx,sm){"
             "var lb=null;"
             "if(tp==116){var p=t.indexOf('|');if(p>=0){lb=t.substring(p+1).split('|');t=t.substring(0,p);}}"
-            "_tcC[ci]={t:t,u:u,tp:tp,mn:mn,mx:mx,s:[],lb:lb};"
+            "_tcC[ci]={t:t,u:u,tp:tp,mn:mn,mx:mx,s:[],lb:lb,sm:sm||0};"
           "}"
           "function _tcD(){"
             "var N=new Date();"
@@ -5910,28 +6430,44 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
               "var dt=new google.visualization.DataTable();"
               "var tp=c.tp,el=document.getElementById('tc'+i);"
               "if(tp==116){"                                                               // table
-                "dt.addColumn('string',c.t||'');"
-                "for(var j=0;j<c.s.length;j++)dt.addColumn('number',c.s[j].l);"
-                "var rows=[];"
-                "if(c.s.length>0)for(var k=0;k<c.s[0].d.length;k++){"
-                  "var lb=c.lb&&c.lb[k]?c.lb[k]:''+(k+1);"
-                  "var r=[lb];"
-                  "for(var j=0;j<c.s.length;j++)r.push(c.s[j].d[k][1]);"
-                  "rows.push(r);}"
-                "dt.addRows(rows);"
-                "new google.visualization.Table(el).draw(dt,{showRowNumber:false,width:'100%%'});"
+                "if(c.lb&&c.s.length==1&&c.s[0].d.length>1){"
+                  // Transposed table: labels as column headers, one row per series
+                  "dt.addColumn('string','Tag');"
+                  "for(var k=0;k<c.s[0].d.length;k++){"
+                    "var lb=c.lb[k]||''+(k+1);"
+                    "dt.addColumn('number',lb);}"
+                  "var r=[c.s[0].l];"
+                  "for(var k=0;k<c.s[0].d.length;k++)r.push(c.s[0].d[k][1]);"
+                  "dt.addRows([r]);"
+                "}else{"
+                  // Multi-series table: series as columns, data points as rows
+                  "dt.addColumn('string',c.t||'');"
+                  "for(var j=0;j<c.s.length;j++)dt.addColumn('number',c.s[j].l);"
+                  "var rows=[];"
+                  "if(c.s.length>0)for(var k=0;k<c.s[0].d.length;k++){"
+                    "var lb=c.lb&&c.lb[k]?c.lb[k]:''+(k+1);"
+                    "var r=[lb];"
+                    "for(var j=0;j<c.s.length;j++)r.push(c.s[j].d[k][1]);"
+                    "rows.push(r);}"
+                  "dt.addRows(rows);"
+                "}"
+                "new google.visualization.Table(el).draw(dt,{showRowNumber:true,width:'100%%'});"
               "}else{"                                                                     // charts
-                "dt.addColumn('datetime','Time');"
+                "var isCol=(tp==98||tp==99||tp==1||tp==104||tp==115);"
+                "if(isCol){dt.addColumn('string','X');}else{dt.addColumn('datetime','Time');}"
                 "for(var j=0;j<c.s.length;j++)dt.addColumn('number',c.s[j].l);"
                 "var rows=[];"
                 "if(c.s.length>0)for(var k=0;k<c.s[0].d.length;k++){"
-                  "var r=[new Date(N.getTime()+c.s[0].d[k][0]*60000)];"
+                  "var m=c.s[0].d[k][0];"
+                  "var xl;"
+                  "if(isCol){if(tp==115&&c.s[0].d.length>7){xl=''+k;}else{var td=new Date(N.getTime()+m*60000);if(c.s[0].d.length==1){xl='';}else if(c.s[0].d.length<=7){xl=['So','Mo','Di','Mi','Do','Fr','Sa'][td.getDay()];}else{xl=('0'+td.getDate()).slice(-2)+'.'+('0'+(td.getMonth()+1)).slice(-2)+'.';};}}else{xl=new Date(N.getTime()+m*60000);}"
+                  "var r=[xl];"
                   "for(var j=0;j<c.s.length;j++)r.push(c.s[j].d[k][1]);"
                   "rows.push(r);}"
                 "dt.addRows(rows);"
                 "var colors=c.s.map(function(x){return x.c;});"
                 "var va={title:c.u};"
-                "if(c.mn<c.mx){va.minValue=c.mn;va.maxValue=c.mx;}"
+                "if(c.mn<c.mx){va.viewWindow={min:c.mn,max:c.mx};}"
                 "var dual=false,sr={},vx={};"
                 "vx[0]=va;"
                 "for(var j=0;j<c.s.length;j++){"
@@ -5939,18 +6475,20 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
                   "if(j>0&&(s.mn!=c.s[0].mn||s.mx!=c.s[0].mx)){"
                     "dual=true;sr[j]={targetAxisIndex:1};"
                     "var a2={title:s.u};"
-                    "if(s.mn<s.mx){a2.minValue=s.mn;a2.maxValue=s.mx;}"
+                    "if(s.mn<s.mx){a2.viewWindow={min:s.mn,max:s.mx};}"
                     "vx[1]=a2;"
                   "}else{sr[j]={targetAxisIndex:0};}"
                 "}"
-                "if(dual&&c.s[0].mn<c.s[0].mx){vx[0]={title:c.s[0].u,minValue:c.s[0].mn,maxValue:c.s[0].mx};}"
-                "var dw=c.s[0].d[0]?c.s[0].d[0][0]*60000:-86400000;"
-                "var hfmt=dw<-172800000?'EEE HH:mm':'HH:mm';"
-                "var o={title:c.t,curveType:'none',"
-                  "hAxis:{format:hfmt,viewWindow:{min:new Date(N.getTime()+dw),max:N}},"
-                  "colors:colors,"
-                  "lineWidth:1,pointSize:0,"
-                  "chartArea:{width:'75%%',height:'65%%'}};"
+                "if(dual&&c.s[0].mn<c.s[0].mx){vx[0]={title:c.s[0].u,viewWindow:{min:c.s[0].mn,max:c.s[0].mx}};}"
+                "var o={title:c.t,colors:colors,chartArea:{width:'75%%',height:'65%%'}};"
+                "if(!isCol){"
+                  "var dw=c.s[0].d[0]?c.s[0].d[0][0]*60000:-86400000;"
+                  "var dwe=c.s[0].d.length>0?c.s[0].d[c.s[0].d.length-1][0]*60000:0;"
+                  "o.curveType=c.sm?'function':'none';"
+                  "o.hAxis={format:'HH:mm',viewWindow:{min:new Date(N.getTime()+dw-900000),max:new Date(N.getTime()+dwe+900000)}};"
+                  "if((dwe-dw)>172800000){var tks=[];var nd=c.s[0].d.length;if(nd>10&&(dwe-dw)>6048e5){for(var ti=0;ti<nd;ti++){tks.push({v:new Date(N.getTime()+c.s[0].d[ti][0]*60000),f:''+ti});}o.hAxis.ticks=tks;}else{var wd=['So','Mo','Di','Mi','Do','Fr','Sa'];var ds=new Date(N.getTime()+dw);ds.setHours(0,0,0,0);ds.setDate(ds.getDate()+1);var de=new Date(N.getTime()+dwe);while(ds<=de){tks.push({v:new Date(ds),f:wd[ds.getDay()]});ds=new Date(ds.getTime()+86400000);}o.hAxis.ticks=tks;}}"
+                  "o.lineWidth=1;o.pointSize=0;"
+                "}"
                 "if(dual){o.series=sr;o.vAxes=vx;}else{o.vAxis=va;}"
                 "if(tp==98)new google.visualization.BarChart(el).draw(dt,o);"              // 'b'=98
                 "else if(tp==99||tp==1)new google.visualization.ColumnChart(el).draw(dt,o);" // 'c'=99 or legacy 1
@@ -5988,7 +6526,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         } else if (tc_chart_height > 0) {
           snprintf(div_style, sizeof(div_style), "width:100%%;height:%dpx", tc_chart_height);
         } else {
-          strcpy(div_style, "width:100%;height:300px");
+          strcpy(div_style, "width:960px;height:300px");
         }
         if (fixed_range) {
           char ymin_s[16], ymax_s[16];
@@ -5996,13 +6534,13 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
           dtostrf(ymax, 1, 1, ymax_s);
           WSContentSend_P(PSTR(
             "<div id=\"tc%d\" style=\"%s\"></div>"
-            "<script>_tcN(%d,'%s','%s',%d,%s,%s);</script>"
-          ), chart_id, div_style, chart_id, title, axis_unit, type, ymin_s, ymax_s);
+            "<script>_tcN(%d,'%s','%s',%d,%s,%s,%d);</script>"
+          ), chart_id, div_style, chart_id, title, axis_unit, type, ymin_s, ymax_s, smooth ? 1 : 0);
         } else {
           WSContentSend_P(PSTR(
             "<div id=\"tc%d\" style=\"%s\"></div>"
-            "<script>_tcN(%d,'%s','%s',%d,0,0);</script>"
-          ), chart_id, div_style, chart_id, title, axis_unit, type);
+            "<script>_tcN(%d,'%s','%s',%d,0,0,%d);</script>"
+          ), chart_id, div_style, chart_id, title, axis_unit, type, smooth ? 1 : 0);
         }
       }
 
@@ -6029,7 +6567,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         if (idx < 0) idx += count;
         float fval;
         memcpy(&fval, &arr[idx], sizeof(float));
-        int32_t mins_ago = -((count - 1 - i) * interval);
+        int32_t mins_ago = -((count - 1 - i) * interval) + tc_chart_time_base;
         char vbuf[16];
         dtostrf(fval, 1, decimals, vbuf);
         WSContentSend_P(PSTR("%s[%d,%s]"),
@@ -6118,15 +6656,16 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       break;
     }
 
-    // ── Webcam (multiplexed) ───────────────────────────
-#if defined(ESP32) && defined(USE_WEBCAM)
+    // ── Webcam — camControl(sel, p1, p2) ───────────────
     case SYS_CAM_CONTROL: {
-      // camControl(sel, p1, p2) -> int
       int32_t p2  = TC_POP(vm);
       int32_t p1  = TC_POP(vm);
       int32_t sel = TC_POP(vm);
-      int32_t res = 0;
+      int32_t res = -1;
+
       switch (sel) {
+#if defined(ESP32) && defined(USE_WEBCAM)
+        // ── Tasmota webcam wrapper (sel 0-7, requires USE_WEBCAM) ──
         case 0: res = WcSetup(p1); break;                  // init(resolution)
         case 1: res = WcGetFrame(p1); break;               // capture(bufnum) -> framesize
         case 2: res = WcSetOptions(p1, p2); break;         // options(sel, val)
@@ -6134,8 +6673,12 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
         case 4: res = WcGetHeight(); break;                // height()
         case 5: res = WcSetStreamserver(p1); break;        // stream(on/off)
         case 6: res = WcSetMotionDetect(p1); break;        // motion(param)
+#endif // USE_WEBCAM
+
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
         case 7: {
           // savePic(bufnum, filehandle) — write picture from RAM buffer to open file
+          // Uses WcGetPicstore() — bridged to tc_cam_slot when USE_TINYC_CAMERA
           uint8_t *buff;
           int32_t maxps = WcGetPicstore(-1, 0);
           int32_t bnum = p1;
@@ -6146,6 +6689,223 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
           }
           break;
         }
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
+
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+        // ── Direct esp_camera API (sel 8-13) ──
+        case 8: {
+          // getSensorPID() -> PID value (e.g. 0x3660 for OV3660)
+          sensor_t *s = esp_camera_sensor_get();
+          res = s ? (int32_t)s->id.PID : -1;
+          break;
+        }
+        case 9: {
+          // sensorSet(param, value) -> 0=ok, -1=err
+          sensor_t *s = esp_camera_sensor_get();
+          if (s) {
+            switch (p1) {
+              case 0:  res = s->set_vflip(s, p2); break;
+              case 1:  res = s->set_brightness(s, p2); break;
+              case 2:  res = s->set_saturation(s, p2); break;
+              case 3:  res = s->set_hmirror(s, p2); break;
+              case 4:  res = s->set_contrast(s, p2); break;
+              case 5:  res = s->set_framesize(s, (framesize_t)p2); break;
+              case 6:  res = s->set_quality(s, p2); break;
+              case 7:  res = s->set_sharpness(s, p2); break;
+              case 8:  res = s->set_special_effect(s, p2); break;
+              case 9:  res = s->set_whitebal(s, p2); break;
+              case 10: res = s->set_awb_gain(s, p2); break;
+              case 11: res = s->set_wb_mode(s, p2); break;
+              case 12: res = s->set_exposure_ctrl(s, p2); break;
+              case 13: res = s->set_aec2(s, p2); break;
+              case 14: res = s->set_ae_level(s, p2); break;
+              case 15: res = s->set_aec_value(s, p2); break;
+              case 16: res = s->set_gain_ctrl(s, p2); break;
+              case 17: res = s->set_agc_gain(s, p2); break;
+              case 18: res = s->set_gainceiling(s, (gainceiling_t)p2); break;
+              case 19: res = s->set_lenc(s, p2); break;
+              case 20: res = s->set_raw_gma(s, p2); break;
+              default: res = -1; break;
+            }
+          } else { res = -1; }
+          break;
+        }
+        case 10: {
+          // capture(slot) -> size in bytes — capture to PSRAM slot (1-based), returns size
+          int32_t slot = p1;
+          if (slot < 1 || slot > TC_CAM_MAX_SLOTS) { res = -1; break; }
+          slot--;  // 0-based internally
+#ifdef ESP32
+          // esp_camera_fb_get() blocks — must only run from VM task thread
+          // If task_handle is NULL (task exited) or we're on a different thread, skip
+          if (!tc_current_slot || !tc_current_slot->task_handle ||
+              xTaskGetCurrentTaskHandle() != tc_current_slot->task_handle) {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: capture SKIPPED — wrong thread (slot=%d, task=%p, cur=%p)"),
+              slot + 1, tc_current_slot ? tc_current_slot->task_handle : nullptr, xTaskGetCurrentTaskHandle());
+            res = 0; break;  // skip — use TaskLoop for camera captures
+          }
+#endif
+          camera_fb_t *fb = esp_camera_fb_get();
+          if (!fb) {
+            AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: cam fb_get timeout (slot %d)"), slot + 1);
+            res = 0; break;
+          }
+          // (Re)allocate PSRAM slot if needed
+          if (tc_cam_slot[slot].buf && tc_cam_slot[slot].len < fb->len) {
+            free(tc_cam_slot[slot].buf);
+            tc_cam_slot[slot].buf = nullptr;
+          }
+          if (!tc_cam_slot[slot].buf) {
+            tc_cam_slot[slot].buf = (uint8_t*)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          }
+          if (tc_cam_slot[slot].buf) {
+            tc_cam_slot[slot].writing = 1;
+            memcpy(tc_cam_slot[slot].buf, fb->buf, fb->len);
+            tc_cam_slot[slot].len = fb->len;
+            tc_cam_slot[slot].width = fb->width;
+            tc_cam_slot[slot].height = fb->height;
+            tc_cam_slot[slot].writing = 0;
+            res = (int32_t)fb->len;
+          } else {
+            tc_cam_slot[slot].len = 0;
+            res = -1;
+            AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cam slot %d PSRAM alloc failed (%d bytes)"), slot + 1, fb->len);
+          }
+          esp_camera_fb_return(fb);  // return camera fb immediately
+          break;
+        }
+        case 11: {
+          // saveSlot(slot, filehandle) -> bytes written — save PSRAM slot to file
+          int32_t slot = p1;
+          if (slot < 1 || slot > TC_CAM_MAX_SLOTS) { res = -1; break; }
+          slot--;
+          if (tc_cam_slot[slot].buf && tc_cam_slot[slot].len > 0 &&
+              p2 >= 0 && p2 < TC_MAX_FILE_HANDLES && Tinyc->file_used[p2]) {
+            res = tc_file_handles[p2].write(tc_cam_slot[slot].buf, tc_cam_slot[slot].len);
+          } else { res = -1; }
+          break;
+        }
+        case 12: {
+          // freeSlot(slot) — free PSRAM slot (0 = free all)
+          if (p1 == 0) {
+            for (int i = 0; i < TC_CAM_MAX_SLOTS; i++) {
+              if (tc_cam_slot[i].buf) { free(tc_cam_slot[i].buf); tc_cam_slot[i].buf = nullptr; }
+              tc_cam_slot[i].len = 0;
+            }
+          } else if (p1 >= 1 && p1 <= TC_CAM_MAX_SLOTS) {
+            int i = p1 - 1;
+            if (tc_cam_slot[i].buf) { free(tc_cam_slot[i].buf); tc_cam_slot[i].buf = nullptr; }
+            tc_cam_slot[i].len = 0;
+          }
+          res = 0;
+          break;
+        }
+        case 13: {
+          // deinit() -> 0=ok — deinit camera + free all slots + stop stream + free motion
+          for (int i = 0; i < TC_CAM_MAX_SLOTS; i++) {
+            if (tc_cam_slot[i].buf) { free(tc_cam_slot[i].buf); tc_cam_slot[i].buf = nullptr; }
+            tc_cam_slot[i].len = 0;
+            tc_cam_slot[i].width = 0;
+            tc_cam_slot[i].height = 0;
+          }
+          // Stop stream server
+          if (tc_cam_stream.server) {
+            tc_cam_stream.stream_active = 0;
+            tc_cam_stream.server->stop();
+            delete tc_cam_stream.server;
+            tc_cam_stream.server = nullptr;
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server stopped"));
+          }
+          // Free motion buffers
+          if (tc_cam_motion.ref_buf) { free(tc_cam_motion.ref_buf); tc_cam_motion.ref_buf = nullptr; }
+          tc_cam_motion.ref_size = 0;
+          tc_cam_motion.interval_ms = 0;
+          tc_cam_motion.triggered = 0;
+          // Note: NOT calling esp_camera_deinit() here — OV3660 doesn't recover
+          // from deinit without power cycle. Camera stays initialized for reuse.
+          // cameraInit() will deinit+reinit if called again (via tc_cam_inited flag).
+          res = 0;
+          break;
+        }
+        case 14: {
+          // slotSize(slot) -> size in bytes (0 if empty)
+          int32_t slot = p1;
+          if (slot >= 1 && slot <= TC_CAM_MAX_SLOTS) {
+            res = (int32_t)tc_cam_slot[slot - 1].len;
+          } else { res = -1; }
+          break;
+        }
+        case 15: {
+          // streamControl(on_off) — start/stop MJPEG stream server on port 81
+          // Actual server creation is in xdrv_124_tinyc.ino (TC_CamStreamInit/Stop)
+          // This case just signals the request; the functions are called externally
+          extern void TC_CamStreamInit(void);
+          extern void TC_CamStreamStop(void);
+          if (p1) {
+            TC_CamStreamInit();
+          } else {
+            TC_CamStreamStop();
+          }
+          res = 0;
+          break;
+        }
+        case 16: {
+          // motionControl(interval_ms, threshold) — enable/disable motion detection
+          tc_cam_motion.interval_ms = (uint16_t)p1;
+          tc_cam_motion.threshold = (uint32_t)p2;
+          tc_cam_motion.last_time = millis();
+          if (p1 == 0) {
+            // Disable — free reference buffer
+            if (tc_cam_motion.ref_buf) { free(tc_cam_motion.ref_buf); tc_cam_motion.ref_buf = nullptr; }
+            tc_cam_motion.ref_size = 0;
+            tc_cam_motion.triggered = 0;
+          }
+          res = 0;
+          break;
+        }
+        case 17: {
+          // getMotionValue(sel) — read motion detection results
+          switch (p1) {
+            case 0: res = (int32_t)tc_cam_motion.motion_trigger; break;
+            case 1: res = (int32_t)tc_cam_motion.motion_brightness; break;
+            case 2: res = (int32_t)tc_cam_motion.triggered; break;
+            case 3: res = (int32_t)tc_cam_motion.interval_ms; break;
+            default: res = -1; break;
+          }
+          break;
+        }
+        case 18: {
+          // motionFree() — free motion reference buffer
+          if (tc_cam_motion.ref_buf) { free(tc_cam_motion.ref_buf); tc_cam_motion.ref_buf = nullptr; }
+          tc_cam_motion.ref_size = 0;
+          tc_cam_motion.interval_ms = 0;
+          tc_cam_motion.triggered = 0;
+          tc_cam_motion.motion_trigger = 0;
+          tc_cam_motion.motion_brightness = 0;
+          res = 0;
+          break;
+        }
+        case 19: {
+          // readSensorReg(addr, mask, 0) — read sensor register
+          // p1=register address (e.g. 0x3820), p2=mask (0xff for full byte)
+          sensor_t *s19 = esp_camera_sensor_get();
+          if (s19) {
+            res = s19->get_reg(s19, p1, p2 ? p2 : 0xff);
+          } else { res = -1; }
+          break;
+        }
+        case 20: {
+          // writeSensorReg(addr, val, mask) — write sensor register
+          // p1=register address, p2=value, p3 used as mask (passed via sel hack)
+          // Usage from TinyC: camControl(20, addr, value)
+          // writes full byte (mask=0xff)
+          sensor_t *s20 = esp_camera_sensor_get();
+          if (s20) {
+            res = s20->set_reg(s20, p1, 0xff, p2);
+          } else { res = -1; }
+          break;
+        }
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
         default:
           AddLog(LOG_LEVEL_ERROR, PSTR("TCC: camControl unknown sel=%d"), sel);
           res = -1;
@@ -6154,18 +6914,295 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       TC_PUSH(vm, res);
       break;
     }
+
+    // ── Hardware register peek/poke ─────────────────────
+    case SYS_PEEK_REG: {
+      // peekReg(addr) -> int — read 32-bit from memory-mapped address
+      uint32_t addr = (uint32_t)TC_POP(vm);
+      // Safety: only allow peripheral address ranges (0x3FF00000-0x3FFFFFFF, 0x60000000-0x600FFFFF)
+      int32_t val = 0;
+      if ((addr >= 0x3FF00000 && addr <= 0x3FFFFFFF) || (addr >= 0x60000000 && addr <= 0x600FFFFF)) {
+        val = *(volatile uint32_t*)addr;
+      } else {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: peekReg invalid addr 0x%08x"), addr);
+        val = -1;
+      }
+      TC_PUSH(vm, val);
+      break;
+    }
+    case SYS_POKE_REG: {
+      // pokeReg(addr, val) -> void — write 32-bit to memory-mapped address
+      int32_t val  = TC_POP(vm);
+      uint32_t addr = (uint32_t)TC_POP(vm);
+      if ((addr >= 0x3FF00000 && addr <= 0x3FFFFFFF) || (addr >= 0x60000000 && addr <= 0x600FFFFF)) {
+        *(volatile uint32_t*)addr = (uint32_t)val;
+      } else {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: pokeReg invalid addr 0x%08x"), addr);
+      }
+      break;
+    }
+
+    // ── Camera init with custom pins ─────────────────────
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+    case SYS_CAM_INIT_PINS: {
+      // cameraInit(pins[], format, framesize, quality, xclk_freq, fb_count, grab_mode, fb_loc) -> int
+      // xclk_freq: Hz (0 = 20MHz default)
+      // fb_count:  0 = auto (1 no PSRAM, 2 with PSRAM), >0 = explicit
+      // grab_mode: -1 = auto, 0 = GRAB_WHEN_EMPTY, 1 = GRAB_LATEST
+      // fb_loc:    0 = auto (PSRAM if available), 1 = force DRAM
+      int32_t fb_loc_arg    = TC_POP(vm);
+      int32_t grab_mode_arg = TC_POP(vm);
+      int32_t fb_count_arg  = TC_POP(vm);
+      int32_t xclk_arg      = TC_POP(vm);
+      int32_t quality   = TC_POP(vm);
+      int32_t framesize = TC_POP(vm);
+      int32_t format    = TC_POP(vm);
+      int32_t pins_ref  = TC_POP(vm);
+      int32_t *pins = tc_resolve_ref(vm, pins_ref);
+
+      camera_config_t config = {};
+      config.pin_pwdn     = pins[0];
+      config.pin_reset    = pins[1];
+      config.pin_xclk     = pins[2];
+      config.pin_sccb_sda = pins[3];
+      config.pin_sccb_scl = pins[4];
+
+      // Share I2C bus 2 if Tasmota already initialized it (other sensors on same bus)
+      if (TasmotaGlobal.i2c_enabled[1]) {
+        config.sccb_i2c_port = 1;           // reuse Wire1
+        config.pin_sccb_sda  = -1;          // tell esp_camera to NOT install its own I2C driver
+        config.pin_sccb_scl  = -1;
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: sharing I2C bus 2 for SCCB"));
+      }
+
+      config.pin_d7       = pins[5];
+      config.pin_d6       = pins[6];
+      config.pin_d5       = pins[7];
+      config.pin_d4       = pins[8];
+      config.pin_d3       = pins[9];
+      config.pin_d2       = pins[10];
+      config.pin_d1       = pins[11];
+      config.pin_d0       = pins[12];
+      config.pin_vsync    = pins[13];
+      config.pin_href     = pins[14];
+      config.pin_pclk     = pins[15];
+
+      config.xclk_freq_hz  = (xclk_arg > 0) ? xclk_arg : 20000000;
+      // Use high LEDC channel/timer to avoid conflict with Tasmota PWM (which uses TIMER_0/CHANNEL_0)
+      config.ledc_channel   = LEDC_CHANNEL_4;
+      config.ledc_timer     = LEDC_TIMER_2;
+      config.pixel_format   = (pixformat_t)format;
+      config.frame_size     = (framesize_t)framesize;
+      config.jpeg_quality   = quality;
+      // fb_location: 0=auto, 1=force DRAM
+      bool use_psram = psramFound() && (fb_loc_arg != 1);
+      config.fb_location = use_psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+
+      // fb_count: 0=auto, >0=explicit
+      if (fb_count_arg > 0) {
+        config.fb_count = fb_count_arg;
+      } else if (use_psram) {
+        config.fb_count = 2;
+      } else {
+        config.fb_count = 1;
+      }
+
+      // grab_mode: -1=auto, 0=WHEN_EMPTY, 1=LATEST
+      // GRAB_LATEST keeps camera continuously capturing — queue always has fresh frame.
+      // GRAB_WHEN_EMPTY stops camera when queue is full, causing GDMA freeze issues on ESP32-S3.
+      if (grab_mode_arg >= 0) {
+        config.grab_mode = (camera_grab_mode_t)grab_mode_arg;
+      } else {
+        config.grab_mode = CAMERA_GRAB_LATEST;
+      }
+
+      if (!use_psram && config.frame_size > FRAMESIZE_SVGA) {
+        config.frame_size = FRAMESIZE_SVGA;
+      }
+
+      static bool tc_cam_inited = false;
+      if (tc_cam_inited) {
+        esp_camera_deinit();
+        delay(100);
+      }
+
+      esp_err_t err = esp_camera_init(&config);
+      if (err == ESP_OK) tc_cam_inited = true;
+      int32_t res = (err == ESP_OK) ? 0 : -1;
+      if (err != ESP_OK) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cameraInit failed 0x%x"), err);
+      } else {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: camera initialized fmt=%d fs=%d q=%d xclk=%d fb=%d grab=%d loc=%d"),
+          format, framesize, quality, config.xclk_freq_hz, config.fb_count, config.grab_mode, config.fb_location);
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) {
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: sensor PID=0x%x"), s->id.PID);
+          if (s->id.PID == OV3660_PID) {
+            s->set_vflip(s, 1);
+            s->set_brightness(s, 1);
+            s->set_saturation(s, -2);
+            // Enable 50/60Hz banding filter to eliminate light flicker stripes
+            // Register 0x3a00 bit 2 = banding filter enable (exposed as "aec2" / "Night Mode" in demo UI)
+            // Default init leaves this OFF (0x3a = 0011_1010, bit 2 = 0)
+            // Band width steps (0x3a08-0b) and max bands (0x3a0d-0e) are already configured by sensor init
+            s->set_aec2(s, 1);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: OV3660 banding filter enabled (aec2=1)"));
+            // Dump banding/AEC registers for diagnostics
+            uint8_t r3a00 = s->get_reg(s, 0x3a00, 0xff);  // AEC ctrl: bit2=banding enable
+            uint8_t r3c00 = s->get_reg(s, 0x3c00, 0xff);  // banding filter ctrl (50/60Hz)
+            uint8_t r3c01 = s->get_reg(s, 0x3c01, 0xff);  // banding auto-detect
+            uint8_t r3a09 = s->get_reg(s, 0x3a09, 0xff);  // 50Hz band step L
+            uint8_t r3a0b = s->get_reg(s, 0x3a0b, 0xff);  // 60Hz band step L
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: banding r3a00=%02x r3c00=%02x r3c01=%02x step50=%02x step60=%02x"),
+              r3a00, r3c00, r3c01, r3a09, r3a0b);
+            // Dump key timing/PLL registers
+            uint8_t r3820 = s->get_reg(s, 0x3820, 0xff);  // TIMING_TC_REG20 (vflip/binning)
+            uint8_t r3821 = s->get_reg(s, 0x3821, 0xff);  // TIMING_TC_REG21 (hmirror/compress)
+            uint8_t r3814 = s->get_reg(s, 0x3814, 0xff);  // X_INCREMENT
+            uint8_t r3815 = s->get_reg(s, 0x3815, 0xff);  // Y_INCREMENT
+            uint8_t pll1 = s->get_reg(s, 0x303b, 0xff);   // SC_PLLS_CTRL1 (multiplier)
+            uint8_t pll3 = s->get_reg(s, 0x303d, 0xff);   // SC_PLLS_CTRL3 (pre_div/root2x/seld5)
+            uint8_t pclk = s->get_reg(s, 0x3824, 0xff);   // PCLK_RATIO
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: OV3660 r3820=%02x r3821=%02x xinc=%02x yinc=%02x pll_mult=%02x pll_prediv=%02x pclk=%02x"),
+              r3820, r3821, r3814, r3815, pll1, pll3, pclk);
+          }
+        }
+      }
+      TC_PUSH(vm, res);
+      break;
+    }
 #else
-    case SYS_CAM_CONTROL: {
-      TC_POP(vm); TC_POP(vm); TC_POP(vm);
+    case SYS_CAM_INIT_PINS: {
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm);
       TC_PUSH(vm, -1);
       break;
     }
-#endif
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
+
+    // ── Image store for dspLoadImage / dspPushImageRect ──
+#if defined(USE_DISPLAY) && defined(ESP32) && defined(JPEG_PICTS)
+    case SYS_DSP_LOAD_IMG: {
+      // dspLoadImage("file.jpg") -> slot (0-3, -1 on error)
+      int32_t ci = TC_POP(vm);
+      int32_t result = -1;
+      if (!renderer) { TC_PUSH(vm, -1); break; }
+      const char *fname = tc_get_const_str(vm, ci);
+      if (!fname) { TC_PUSH(vm, -1); break; }
+      // find free slot
+      int slot = -1;
+      for (int i = 0; i < TC_IMG_SLOTS; i++) {
+        if (!tc_img_store[i].buf) { slot = i; break; }
+      }
+      if (slot < 0) { TC_PUSH(vm, -1); break; }
+      // load file
+      File fp = ufsp->open(fname, FS_FILE_READ);
+      if (!fp) { TC_PUSH(vm, -1); break; }
+      uint32_t size = fp.size();
+      uint8_t *mem = (uint8_t *)special_malloc(size + 4);
+      if (!mem) { fp.close(); TC_PUSH(vm, -1); break; }
+      fp.read(mem, size);
+      fp.close();
+      if (mem[0] != 0xff || mem[1] != 0xd8) {
+        // not a JPEG
+        free(mem); TC_PUSH(vm, -1); break;
+      }
+      uint16_t xsize, ysize;
+      get_jpeg_size(mem, size, &xsize, &ysize);
+      if (!xsize || !ysize) { free(mem); TC_PUSH(vm, -1); break; }
+      uint32_t outsize = xsize * ysize * 2;
+      uint16_t *out_buf = (uint16_t *)special_malloc(outsize + 4);
+      if (!out_buf) { free(mem); TC_PUSH(vm, -1); break; }
+      esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = mem,
+        .indata_size = size,
+        .outbuf = (uint8_t*)out_buf,
+        .outbuf_size = outsize,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = { .swap_color_bytes = 0 }
+      };
+      esp_jpeg_image_output_t outimg;
+      esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &outimg);
+      free(mem);
+      if (err != ESP_OK) { free(out_buf); TC_PUSH(vm, -1); break; }
+      tc_img_store[slot].buf = out_buf;
+      tc_img_store[slot].w = xsize;
+      tc_img_store[slot].h = ysize;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: img slot %d loaded %dx%d (%d KB)"),
+             slot, xsize, ysize, outsize / 1024);
+      TC_PUSH(vm, slot);
+      break;
+    }
+    case SYS_DSP_IMG_RECT: {
+      // dspPushImageRect(slot, sx, sy, dx, dy, w, h)
+      int32_t h  = TC_POP(vm);
+      int32_t w  = TC_POP(vm);
+      int32_t dy = TC_POP(vm);
+      int32_t dx = TC_POP(vm);
+      int32_t sy = TC_POP(vm);
+      int32_t sx = TC_POP(vm);
+      int32_t slot = TC_POP(vm);
+      if (!renderer) break;
+      if (slot < 0 || slot >= TC_IMG_SLOTS) break;
+      if (!tc_img_store[slot].buf) break;
+      uint16_t *img = tc_img_store[slot].buf;
+      uint16_t img_w = tc_img_store[slot].w;
+      uint16_t img_h = tc_img_store[slot].h;
+      // clamp to image bounds
+      if (sx < 0) sx = 0;
+      if (sy < 0) sy = 0;
+      if (sx + w > img_w) w = img_w - sx;
+      if (sy + h > img_h) h = img_h - sy;
+      if (w <= 0 || h <= 0) break;
+      // push row by row from image buffer to screen
+      for (int row = 0; row < h; row++) {
+        renderer->setAddrWindow(dx, dy + row, dx + w, dy + row + 1);
+        renderer->pushColors(&img[(sy + row) * img_w + sx], w, true);
+      }
+      renderer->setAddrWindow(0, 0, 0, 0);
+      break;
+    }
+    case SYS_DSP_IMG_WIDTH: {
+      int32_t slot = TC_POP(vm);
+      if (slot >= 0 && slot < TC_IMG_SLOTS && tc_img_store[slot].buf) {
+        TC_PUSH(vm, tc_img_store[slot].w);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+      break;
+    }
+    case SYS_DSP_IMG_HEIGHT: {
+      int32_t slot = TC_POP(vm);
+      if (slot >= 0 && slot < TC_IMG_SLOTS && tc_img_store[slot].buf) {
+        TC_PUSH(vm, tc_img_store[slot].h);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+      break;
+    }
+#else
+    case SYS_DSP_LOAD_IMG: {
+      TC_POP(vm); // filename
+      TC_PUSH(vm, -1); // not available
+      break;
+    }
+    case SYS_DSP_IMG_RECT: {
+      for (int i = 0; i < 7; i++) TC_POP(vm); // consume args
+      break;
+    }
+    case SYS_DSP_IMG_WIDTH:
+    case SYS_DSP_IMG_HEIGHT: {
+      TC_POP(vm); // slot
+      TC_PUSH(vm, 0);
+      break;
+    }
+#endif // USE_DISPLAY && ESP32 && JPEG_PICTS
 
     // ── Display drawing (direct renderer calls) ──────
 #ifdef USE_DISPLAY
     case SYS_DSP_TEXT: {
       int32_t ref = TC_POP(vm);
+      if (!renderer) break;  // display not yet initialized
       char tbuf[256];
       tc_ref_to_cstr(vm, ref, tbuf, sizeof(tbuf));
       char *savptr = XdrvMailbox.data;
@@ -6210,6 +7247,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
     }
     case SYS_DSP_DRAW: {
       int32_t ref = TC_POP(vm);
+      if (!renderer) break;
       char tbuf[128];
       tc_ref_to_cstr(vm, ref, tbuf, sizeof(tbuf));
       tc_display_text_padded(tbuf);
@@ -6300,7 +7338,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
     }
     case SYS_DSP_ONOFF: {
       int32_t on = TC_POP(vm);
-      DisplayOnOff(on);
+      if (renderer) DisplayOnOff(on);
       break;
     }
     case SYS_DSP_UPDATE:
@@ -6309,6 +7347,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
     case SYS_DSP_PICTURE: {
       int32_t scale = TC_POP(vm);
       int32_t ci = TC_POP(vm);
+      if (!renderer) break;
       const char *fname = tc_get_const_str(vm, ci);
       if (fname) {
         Draw_RGB_Bitmap((char*)fname, disp_xpos, disp_ypos, (uint8_t)scale, false, 0, 0);
@@ -6323,6 +7362,7 @@ static int tc_syscall(TcVM *vm, uint8_t id) {
       break;
     case SYS_DSP_TEXT_STR: {
       int32_t ci = TC_POP(vm);
+      if (!renderer) break;
       const char *cmd = tc_get_const_str(vm, ci);
       if (cmd) {
         char tbuf[256];
@@ -7707,11 +8747,14 @@ static int tc_vm_call_callback(TcVM *vm, const char *name) {
     if (err != TC_OK) {
       vm->error = err;
       AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Callback error %d at PC=%u"), err, vm->pc);
+      tc_crash_log(err, vm->pc, vm->instruction_count, name);
       break;
     }
     vm->instruction_count++;
     if (++count > TC_CALLBACK_MAX_INSTR) {
       vm->error = TC_ERR_INSTRUCTION_LIMIT;
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Instruction limit in '%s' at PC=%u (%u instr)"), name, vm->pc, count);
+      tc_crash_log(TC_ERR_INSTRUCTION_LIMIT, vm->pc, count, name);
       break;
     }
   }
@@ -8017,6 +9060,10 @@ static int tc_vm_step(TcVM *vm) {
     case OP_SYSCALL:
       idx = tc_read_u8(vm);
       return tc_syscall(vm, idx);
+    case OP_SYSCALL2: {
+      uint16_t idx2 = tc_read_u16(vm);
+      return tc_syscall(vm, idx2);
+    }
 
     default:
       vm->error = TC_ERR_BAD_OPCODE;
@@ -8480,6 +9527,7 @@ static void tc_vm_task(void *param) {
         vm->error = err;
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Runtime error %d at PC=%u after %u instr"),
           err, vm->pc, vm->instruction_count);
+        tc_crash_log(err, vm->pc, vm->instruction_count, "main");
         break;
       }
       count++;
@@ -8550,11 +9598,22 @@ static void tc_vm_task(void *param) {
               if (err != TC_OK) {
                 vm->error = err;
                 AddLog(LOG_LEVEL_ERROR, PSTR("TCC: TaskLoop error %d at PC=%u"), err, vm->pc);
+                tc_crash_log(err, vm->pc, vm->instruction_count, "TaskLoop");
                 break;
               }
-              if (++count > TC_CALLBACK_MAX_INSTR) {
-                vm->error = TC_ERR_INSTRUCTION_LIMIT;
-                break;
+              count++;
+              vm->instruction_count++;
+              // Yield periodically to feed WDT (no instruction limit in TaskLoop)
+              if ((count & 0xFFFF) == 0) {
+                vm->halted = true;
+                vm->running = false;
+                if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+                vTaskDelay(1);
+                if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+                tc_current_slot = slot;
+                vm->halted = false;
+                vm->running = true;
+                if (slot->task_stop) break;
               }
             }
 
@@ -8693,6 +9752,7 @@ static void TinyCStopVM(TcSlot *s) {
   }
   tc_spi_cleanup();
   tc_serial_close();
+  tc_img_store_free();
   // Free OneWire bus
   if (s->vm.ow_bus) { delete s->vm.ow_bus; s->vm.ow_bus = nullptr; s->vm.ow_pin = -1; }
   // Free HTTP header arrays
@@ -8768,10 +9828,10 @@ static bool TinyCStartVM(TcSlot *s) {
 
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2)
   // Single-core variants -- no core affinity
-  BaseType_t ret = xTaskCreate(tc_vm_task, taskname, 8192, s, 1, &s->task_handle);
+  BaseType_t ret = xTaskCreate(tc_vm_task, taskname, TC_VM_TASK_STACK, s, 1, &s->task_handle);
 #else
   // Dual-core ESP32/S3 -- pin to core 1
-  BaseType_t ret = xTaskCreatePinnedToCore(tc_vm_task, taskname, 8192, s, 1, &s->task_handle, 1);
+  BaseType_t ret = xTaskCreatePinnedToCore(tc_vm_task, taskname, TC_VM_TASK_STACK, s, 1, &s->task_handle, 1);
 #endif
   if (ret != pdPASS) {
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Failed to create task for %s"), s->filename);

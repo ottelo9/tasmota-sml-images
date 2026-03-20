@@ -1,7 +1,10 @@
 // Read analog sensor and display via serial
 #define SENSOR_PIN 34
 #define LED_PIN 2
-#define OUTPUT 1
+#define INPUT         0x01
+#define OUTPUT        0x03
+#define INPUT_PULLUP  0x05
+#define INPUT_PULLDOWN 0x09
 #define THRESHOLD 2000
 
 int main() {

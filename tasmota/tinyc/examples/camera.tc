@@ -1,0 +1,303 @@
+// ═══════════════════════════════════════════════════════════════════
+// ESP32 Camera — TinyC direct esp_camera driver
+// Supports multiple boards via compile-time #define
+// Compile: node compile_cli.js camera.tc camera.tcb -DBOARD_DFROBOT
+//      or: node compile_cli.js camera.tc camera.tcb -DBOARD_GOOUUU
+//      or: node compile_cli.js camera.tc camera.tcb -DBOARD_AITHINKER
+// Live view: http://<device-ip>/cam  (MJPEG stream from port 81)
+// ═══════════════════════════════════════════════════════════════════
+// @defines: -DBOARD_DFROBOT
+
+// ─── Camera pixel formats ───
+#define PIXFORMAT_RGB565    0
+#define PIXFORMAT_YUV422    1
+#define PIXFORMAT_YUV420    2
+#define PIXFORMAT_GRAYSCALE 3
+#define PIXFORMAT_JPEG      4
+#define PIXFORMAT_RGB888    5
+
+// ─── Frame sizes ───
+#define FRAMESIZE_96X96     0
+#define FRAMESIZE_QQVGA     1
+#define FRAMESIZE_QCIF      2
+#define FRAMESIZE_HQVGA     3
+#define FRAMESIZE_240X240   4
+#define FRAMESIZE_QVGA      5
+#define FRAMESIZE_CIF       6
+#define FRAMESIZE_HVGA      7
+#define FRAMESIZE_VGA       8
+#define FRAMESIZE_SVGA      9
+#define FRAMESIZE_XGA       10
+#define FRAMESIZE_HD        11
+#define FRAMESIZE_SXGA      12
+#define FRAMESIZE_UXGA      13
+
+// ─── Sensor parameter IDs (for camControl sel=9) ───
+#define CAM_VFLIP           0
+#define CAM_BRIGHTNESS      1
+#define CAM_SATURATION      2
+#define CAM_HMIRROR         3
+#define CAM_CONTRAST        4
+#define CAM_FRAMESIZE       5
+#define CAM_QUALITY         6
+#define CAM_SHARPNESS       7
+#define CAM_SPECIAL_EFFECT  8
+#define CAM_WHITEBAL        9
+#define CAM_AWB_GAIN        10
+#define CAM_WB_MODE         11
+#define CAM_EXPOSURE_CTRL   12
+#define CAM_AEC2            13
+#define CAM_AE_LEVEL        14
+#define CAM_AEC_VALUE       15
+#define CAM_GAIN_CTRL       16
+#define CAM_AGC_GAIN        17
+#define CAM_GAINCEILING     18
+#define CAM_LENC            19
+#define CAM_RAW_GMA         20
+
+// ─── Known sensor PIDs ───
+#define OV2640_PID          0x2642
+#define OV3660_PID          0x3660
+#define OV5640_PID          0x5640
+
+// ═══════════════════════════════════════════════════════════════════
+// Board-specific pin definitions
+// Order: pwdn, reset, xclk, sda, scl, d7, d6, d5, d4, d3, d2, d1, d0, vsync, href, pclk
+// ═══════════════════════════════════════════════════════════════════
+#ifdef BOARD_DFROBOT
+// DFRobot Firebeetle 2 ESP32-S3 (OV3660)
+int campins[] = {-1, -1, 5, 8, 9, 4, 6, 7, 14, 17, 21, 18, 16, 1, 2, 15};
+#endif
+
+#ifdef BOARD_GOOUUU
+// Goouuu ESP32-S3-CAM / ESP32S3_EYE (OV2640)
+int campins[] = {-1, -1, 15, 4, 5, 16, 17, 18, 12, 10, 8, 9, 11, 6, 7, 13};
+#endif
+
+#ifdef BOARD_AITHINKER
+// AI-Thinker ESP32-CAM (OV2640), flash LED on GPIO4
+int campins[] = {32, -1, 0, 26, 27, 35, 34, 39, 36, 21, 19, 18, 5, 25, 23, 22};
+#endif
+
+int pic_count;
+int frame_count;
+int cam_ok;
+int last_size;
+int motion_val;
+int motion_detect;
+char buf[128];
+char path[64];
+
+// ═══════════════════════════════════════════════════════════════════
+// Initialize camera with board-specific pins
+// cameraInit(pins[], format, framesize, quality, xclk_freq, fb_count, grab_mode, fb_loc)
+//   xclk_freq: Hz (0 = 20MHz default)
+//   fb_count:  0 = auto (1 no PSRAM, 2 with PSRAM), >0 = explicit
+//   grab_mode: -1 = auto, 0 = GRAB_WHEN_EMPTY, 1 = GRAB_LATEST
+//   fb_loc:    -1 = auto (PSRAM if available), 1 = force DRAM
+// ═══════════════════════════════════════════════════════════════════
+int initCamera() {
+    int ok;
+
+    ok = cameraInit(campins, PIXFORMAT_JPEG, FRAMESIZE_VGA, 12, 0, 0, -1, -1);
+    if (ok != 0) {
+        print(ok);
+        addLog("TCC: camera init FAILED");
+        return -1;
+    }
+    addLog("TCC: camera initialized OK");
+
+    int pid = camControl(8, 0, 0);
+    sprintfInt(buf, "TCC: sensor PID = 0x%x", pid);
+    addLog(buf);
+
+    if (pid == OV3660_PID) {
+        camControl(9, CAM_VFLIP, 1);
+        camControl(9, CAM_BRIGHTNESS, 1);
+        camControl(9, CAM_SATURATION, -2);
+        addLog("TCC: OV3660 settings applied");
+    }
+
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Capture to PSRAM slot 1 (for live view via /tc_cam endpoint)
+// ═══════════════════════════════════════════════════════════════════
+int captureToSlot() {
+    int size;
+    size = camControl(10, 1, 0);
+    if (size <= 0) {
+        return -1;
+    }
+    frame_count = frame_count + 1;
+    return size;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Capture to PSRAM slot 2 and save as numbered picture file
+// ═══════════════════════════════════════════════════════════════════
+int takePicture() {
+    int size;
+    int fh;
+    int written;
+
+    size = camControl(10, 2, 0);
+    if (size <= 0) {
+        addLog("TCC: capture failed");
+        return -1;
+    }
+
+    pic_count = pic_count + 1;
+    sprintfInt(path, "/pic_%03d.jpg", pic_count);
+
+    fh = fileOpen(path, 1);
+    if (fh < 0) {
+        return -1;
+    }
+
+    written = camControl(11, 2, fh);
+    fileClose(fh);
+
+    sprintfInt(buf, "TCC: saved %d bytes to ", written);
+    sprintfAppendStr(buf, "%s", path);
+    addLog(buf);
+
+    return written;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Custom web handler: /cam — MJPEG stream page
+// ═══════════════════════════════════════════════════════════════════
+void WebOn() {
+    int h;
+    h = webHandler();
+    if (h == 1) {
+        webSend("<html><head><title>TinyC Camera</title>");
+        webSend("<style>body{background:#000;margin:0;text-align:center}");
+        webSend("img{max-width:100%;height:auto;margin-top:20px}</style></head>");
+        webSend("<body><h2 style='color:#0ff'>TinyC Camera Live View</h2>");
+        webSend("<img id='img'/>");
+        webSend("<p style='color:#888;font-size:12px'>");
+        webSend("<a id='snap' href='#' style='color:#0ff'>Snapshot</a>");
+        webSend(" | <a id='strm' href='#' style='color:#0ff'>Direct stream</a></p>");
+        webSend("<script>var h=location.hostname,img=document.getElementById('img');");
+        webSend("document.getElementById('snap').href='/tc_cam?slot=1';");
+        webSend("document.getElementById('strm').href='http://'+h+':81/cam.mjpeg';");
+        webSend("if(/^((?!chrome|android).)*safari/i.test(navigator.userAgent)){");
+        webSend("setInterval(function(){img.src='/tc_cam?slot=1&t='+Date.now()},200)");
+        webSend("}else{img.src='http://'+h+':81/cam.mjpeg'}</script>");
+        webSend("</body></html>");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WebUI — control panel on Tasmota main page
+// ═══════════════════════════════════════════════════════════════════
+int doCapture;
+int doHiRes;
+
+void WebUI() {
+    webButton(doCapture, "Take Picture");
+    webButton(doHiRes, "Hi-Res Capture");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WebCall — show status on Tasmota main page
+// ═══════════════════════════════════════════════════════════════════
+void WebCall() {
+    webSend("{s}<b style='color:cyan'>Camera</b>{m}{e}");
+    sprintfInt(buf, "{s}Frames{m}%d{e}", frame_count);
+    webSend(buf);
+    sprintfInt(buf, "{s}Motion{m}%d{e}", motion_val);
+    webSend(buf);
+    sprintfInt(buf, "{s}Pictures saved{m}%d{e}", pic_count);
+    webSend(buf);
+    webSend("{s}Live view{m}<a href='/cam' target='_blank'>Open /cam</a>{e}");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TaskLoop — runs in VM task thread (required for camera capture)
+// ═══════════════════════════════════════════════════════════════════
+void TaskLoop() {
+    if (cam_ok != 1) {
+        delay(100);
+        return;
+    }
+
+    // Continuous capture to PSRAM slot 1 (served via /tc_cam and MJPEG stream)
+    int size = captureToSlot();
+
+    // Simple motion detection via JPEG size delta
+    if (last_size > 0 && size > 0) {
+        int diff = size - last_size;
+        if (diff < 0) { diff = 0 - diff; }
+        motion_val = diff;
+        if (diff > 400) {
+            motion_detect = motion_detect + 1;
+        }
+    }
+    if (size > 0) { last_size = size; }
+
+    // Button: take numbered picture
+    if (doCapture == 1) {
+        doCapture = 0;
+        takePicture();
+    }
+
+    // Button: hi-res capture (UXGA, then back to VGA)
+    if (doHiRes == 1) {
+        doHiRes = 0;
+        camControl(9, CAM_FRAMESIZE, FRAMESIZE_UXGA);
+        delay(500);
+        takePicture();
+        camControl(9, CAM_FRAMESIZE, FRAMESIZE_VGA);
+    }
+
+    // ~10 fps for smooth MJPEG stream
+    delay(100);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// OnExit — clean up camera resources
+// ═══════════════════════════════════════════════════════════════════
+void OnExit() {
+    camControl(15, 0, 0);   // stop MJPEG stream server
+    camControl(12, 0, 0);   // free all PSRAM slots (slot 0 = free all)
+    camControl(13, 0, 0);   // deinit camera
+    addLog("TCC: camera shut down");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════
+int main() {
+    pic_count = 0;
+    frame_count = 0;
+    doCapture = 0;
+    doHiRes = 0;
+    cam_ok = 0;
+    last_size = 0;
+    motion_val = 0;
+    motion_detect = 0;
+
+    // Register custom web endpoint: /cam
+    webOn(1, "/cam");
+
+    int ok = initCamera();
+    if (ok != 0) {
+        return -1;
+    }
+    cam_ok = 1;
+
+    // Start MJPEG stream server on port 81
+    camControl(15, 1, 0);
+
+    // Take initial test capture to PSRAM slot 1
+    int size = captureToSlot();
+    sprintfInt(buf, "Camera ready, first frame: %d bytes, heap: ", size);
+    sprintfAppendInt(buf, "%d", tasm_heap);
+    addLog(buf);
+
+    return 0;
+}

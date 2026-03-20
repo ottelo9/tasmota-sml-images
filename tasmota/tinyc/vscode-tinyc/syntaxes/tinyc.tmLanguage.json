@@ -182,7 +182,7 @@
         {
           "comment": "sprintf variants",
           "name": "support.function.sprintf.tinyc",
-          "match": "\\b(sprintfInt|sprintfFloat|sprintfStr|sprintfAppendInt|sprintfAppendFloat|sprintfAppendStr)\\b"
+          "match": "\\b(sprintf|sprintfAppend|sprintfInt|sprintfFloat|sprintfStr|sprintfAppendInt|sprintfAppendFloat|sprintfAppendStr)\\b"
         },
         {
           "comment": "Tasmota command & output",

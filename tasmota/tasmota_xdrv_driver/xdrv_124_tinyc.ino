@@ -32,6 +32,9 @@
 
 #define XDRV_124  124
 
+// Global pause flag — set by filesystem upload handler (xdrv_50) to pause VM during uploads
+bool tc_global_pause = false;
+
 // Forward declarations for custom web handlers (called from SYS_WEB_ON in vm.h)
 static void HandleTinyCWebOn1(void);
 static void HandleTinyCWebOn2(void);
@@ -318,7 +321,7 @@ static void TinyCInit(void) {
 
   // Slots allocated on demand (upload, load, run API)
 
-  AddLog(LOG_LEVEL_INFO, PSTR("TCC: TinyC VM initialized (%d bytes, %d free)"), needed, ESP_getFreeHeap());
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: TinyC v" TC_RELEASE " initialized (%d bytes, %d free)"), needed, ESP_getFreeHeap());
 
   // Load slot config from /tinyc.cfg (loads files + auto-runs marked slots)
 #ifdef USE_UFILESYS
@@ -417,13 +420,176 @@ static const char TC_NOT_INIT[] PROGMEM = "Not initialized";
 
 #define D_PRFX_TINYC "TinyC"
 
+void CmndCheckPartition(void);
+
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info";
+  "|Run|Stop|Reset|Exec|Info"
+#ifdef ESP32
+  "|Chkpt"
+#endif
+  ;
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
   &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo
+#ifdef ESP32
+  , &CmndCheckPartition
+#endif
 };
+
+// --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
+#ifdef ESP32
+#include <MD5Builder.h>
+
+static bool chkpt_scan_ptable(uint8_t *mp, uint32_t num) {
+  int num_partitions = num;
+  esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
+  for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+    AddLog(LOG_LEVEL_INFO, PSTR("partition addr: 0x%06x; size: 0x%06x (%d KB); label: %s"),
+           peptr->pos.offset, peptr->pos.size, peptr->pos.size / 1024, peptr->label);
+    peptr++;
+  }
+  esp_err_t ret = esp_partition_table_verify((const esp_partition_info_t *)mp, false, &num_partitions);
+  AddLog(LOG_LEVEL_INFO, "partition table status: err: %d - entries: %d", ret, num_partitions);
+  return ret;
+}
+
+// TinyCChkpt       — show partition table
+// TinyCChkpt p      — pack: shrink app0 to fit firmware, expand spiffs
+// TinyCChkpt p 2880 — pack with explicit app0 size in KB
+void CmndCheckPartition(void) {
+  uint32_t new_app_size = 0;
+  uint8_t pack = 0;
+
+  if (XdrvMailbox.data_len) {
+    char *cp = XdrvMailbox.data;
+    while (*cp == ' ') cp++;
+    if (*cp == 'p') {
+      pack = 1;
+      cp++;
+      while (*cp == ' ') cp++;
+      if (*cp) {
+        uint32_t req_kb = strtol(cp, &cp, 10);
+        if (req_kb >= 1024 && req_kb <= 3904) {
+          new_app_size = req_kb * 1024;
+          new_app_size = (new_app_size + 0xFFFF) & ~0xFFFF;
+        }
+      }
+    }
+  }
+
+  if (pack) {
+    uint32_t sketch_size = ESP.getSketchSize();
+    if (!new_app_size) {
+      new_app_size = ((sketch_size + 0xFFFF) & ~0xFFFF) + 0x30000;
+      new_app_size = (new_app_size + 0xFFFF) & ~0xFFFF;
+      AddLog(LOG_LEVEL_INFO, PSTR("pack: firmware %d KB, auto app %d KB (overhead %d KB)"),
+        sketch_size / 1024, new_app_size / 1024, (new_app_size - sketch_size) / 1024);
+    } else {
+      AddLog(LOG_LEVEL_INFO, PSTR("pack: firmware %d KB, requested app %d KB"),
+        sketch_size / 1024, new_app_size / 1024);
+      if (new_app_size < sketch_size) {
+        AddLog(LOG_LEVEL_INFO, PSTR("pack: requested size too small for current firmware!"));
+        ResponseCmndDone();
+        return;
+      }
+    }
+    LittleFS.format();
+  }
+
+  #define PART_OFFSET 0x8000
+
+  int num_partitions;
+  uint8_t *mp = (uint8_t*)calloc(SPI_FLASH_SEC_SIZE >> 2, 4);
+  esp_err_t ret = esp_flash_read(NULL, mp, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+  if (ret) {
+    AddLog(LOG_LEVEL_INFO, "partition read error: %d", ret);
+  } else {
+    if (mp[0] != 0xAA || mp[1] != 0x50) {
+      AddLog(LOG_LEVEL_INFO, "partition table not valid");
+    } else {
+      ret = esp_partition_table_verify((const esp_partition_info_t *)mp, false, &num_partitions);
+      if (!ret) {
+        AddLog(LOG_LEVEL_INFO, "partition table is valid: %d entries", num_partitions);
+        int8_t hasspiffs = -1;
+        esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
+        for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+          AddLog(LOG_LEVEL_INFO, PSTR("partition addr: 0x%06x; size: 0x%06x (%d KB); label: %s"),
+                 peptr->pos.offset, peptr->pos.size, peptr->pos.size / 1024, peptr->label);
+          if (!strcmp((char*)peptr->label, "spiffs")) hasspiffs = cnt;
+          peptr++;
+          if (peptr->magic != ESP_PARTITION_MAGIC) break;
+        }
+
+        if (pack) {
+          int8_t hasapp0 = -1, hascustom = -1, hassafeboot = -1;
+          peptr = (esp_partition_info_t*)mp;
+          for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+            if (!strcmp((char*)peptr[cnt].label, "app0")) hasapp0 = cnt;
+            if (!strcmp((char*)peptr[cnt].label, "custom")) hascustom = cnt;
+            if (!strcmp((char*)peptr[cnt].label, "safeboot")) hassafeboot = cnt;
+          }
+          if (hassafeboot < 0) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: no safeboot partition — resize refused (no recovery possible)"));
+            pack = 0;
+          } else if (hasapp0 < 0 || hasspiffs < 0) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 or spiffs not found"));
+          } else if (peptr[hasapp0].pos.size == new_app_size) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 already %d KB, nothing to do"), new_app_size / 1024);
+            pack = 0;
+          } else {
+            uint32_t new_spiffs_offset = peptr[hasapp0].pos.offset + new_app_size;
+            uint32_t spiffs_end;
+            if (hascustom >= 0) {
+              spiffs_end = peptr[hascustom].pos.offset;
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: preserving custom at 0x%06x"), spiffs_end);
+            } else {
+              spiffs_end = ESP.getFlashChipSize();
+            }
+            if (new_spiffs_offset >= spiffs_end) {
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: no room for spiffs, aborting"));
+              pack = 0;
+            } else {
+              uint32_t new_spiffs_size = spiffs_end - new_spiffs_offset;
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 %d KB -> %d KB"),
+                peptr[hasapp0].pos.size / 1024, new_app_size / 1024);
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: spiffs %d KB @ 0x%06x -> %d KB @ 0x%06x"),
+                peptr[hasspiffs].pos.size / 1024, peptr[hasspiffs].pos.offset,
+                new_spiffs_size / 1024, new_spiffs_offset);
+              peptr[hasapp0].pos.size = new_app_size;
+              peptr[hasspiffs].pos.offset = new_spiffs_offset;
+              peptr[hasspiffs].pos.size = new_spiffs_size;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (pack) {
+    MD5Builder md5;
+    md5.begin();
+    md5.add(mp, num_partitions * sizeof(esp_partition_info_t));
+    md5.calculate();
+    uint8_t result[16];
+    md5.getBytes(result);
+    uint8_t *end_offset = mp + (num_partitions * sizeof(esp_partition_info_t));
+    end_offset[0] = 0xeb;
+    end_offset[1] = 0xeb;
+    memmove(end_offset + 16, result, 16);
+
+    chkpt_scan_ptable(mp, num_partitions);
+    ret = esp_flash_erase_region(NULL, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+    ret = esp_flash_write(NULL, mp, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+    free(mp);
+    ESP_Restart();
+    return;
+  }
+
+  free(mp);
+  ResponseCmndDone();
+}
+#endif // ESP32
 
 // Query variables by name — scans global name table in binary (zero RAM cost)
 // Usage: http://device/cm?cmnd=TinyC ?var1;var2     (slot 0)
@@ -964,7 +1130,7 @@ static void HandleTinyCPage(void) {
 #if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
-    "<button onclick=\"window.open('/ide')\" class='button bgrn'>Open IDE</button>"
+    "<button onclick=\"window.open('/ide','tinyc_ide')\" class='button bgrn'>Open IDE</button>"
     "</p>"
     "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem</p>"));
 #else
@@ -972,7 +1138,7 @@ static void HandleTinyCPage(void) {
     "<div class='tc-ide-url'>"
     "<input id='ide_url' value='http://localhost:8080' placeholder='IDE URL'>"
     "<button onclick=\"var u=document.getElementById('ide_url').value;"
-    "window.open(u+'?device='+location.hostname)\" class='button bgrn'>Open</button>"
+    "window.open(u+'?device='+location.hostname,'tinyc_ide')\" class='button bgrn'>Open</button>"
     "</div>"
     "<p style='text-align:center;font-size:.85em;opacity:.6'>IDE URL saved in browser</p>"
     "<script>var u=localStorage.getItem('tinyc_ide_url');"
@@ -990,11 +1156,11 @@ static void HandleTinyCPage(void) {
     "</script>"));
 
 #ifdef USE_DISPLAY
-  if (renderer && (renderer->framebuffer || renderer->rgb_fb)) {
+  if (renderer && (((uintptr_t)renderer->framebuffer >= 0x3C000000) || ((uintptr_t)renderer->rgb_fb >= 0x3C000000))) {
     WSContentSend_P(PSTR(
       "<fieldset><legend><b> Display </b></legend>"
       "<p style='text-align:center'>"
-      "<button onclick=\"window.open('/tc_display')\" class='button bgrn'>Display Mirror</button>"
+      "<button onclick=\"window.open('/tc_display','tinyc_display')\" class='button bgrn'>Display Mirror</button>"
       "</p></fieldset>"));
   }
 #endif
@@ -1099,6 +1265,7 @@ static void HandleTinyCUpload(void) {
       return;
     }
     Tinyc->upload_received = 0;
+    Tinyc->upload_active = true;
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
     if (Tinyc->upload_buf && Tinyc->upload_received + upload.currentSize <= TC_MAX_PROGRAM) {
@@ -1161,6 +1328,7 @@ static void HandleTinyCUpload(void) {
     } else {
       if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
     }
+    Tinyc->upload_active = false;
   }
 }
 
@@ -1759,11 +1927,20 @@ static void HandleTinyCDisplayRaw(void) {
     Webserver->send(503, "text/plain", "Busy");
     return;
   }
+  if (!renderer) {
+    Webserver->send(503, "text/plain", "No display");
+    return;
+  }
   tc_mirror_busy = true;
+  tc_global_pause = true;   // pause VM during framebuffer read
+  delay(0);  // yield to let VM finish current cycle
 
   int8_t bpp = renderer->disp_bpp;
   uint8_t *fb = renderer->framebuffer;
   uint16_t *rgb = renderer->rgb_fb;
+  // Validate pointers — reject garbage values (valid ESP32 heap/PSRAM >= 0x3C000000)
+  if (fb && (uintptr_t)fb < 0x3C000000) fb = nullptr;
+  if (rgb && (uintptr_t)rgb < 0x3C000000) rgb = nullptr;
 
   // Derive raw (unrotated) dimensions from rotated width/height + rotation
   uint8_t rot = renderer->getRotation();
@@ -1799,9 +1976,11 @@ static void HandleTinyCDisplayRaw(void) {
   if (!data_ptr || fb_size == 0) {
     Webserver->send(503, "text/plain", "Unsupported bpp");
     tc_mirror_busy = false;
+    tc_global_pause = false;
     return;
   }
 
+#ifdef ESP32
   // Large RGB framebuffers (>32KB): downsample + stream from SRAM
   // Scale factor: 2=half (400x240=192KB), 1=full (800x480=768KB)
   #define DISPLAY_MIRROR_SCALE 2
@@ -1836,7 +2015,7 @@ static void HandleTinyCDisplayRaw(void) {
     uint32_t batch_bytes = line_bytes * BATCH;
     uint8_t *buf = (uint8_t *)heap_caps_malloc(batch_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf) { buf = (uint8_t *)malloc(batch_bytes); }
-    if (!buf) { tc_mirror_busy = false; return; }
+    if (!buf) { tc_mirror_busy = false; tc_global_pause = false; return; }
 
     uint16_t lines_done = 0;
     for (uint16_t y = 0; y < rh; y += DISPLAY_MIRROR_SCALE) {
@@ -1863,8 +2042,10 @@ static void HandleTinyCDisplayRaw(void) {
     setsockopt(client.fd(), SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
     client.stop();
     tc_mirror_busy = false;
+    tc_global_pause = false;
     return;
   }
+#endif  // ESP32 — large RGB framebuffers
 
   // Small framebuffers (EPD, OLED) — send full resolution
   // 8-byte header
@@ -1902,6 +2083,7 @@ static void HandleTinyCDisplayRaw(void) {
   delay(50);
   client.stop();
   tc_mirror_busy = false;
+  tc_global_pause = false;
 }
 
 // Serve self-contained HTML/JS display snapshot page
@@ -2026,12 +2208,20 @@ static void HandleTinyCDisplayHTML(void) {
 static void HandleTinyCDisplay(void) {
   if (!HttpCheckPriviledgedAccess()) return;
 
-  if (!renderer) {
+  Renderer *r = renderer;  // snapshot pointer
+  if (!r) {
     Webserver->send(503, "text/plain", "No display");
     return;
   }
-  if (!renderer->framebuffer && !renderer->rgb_fb) {
-    Webserver->send(503, "text/plain", "No framebuffer");
+  // Validate framebuffer pointers — rgb_fb may contain uninitialized garbage
+  // on displays where the LCD peripheral manages DMA buffers directly.
+  // Valid ESP32 heap pointers are >= 0x3C000000.
+  uint8_t *fb = r->framebuffer;
+  uint16_t *rgb = r->rgb_fb;
+  bool fb_ok = fb && ((uintptr_t)fb >= 0x3C000000);
+  bool rgb_ok = rgb && ((uintptr_t)rgb >= 0x3C000000);
+  if (!fb_ok && !rgb_ok) {
+    Webserver->send(503, "text/plain", "No framebuffer (display uses HW DMA)");
     return;
   }
 
@@ -2067,6 +2257,192 @@ static void HandleTinyCWebOn2(void) { HandleTinyCWebOn(2); }
 static void HandleTinyCWebOn3(void) { HandleTinyCWebOn(3); }
 static void HandleTinyCWebOn4(void) { HandleTinyCWebOn(4); }
 
+// ---- Camera JPEG endpoint: /tc_cam?slot=N — serve PSRAM slot directly ----
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+static void HandleTinyCCam(void) {
+  int slot = 1;  // default slot 1
+  if (Webserver->hasArg("slot")) {
+    slot = Webserver->arg("slot").toInt();
+  }
+  if (slot < 1 || slot > TC_CAM_MAX_SLOTS) {
+    Webserver->send(400, "text/plain", "invalid slot");
+    return;
+  }
+  int idx = slot - 1;
+  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
+    Webserver->send(503, "text/plain", "no image");
+    return;
+  }
+  Webserver->sendHeader("Cache-Control", "no-cache, no-store");
+  Webserver->send_P(200, "image/jpeg", (const char*)tc_cam_slot[idx].buf, tc_cam_slot[idx].len);
+}
+
+// ---- MJPEG streaming server on port 81 ----
+
+static void TC_CamStreamHandler(void) {
+  tc_cam_stream.stream_active = 1;
+  tc_cam_stream.client = tc_cam_stream.server->client();
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client connected"));
+}
+
+static void TC_CamStreamRoot(void) {
+  tc_cam_stream.server->sendHeader("Location", "/cam.mjpeg");
+  tc_cam_stream.server->send(302, "", "");
+}
+
+static void TC_CamStreamTask(void) {
+  if (!tc_cam_stream.client.connected()) {
+    tc_cam_stream.stream_active = 0;
+    return;
+  }
+  if (1 == tc_cam_stream.stream_active) {
+    tc_cam_stream.client.flush();
+    tc_cam_stream.client.setNoDelay(true);
+    tc_cam_stream.client.setTimeout(1);
+    tc_cam_stream.client.print("HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace;boundary=" TC_CAM_BOUNDARY "\r\n"
+      "\r\n");
+    tc_cam_stream.stream_active = 2;
+  }
+  if (2 == tc_cam_stream.stream_active) {
+    // Copy frame to send buffer first (slot may be overwritten during slow TCP send)
+    if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 || tc_cam_slot[0].writing) return;
+    uint32_t len = tc_cam_slot[0].len;
+    // (Re)allocate send buffer if needed
+    if (!tc_cam_stream.send_buf || tc_cam_stream.send_alloc < len) {
+      if (tc_cam_stream.send_buf) free(tc_cam_stream.send_buf);
+      tc_cam_stream.send_buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      tc_cam_stream.send_alloc = tc_cam_stream.send_buf ? len : 0;
+    }
+    if (!tc_cam_stream.send_buf) return;
+    memcpy(tc_cam_stream.send_buf, tc_cam_slot[0].buf, len);
+    tc_cam_stream.send_len = len;
+    // Send from the copy — safe even if slot gets overwritten now
+    tc_cam_stream.client.print("--" TC_CAM_BOUNDARY "\r\n");
+    tc_cam_stream.client.printf("Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
+      (int)tc_cam_stream.send_len);
+    tc_cam_stream.client.write(tc_cam_stream.send_buf, tc_cam_stream.send_len);
+    tc_cam_stream.client.print("\r\n");
+  }
+  if (0 == tc_cam_stream.stream_active) {
+    tc_cam_stream.client.flush();
+    tc_cam_stream.client.stop();
+    AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client disconnected"));
+  }
+}
+
+void TC_CamStreamInit(void) {
+  if (tc_cam_stream.server) return;  // already running
+  // Defer if WiFi not ready (early boot autoexec)
+  if (!WifiHasIP()) {
+    tc_cam_stream.pending = 1;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server deferred (no WiFi)"));
+    return;
+  }
+  tc_cam_stream.pending = 0;
+  tc_cam_stream.stream_active = 0;
+  tc_cam_stream.server = new ESP8266WebServer(TC_CAM_STREAM_PORT);
+  if (tc_cam_stream.server) {
+    tc_cam_stream.server->on("/", TC_CamStreamRoot);
+    tc_cam_stream.server->on("/cam.mjpeg", TC_CamStreamHandler);
+    tc_cam_stream.server->on("/cam.jpg", TC_CamStreamHandler);
+    tc_cam_stream.server->on("/stream", TC_CamStreamHandler);
+    tc_cam_stream.server->begin();
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: MJPEG stream server on port %d"), TC_CAM_STREAM_PORT);
+  }
+}
+
+void TC_CamStreamStop(void) {
+  if (tc_cam_stream.server) {
+    tc_cam_stream.stream_active = 0;
+    tc_cam_stream.server->stop();
+    delete tc_cam_stream.server;
+    tc_cam_stream.server = nullptr;
+    if (tc_cam_stream.send_buf) { free(tc_cam_stream.send_buf); tc_cam_stream.send_buf = nullptr; }
+    tc_cam_stream.send_len = 0;
+    tc_cam_stream.send_alloc = 0;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server stopped"));
+  }
+}
+
+static void TC_CamStreamLoop(void) {
+  // Deferred init: create server once WiFi is ready
+  if (tc_cam_stream.pending && !tc_cam_stream.server && WifiHasIP()) {
+    TC_CamStreamInit();
+  }
+  if (tc_cam_stream.server) {
+    tc_cam_stream.server->handleClient();
+    if (tc_cam_stream.stream_active) { TC_CamStreamTask(); }
+  }
+}
+
+// ---- Motion detection (frame-diff from PSRAM slot 0) ----
+
+static void TC_CamMotionDetect(void) {
+  if (!tc_cam_motion.interval_ms) return;
+  if ((millis() - tc_cam_motion.last_time) < tc_cam_motion.interval_ms) return;
+  tc_cam_motion.last_time = millis();
+
+  // Need a valid JPEG in slot 0 with known dimensions, not currently being written
+  if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 ||
+      tc_cam_slot[0].width == 0 || tc_cam_slot[0].height == 0 ||
+      tc_cam_slot[0].writing) return;
+
+  uint32_t w = tc_cam_slot[0].width;
+  uint32_t h = tc_cam_slot[0].height;
+  uint32_t pixels = w * h;
+
+  // Decode JPEG to RGB888 in temp buffer
+  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) return;
+
+  if (!fmt2rgb888(tc_cam_slot[0].buf, tc_cam_slot[0].len, PIXFORMAT_JPEG, rgb)) {
+    free(rgb);
+    return;
+  }
+
+  // Allocate reference buffer if needed
+  if (!tc_cam_motion.ref_buf || tc_cam_motion.ref_size != pixels) {
+    if (tc_cam_motion.ref_buf) free(tc_cam_motion.ref_buf);
+    tc_cam_motion.ref_buf = (uint8_t*)heap_caps_malloc(pixels, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    tc_cam_motion.ref_size = pixels;
+    if (tc_cam_motion.ref_buf) {
+      // First frame — fill reference, no comparison
+      uint8_t *pxi = rgb;
+      for (uint32_t i = 0; i < pixels; i++) {
+        tc_cam_motion.ref_buf[i] = (pxi[0] + pxi[1] + pxi[2]) / 3;
+        pxi += 3;
+      }
+    }
+    free(rgb);
+    return;
+  }
+
+  // Compare with reference
+  uint64_t accu = 0;
+  uint64_t bright = 0;
+  uint8_t *pxi = rgb;
+  uint8_t *pxr = tc_cam_motion.ref_buf;
+  for (uint32_t i = 0; i < pixels; i++) {
+    int32_t gray = (pxi[0] + pxi[1] + pxi[2]) / 3;
+    int32_t lgray = pxr[0];
+    pxr[0] = gray;
+    pxi += 3;
+    pxr++;
+    accu += abs(gray - lgray);
+    bright += gray;
+  }
+  free(rgb);
+
+  uint32_t divider = pixels / 100;
+  if (divider == 0) divider = 1;
+  tc_cam_motion.motion_trigger = (uint32_t)(accu / divider);
+  tc_cam_motion.motion_brightness = (uint32_t)(bright / divider);
+  tc_cam_motion.triggered = (tc_cam_motion.threshold > 0 && tc_cam_motion.motion_trigger > tc_cam_motion.threshold) ? 1 : 0;
+}
+
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
+
 // ---- WebUI: interactive widget page (/tc_ui) -- uses slot 0 ----
 
 static void HandleTinyCUI(void) {
@@ -2092,6 +2468,7 @@ static void HandleTinyCUI(void) {
   // Reset WebChart state before rendering
   tc_chart_seq = 0;
   tc_chart_lib_sent = false;
+  tc_chart_time_base = 0;
 
   // AJAX mode (m=1): just re-render widgets via WebUI() callback
   if (Webserver->hasArg(F("m"))) {
@@ -2116,7 +2493,12 @@ static void HandleTinyCUI(void) {
       "x=new XMLHttpRequest();"
       "x.onreadystatechange=function(){"
         "if(x.readyState==4&&x.status==200){"
-          "document.getElementById('ui').innerHTML=x.responseText;"
+          "var r=x.responseText;"
+          "if(r.indexOf('script src=')>=0){location.reload();return;}"
+          "var el=document.getElementById('ui');"
+          "el.innerHTML=r;"
+          "var ss=el.getElementsByTagName('script');"
+          "for(var i=0;i<ss.length;i++){eval(ss[i].textContent);}"
         "}"
       "};"
       "if(rfsh){"
@@ -2479,6 +2861,10 @@ static void TC_DLServerLoop(void) {
  * Tasmota: Driver entry point
 \*********************************************************************************************/
 
+// Event callback edge-detection flags
+static bool tc_init_done = false;
+static bool tc_wifi_up = false;
+
 bool Xdrv124(uint32_t function) {
   bool result = false;
 
@@ -2489,8 +2875,16 @@ bool Xdrv124(uint32_t function) {
 
   if (!Tinyc) { return false; }
 
+  // Auto-pause VM callbacks during OTA updates and filesystem uploads
+  // to prevent timeouts and upload failures
+  bool tc_paused = (TasmotaGlobal.ota_state_flag != 0) ||
+                   (TasmotaGlobal.restart_flag != 0) ||
+                   Tinyc->upload_active ||
+                   tc_global_pause;
+
   switch (function) {
     case FUNC_LOOP:
+      if (tc_paused) { break; }
       // Poll UDP multicast for incoming variables
       tc_udp_poll();
 #ifdef ESP32
@@ -2500,16 +2894,50 @@ bool Xdrv124(uint32_t function) {
       }
       // Poll port 82 download server for incoming file requests
       TC_DLServerLoop();
+#if defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA)
+      // Poll port 81 MJPEG stream server
+      TC_CamStreamLoop();
+      // Run motion detection if enabled
+      TC_CamMotionDetect();
+#endif
 #endif
       // Call user's EveryLoop() callback on all active slots
       tc_all_callbacks("EveryLoop");
       break;
     case FUNC_EVERY_50_MSECOND:
+      if (tc_paused) { break; }
       TinyCEvery50ms();
+      if (TasmotaGlobal.rules_flag.mqtt_disconnected) {
+        TasmotaGlobal.rules_flag.mqtt_disconnected = 0;
+        tc_all_callbacks("OnMqttDisconnect");
+      }
       break;
     case FUNC_EVERY_SECOND:
+      if (tc_paused) { break; }
       // Call user's EverySecond() callback on all active slots
       tc_all_callbacks("EverySecond");
+      break;
+    case FUNC_NETWORK_UP:
+      if (!tc_init_done) {
+        tc_init_done = true;
+        tc_all_callbacks("OnInit");
+      }
+      if (!tc_wifi_up) {
+        tc_wifi_up = true;
+        tc_all_callbacks("OnWifiConnect");
+      }
+      break;
+    case FUNC_NETWORK_DOWN:
+      if (tc_wifi_up) {
+        tc_wifi_up = false;
+        tc_all_callbacks("OnWifiDisconnect");
+      }
+      break;
+    case FUNC_MQTT_INIT:
+      tc_all_callbacks("OnMqttConnect");
+      break;
+    case FUNC_TIME_SYNCED:
+      tc_all_callbacks("OnTimeSet");
       break;
     case FUNC_COMMAND:
       result = DecodeCommand(kTinyCCommands, TinyCCommand);
@@ -2562,11 +2990,28 @@ bool Xdrv124(uint32_t function) {
       TinyCShow(false);
       break;
     case FUNC_WEB_ADD_MAIN_BUTTON:
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      // Show MJPEG stream from port 81 — rendered once, not AJAX-refreshed
+      // onerror retry reconnects if stream drops (e.g. client disconnect)
+      if ((tc_cam_stream.server || tc_cam_stream.pending) && tc_cam_slot[0].len > 0) {
+        // Use onload script to set src AFTER page is fully rendered
+        // This prevents the stream request from blocking page load
+        WSContentSend_P(PSTR("<p></p><center>"
+          "<img id='tccam' onerror='setTimeout(()=>{this.src=\"http://%_I:%d/stream\";},2000)' "
+          "alt='TinyC Camera' style='width:99%%;'>"
+          "</center><p></p>"
+          "<script>window.addEventListener('load',()=>{document.getElementById('tccam').src="
+          "'http://%_I:%d/stream';});</script>"),
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
+      }
+#endif
       // Reset WebChart state before calling WebPage()
       tc_chart_seq = 0;
       tc_chart_lib_sent = false;
       tc_chart_width = 0;
       tc_chart_height = 0;
+      tc_chart_time_base = 0;
       // Wrap charts in block container to prevent inline-block cascading width expansion
       WSContentSend_P(PSTR("<div style='display:block;width:100%%;overflow:hidden'>"));
       // Call user's WebPage() on all active slots
@@ -2631,6 +3076,18 @@ bool Xdrv124(uint32_t function) {
       WebServer_on(PSTR("/tc_api"), HandleTinyCApi);
       Webserver->on("/tc_api", HTTP_OPTIONS, HandleTinyCApiCORS);
       WebServer_on(PSTR("/tc_ui"), HandleTinyCUI);
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      WebServer_on(PSTR("/tc_cam"), HandleTinyCCam);
+#endif
+      // Register any webOn handlers that were set up before web server started
+      if (Tinyc) {
+        for (int i = 0; i < Tinyc->web_handler_count && i < TC_MAX_WEB_HANDLERS; i++) {
+          if (Tinyc->web_handler_url[i][0]) {
+            Webserver->on(Tinyc->web_handler_url[i], TinyCWebOnHandlers[i]);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered (deferred)"), i + 1, Tinyc->web_handler_url[i]);
+          }
+        }
+      }
 #if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
       WebServer_on(PSTR("/ide"), HandleTinyCIde);
 #endif

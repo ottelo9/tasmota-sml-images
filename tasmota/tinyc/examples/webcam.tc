@@ -9,6 +9,10 @@
 // ─── Hardware config ───
 #define PIR_PIN    3
 #define CAM_QVGA   6
+#define INPUT         0x01
+#define OUTPUT        0x03
+#define INPUT_PULLUP  0x05
+#define INPUT_PULLDOWN 0x09
 
 
 // ─── Persistent settings (survive reboot) ───
@@ -209,7 +213,7 @@ void send_alarm() {
         mailBody(body);
         mailAttachPic(1);
         char params[128];
-        strcpy(params, "[*:*:*:*:*:gmutz2010@googlemail.com:Alarm]");
+        strcpy(params, "[*:*:*:*:*:your@email.com:Alarm]");
         mailSend(params);
         mailout = 1;
     }
@@ -379,7 +383,7 @@ int main() {
     }
 
     // PIR input pin
-    pinMode(PIR_PIN, 0);
+    pinMode(PIR_PIN, INPUT);
 
     char msg[16];
     strcpy(msg, "booting");
