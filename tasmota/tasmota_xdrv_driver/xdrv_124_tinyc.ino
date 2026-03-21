@@ -941,6 +941,77 @@ static void HandleTinyCPage(void) {
       if (cs) cs->autoexec = Tinyc->slot_config[cmd_slot].autoexec;
       TinyCSaveSettings();
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d autoexec=%d"), cmd_slot, Tinyc->slot_config[cmd_slot].autoexec ? 1 : 0);
+    } else if (cmd == "download" && Webserver->hasArg(F("rfile"))) {
+#ifdef USE_UFILESYS
+      // Download .tcb from remote repository
+      String rfile = Webserver->arg(F("rfile"));
+      if (rfile.length() > 0) {
+        // Read base URL from /tinyc_repo.cfg
+        char repo_url[200] = {};
+        File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
+        if (rcfg) {
+          int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
+          rcfg.close();
+          // trim trailing whitespace
+          while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
+        }
+        if (repo_url[0]) {
+          // Build full URL: base_url/filename
+          String url = String(repo_url);
+          if (!url.endsWith("/")) url += "/";
+          url += rfile;
+          // Download to filesystem
+          char fpath[48];
+          snprintf(fpath, sizeof(fpath), "/%s", rfile.c_str());
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          HTTPClientLight http;
+#else
+          WiFiClient http_client;
+          HTTPClient http;
+#endif
+          http.setTimeout(10000);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          bool begun = http.begin(UrlEncode(url));
+#else
+          bool begun = http.begin(http_client, UrlEncode(url));
+#endif
+          if (begun) {
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+              File f = ufsp->open(fpath, "w");
+              if (f) {
+                WiFiClient *stream = http.getStreamPtr();
+                int32_t len = http.getSize();
+                if (len < 0) len = 999999;
+                uint8_t *dbuf = (uint8_t *)malloc(512);
+                if (dbuf) {
+                  while (http.connected() && (len > 0)) {
+                    size_t avail = stream->available();
+                    if (avail) {
+                      if (avail > 512) avail = 512;
+                      int rd = stream->readBytes(dbuf, avail);
+                      f.write(dbuf, rd);
+                      len -= rd;
+                    }
+                    delay(1);
+                  }
+                  free(dbuf);
+                }
+                int fsize = (int)f.size();
+                f.close();
+                AddLog(LOG_LEVEL_INFO, PSTR("TCC: Downloaded %s (%d bytes)"), fpath, fsize);
+                // Load into selected slot
+                TinyCLoadFile(fpath, cmd_slot);
+                TinyCSaveSettings();
+              }
+            } else {
+              AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Download failed HTTP %d"), httpCode);
+            }
+            http.end();
+          }
+        }
+      }
+#endif
     } else if (cmd == "delall") {
 #ifdef USE_UFILESYS
       // Delete all .tcb files from both filesystems
@@ -1100,6 +1171,72 @@ static void HandleTinyCPage(void) {
         " onclick=\"return confirm('Delete all .tcb files?')\">"
         "Delete All .tcb</button>"
         "</div></form></p></fieldset>"));
+
+      // --- Remote repository selector ---
+      // If /tinyc_repo.cfg exists, fetch index.txt and show remote .tcb files
+      File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
+      if (rcfg) {
+        char repo_url[200] = {};
+        int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
+        rcfg.close();
+        while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
+        if (repo_url[0]) {
+          // Fetch index.txt from repo
+          String idx_url = String(repo_url);
+          if (!idx_url.endsWith("/")) idx_url += "/";
+          idx_url += "index.txt";
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          HTTPClientLight http;
+#else
+          WiFiClient http_client;
+          HTTPClient http;
+#endif
+          http.setTimeout(5000);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          bool begun = http.begin(UrlEncode(idx_url));
+#else
+          bool begun = http.begin(http_client, UrlEncode(idx_url));
+#endif
+          if (begun) {
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK) {
+              String body = http.getString();
+              if (body.length() > 0) {
+                WSContentSend_P(PSTR(
+                  "<fieldset><legend><b> Repository </b></legend>"
+                  "<p><form action='/tc' method='get'>"
+                  "<div style='display:flex;gap:8px;align-items:center'>"
+                  "<select name='rfile' style='flex:1'>"));
+                // Parse index.txt: one filename per line
+                int pos = 0;
+                while (pos < (int)body.length()) {
+                  int nl = body.indexOf('\n', pos);
+                  if (nl < 0) nl = body.length();
+                  String line = body.substring(pos, nl);
+                  line.trim();
+                  if (line.length() > 0 && line.endsWith(".tcb")) {
+                    WSContentSend_P(PSTR("<option value='%s'>%s</option>"),
+                      line.c_str(), line.c_str());
+                  }
+                  pos = nl + 1;
+                }
+                WSContentSend_P(PSTR(
+                  "</select>"
+                  "<select name='slot' style='width:auto'>"));
+                for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+                  WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
+                }
+                WSContentSend_P(PSTR(
+                  "</select></div>"
+                  "<br><button name='cmd' value='download' class='button bgrn'>"
+                  "Download &amp; Load</button>"
+                  "</form></p></fieldset>"));
+              }
+            }
+            http.end();
+          }
+        }
+      }
     }
 #endif
 
@@ -3021,11 +3158,14 @@ bool Xdrv124(uint32_t function) {
         tc_slot_callback(s, "WebPage");
       }
       WSContentSend_P(PSTR("</div>"));
-      // Inject JavaScript for widget interactions on main page (slot 0 only)
+      // Inject JavaScript for widget interactions on main page (all slots)
       {
-        TcSlot *s0 = Tinyc->slots[0];
-        if (s0 && s0->loaded && s0->vm.halted && s0->vm.error == TC_OK) {
-          if (tc_has_callback(&s0->vm, "WebCall")) {
+        bool js_sent = false;
+        bool has_webui = false;
+        for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+          TcSlot *si = Tinyc->slots[i];
+          if (!si || !si->loaded || !si->vm.halted || si->vm.error != TC_OK) continue;
+          if (!js_sent && tc_has_callback(&si->vm, "WebCall")) {
             WSContentSend_P(PSTR(
               "<script>"
               "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
@@ -3034,22 +3174,24 @@ bool Xdrv124(uint32_t function) {
               "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"
               "</script>"
             ), Settings->web_refresh);
+            js_sent = true;
           }
-          // Add buttons to /tc_ui pages if WebUI callback is defined
-          if (tc_has_callback(&s0->vm, "WebUI")) {
-            if (Tinyc->page_count > 0) {
-              // Multiple pages registered via wLabel()
-              for (uint8_t p = 0; p < Tinyc->page_count; p++) {
-                if (Tinyc->page_label[p][0]) {
-                  WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'>"
-                    "<input type='hidden' name='p' value='%d'>"
-                    "<button>%s</button></form>"), p, Tinyc->page_label[p]);
-                }
+          if (tc_has_callback(&si->vm, "WebUI")) {
+            has_webui = true;
+          }
+        }
+        // Add buttons to /tc_ui pages if any slot has WebUI callback
+        if (has_webui) {
+          if (Tinyc->page_count > 0) {
+            for (uint8_t p = 0; p < Tinyc->page_count; p++) {
+              if (Tinyc->page_label[p][0]) {
+                WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'>"
+                  "<input type='hidden' name='p' value='%d'>"
+                  "<button>%s</button></form>"), p, Tinyc->page_label[p]);
               }
-            } else {
-              // No wLabel() called -- single default button
-              WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'><button>TinyC UI</button></form>"));
             }
+          } else {
+            WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'><button>TinyC UI</button></form>"));
           }
         }
       }

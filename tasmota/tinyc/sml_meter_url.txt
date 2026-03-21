@@ -1,1 +1,0 @@
-https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/script-list-menu/meters/

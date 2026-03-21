@@ -2730,9 +2730,10 @@ void SML_Immediate_MQTT(const char *mp,uint8_t index,uint8_t mindex) {
           // immediate mqtt
           DOUBLE2CHAR(sml_globs.meter_vars[index], dp & 0xf, tpowstr);
           ResponseTime_P(PSTR(",\"%s\":{\"%s\":%s}}"), sml_globs.mp[mindex].prefix, jname, tpowstr);
+          uint8_t slog = TasmotaGlobal.masterlog_level;
           TasmotaGlobal.masterlog_level = LOG_LEVEL_DEBUG;
           MqttPublishTeleSensor();
-          TasmotaGlobal.masterlog_level = LOG_LEVEL_NONE;
+          TasmotaGlobal.masterlog_level = slog;
 
         }
       }
