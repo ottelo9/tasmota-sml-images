@@ -89,6 +89,11 @@ Um alle gleichzeitig zu erstellen:
 Linux Script um danach alle Images in zip-Archive zu packen:
 [make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)
 
+### FAQ
+- Beim Übertragen eines Images (z.B. tasmota1m_shelly_ottelo) für ESP8266 via OTA (Use file upload) bekomme ich folgenden Fehler:
+`Upload Failed. Not enough space.`
+Das liegt daran, dass der ESP zu wenig Speicher hat. Verwende zuerst das tasmota-minimal.bin Image, danach kannst du dann das normale Image übertragen.
+
 
 ### Infos
 Mehr Infos bzgl. ESP32 Versionen:  
