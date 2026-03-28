@@ -37,7 +37,7 @@ Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).
 ### Shelly Pro 3EM / EcoTracker Emulation für smarte Akkus (wie z.B. Marstek Venus C,E, Jupiter, Hoymiles, Growatt NOAH 2000)
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas). Das alles haben wir dem Tasmota Script Entwickler [gemu2015](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas) zu verdanken, der es zusammen mit Kalle entwickelt und getestet hat! Siehe auch [im Forum](https://forum.creationx.de/forum/index.php?thread/1095-d0-z%C3%A4hler-sml-auslesen-mit-tasmota/&pageNo=110). Gemu2015 hat ein Testscript zusammen mit Kalle erstellt. Ich habe die Teile aus dem Script entnommen, optimiert und eigene Scripte entworfen [siehe hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
-## TinyC - Alternative zum Scripting/Berry
+## TinyC - Alternative zum Scripting/Berry (ESP32)
 - **NEU: TinyC** von [gemu2015](https://github.com/gemu2015) hinzugefügt (Script ist weiterhin mit drin) !! Eine sehr gute und schnelle Alternative zum Scripting/Berry. Ich könnt nun eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
 => hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
 => Damit die IDE funktioniert müsst ihr die [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tasmota/tinyc/tinyc_ide.html.gz) via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
@@ -89,6 +89,11 @@ Um alle gleichzeitig zu erstellen:
 Linux Script um danach alle Images in zip-Archive zu packen:
 [make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)
 
+### FAQ
+- Beim Übertragen eines Images (z.B. tasmota1m_shelly_ottelo) für ESP8266 via OTA (Use file upload) bekomme ich folgenden Fehler:
+`Upload Failed. Not enough space.`
+Das liegt daran, dass der ESP zu wenig Speicher hat. Verwende zuerst das tasmota-minimal.bin Image, danach kannst du dann das normale Image übertragen.
+
 
 ### Infos
 Mehr Infos bzgl. ESP32 Versionen:  
@@ -114,6 +119,15 @@ Noch eine Info:
 Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren  
 
 [Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)  
+
+### Testtools:
+<b>UDP/HTTP/PING Tester</b>  
+Ihr könnt die Emus mit meinem [PowerScript](https://github.com/ottelo9/tasmota-sml-script/blob/main/pvakku-powermeter-emulator/Shelly-EcoTracker%20Tester.ps1) Tool testen (UDP, HTTP Get, Ping):  
+<img width="500" height="1109" alt="image" src="https://github.com/user-attachments/assets/c70370f6-00c6-4fc8-bef0-9253bf2b6ece" />
+
+<b>SML Simulator</b>  
+Gemu2015 hat ein [SML Simulator Tool](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/sml_emulator.html) (simuliert einen x-beliebigen Stromzähler) für den Google Chrome Browser erstellt. Zum Simulieren eines Stromzählers wird ein USB Lesekopf am PC benötigt. Das Tool kann auch Zählerscripte (Meter Descriptor) erstellen und auch direkt an Tasmota senden. Wieso Google Chrome Browser? Nur Chrome unterstützt das serielle Interface.  
+<img width="500" height="385" alt="image" src="https://github.com/user-attachments/assets/9a5190da-2e8c-4198-97d0-4152276ad7a1" />
 
 ### Debugging
 Falls Tasmota mal ab und zu aus unbekannten Gründen neustarten (Reboots) sollte, gibt es mehrere Möglichkeiten die Ursache des Problems festzustellen.
