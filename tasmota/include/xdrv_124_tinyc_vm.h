@@ -16,7 +16,44 @@
 uint32_t SML_SetOptions(uint32_t in);
 #endif
 
+// Forward declarations for MQTT bridge helpers — defined in xdrv_124_tinyc.ino
+// (after this header is included). Needed because tc_syscall() below calls them.
+#ifdef USE_MQTT
+int tc_mqtt_subscribe(const char *topic);
+int tc_mqtt_unsubscribe(const char *topic);
+#endif
+
+// Forward declarations for dynamic task spawn — defined in xdrv_124_tinyc.ino
+#ifdef ESP32
+int tc_spawn_task_create(const char *name, uint16_t stack_kb);
+int tc_spawn_task_kill(const char *name);
+int tc_spawn_task_running(const char *name);
+void tc_spawn_task_cleanup_slot(uint8_t slot_idx);
+#endif
+
 #include <OneWire.h>
+// Without Scripter, these aren't pulled in transitively. TinyC needs them
+// directly for serial port objects and deep-sleep wakeup-pin config.
+// Safe to include unconditionally — both have header guards and no side effects.
+#include <TasmotaSerial.h>
+#if defined(ESP32) && SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+#include "driver/rtc_io.h"
+#endif
+
+// Minimal I2S output — standalone, no USE_I2S_AUDIO needed
+#if defined(ESP32) && ESP_IDF_VERSION_MAJOR >= 5
+#include "driver/i2s_std.h"
+#endif
+
+// Crypto primitives for the AES/HMAC/SHA syscalls (360..365). mbedtls ships
+// with the ESP-IDF Arduino framework; no extra deps. Used by TinyC scripts
+// implementing protocols that need symmetric crypto (Local Tuya, MQTT-TLS
+// fingerprinting, encrypted SML decoders, custom signed REST APIs, etc.).
+#ifdef ESP32
+#include <mbedtls/aes.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
+#endif
 
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
 #include "esp_camera.h"
@@ -118,27 +155,52 @@ static FS *tc_file_path(char *path) {
   #define TC_MAX_FRAMES      8       // call depth — frames are small (locals allocated dynamically)
   #define TC_MAX_LOCALS      256     // locals per frame (1KB, dynamically allocated)
   #define TC_MAX_GLOBALS     64      // global slots (256 bytes)
-  #define TC_MAX_CONSTANTS   64      // constant pool entries
-  #define TC_MAX_CONST_DATA  512     // string constant bytes
+  #ifndef TC_MAX_CONSTANTS
+    #define TC_MAX_CONSTANTS 64      // constant pool entries
+  #endif
+  #define TC_MAX_CONST_DATA  512     // string constant bytes (informational only — buffer is dynamically sized)
   #define TC_INSTR_PER_TICK  500     // instructions per 50ms tick
   #define TC_OUTPUT_SIZE     128     // output buffer for MQTT
 #else  // ESP32
-  #define TC_MAX_PROGRAM     32768   // max bytecode size
+  // Bytecode buffer is allocated via heap_caps_malloc(MALLOC_CAP_SPIRAM) with
+  // DRAM fallback (see TinyCLoadFile in xdrv_124_tinyc.ino). With PSRAM
+  // available the only practical ceiling is the .tcb on-disk size; without
+  // PSRAM the available DRAM block sets the real limit. 128 KB is enough
+  // headroom for the largest current user scripts (~65 KB) to grow without
+  // forcing another firmware bump.
+  #define TC_MAX_PROGRAM     131072  // max bytecode size (PSRAM-backed)
   #define TC_STACK_SIZE      256     // operand stack (1KB)
   #define TC_MAX_FRAMES      32      // call depth
   #define TC_MAX_LOCALS      256     // locals per frame (1KB) - enough for char arrays
   #define TC_MAX_GLOBALS     512     // global slots (2KB)
-  #define TC_MAX_CONSTANTS   512     // constant pool entries (dynamic alloc, uint16_t)
-  #define TC_MAX_CONST_DATA  8192    // string constant bytes
+  // Constant pool cap. Raised 256→512 in v1.3.12 and 512→1024 in v1.3.18 for
+  // large bat_ctrl.tc-style scripts (BMU + Modbus + REST + Speedwire + EEBus)
+  // that hit ~440 unique string literals. Encoding supports u16 (≤65535), so
+  // the cap is purely a soft RAM-safety bound: each slot is ~12 bytes →
+  // 1024 slots → ~12 KB worst case (calloc'd, not always used). Override in
+  // user_config_override.h to tune per project.
+  #ifndef TC_MAX_CONSTANTS
+    #define TC_MAX_CONSTANTS 1024    // constant pool entries (dynamic alloc, uint16_t)
+  #endif
+  #define TC_MAX_CONST_DATA  8192    // string constant bytes (informational only — buffer is dynamically sized to fit)
   #define TC_INSTR_PER_TICK  1000    // instructions per 50ms tick
   #define TC_OUTPUT_SIZE     128     // output buffer for MQTT (was 512)
 #endif
 
 #define TC_MAX_FILE_HANDLES  4      // max simultaneously open files
+#define TC_TCP_CLI_SLOTS     4      // outgoing TCP client slots (selected via tcpSelect)
 
-// VM task stack size (bytes)
+// VM task stack size (bytes). Bumped 8192 → 12288 (2026-04-27) after a
+// stack-overflow crash in tc_persist_save → fs::File::write → fwrite →
+// __smakebuf_r → littlefs → SPI flash → FreeRTOS critical section reached
+// xPortSetInterruptMaskFromISR with a corrupted TCB. Newlib's fwrite path
+// alloca's a ~1 KB stdio buffer in __smakebuf_r, the LittleFS / SPI-flash
+// chain adds another ~2 KB, plus Xtensa register windows. With the v1.3.20
+// build's slightly different code layout (mbedtls headers pulled in for the
+// new crypto syscalls) the meter_pin_unlock.tc autoexec — which calls
+// saveVars() in main() — went over 8 KB. 12 KB gives ~3 KB headroom.
 #ifndef TC_VM_TASK_STACK
-  #define TC_VM_TASK_STACK   8192
+  #define TC_VM_TASK_STACK   12288
 #endif
 
 // Heap memory for large arrays (> 255 elements)
@@ -146,15 +208,15 @@ static FS *tc_file_path(char *path) {
   #define TC_MAX_HEAP           2048   // heap slots (8KB)
   #define TC_MAX_HEAP_HANDLES   8
 #else  // ESP32
-  #define TC_MAX_HEAP           8192   // heap slots (32KB)
+  #define TC_MAX_HEAP           16384  // heap slots (64KB upper bound; grown dynamically)
   #define TC_MAX_HEAP_HANDLES   128    // max concurrent heap arrays (energy script uses 68+)
 #endif
 
 #define TC_MAGIC           0x54434300  // "TCC\0"
 #define TC_VERSION         5           // V5: global (UDP auto-update) variables
-#define TC_RELEASE         "1.1.0"     // unified sprintf/sprintfAppend, VM auto-pause during uploads
+#define TC_RELEASE         "1.3.20"    // Symmetric crypto syscalls (360–365): aesEcb / aesCbc (AES-128, in-place on TinyC char[] buffers), hmacSha256, sha256, plus hex2bin / bin2hex byte-twiddling helpers. ESP32-only via mbedtls (already linked for HTTPS/MQTT-TLS); ESP8266 path stubs return 0/no-op. Motivating use case: TinyC scripts speaking the Tuya local protocol (v3.3 = AES-128-ECB) so users can drive Smart-Life-controlled devices (pool heat pumps, plugs, switches, dehumidifiers) directly from Tasmota without a cloud round-trip or a separate bridge. Also enables custom signed REST APIs (HMAC-SHA256), encrypted SML decoders not covered by AmsLib, and per-device MQTT-TLS fingerprinting. Buffers follow TinyC convention (one byte per int32 slot, low 8 bits used); lengths are in bytes and must fit the ref's allocated capacity. AES-CBC stack-allocates up to 4 KB per call, falls back to malloc above; HMAC/SHA bounded at 1024 B key / 4 KB data — bigger payloads should be hashed in chunks via repeated SHA-256 of a hash-state buffer (future enhancement). Tuya v3.4 (ECDH+AES-GCM) not exposed yet — most Smart-Life devices are still v3.3. IDE/compiler-side: BUILTINS table + symbol table entries for the 6 functions need to be added in tinyc_ide.html.gz to make them callable from .tc source (next commit). Previous: "1.3.19" — Cross-VM share table + PSRAM-backed bytecode + IDE strcmp/sprintf fixes. (1) New 8-syscall `share*` API (340–347) lets two TinyC slots exchange named scalars/strings via a driver-global 32-entry table (~2.6 KB DRAM, mutex-protected on ESP32). Use this when one program outgrows a single slot and is split across two — e.g. Andreas's BYD/Speedwire/EEBus stack. Missing-key reads return 0/0.0/"" without error; `shareHas`/`shareDelete` complete the model. (2) `TC_MAX_PROGRAM` 65536 → 131072 with PSRAM fallback: `s->program` and `vm->const_data` allocate from internal DRAM first, only spill to `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` on OOM (ESP32 only). Small/normal programs stay in fast static RAM; only edge-case 100+ KB scripts (or scripts on devices with fragmented heap) reach PSRAM. AddLog INFO line emitted when PSRAM path is taken. (3) IDE: 4-site emitByte-truncation bug fixed — `emit(Op.SYSCALL); emitByte(Syscall.X)` truncated ids ≥256 to `id & 0xFF`, silently rerouting STRCMP_CONST=275 to SYS_MATH_POW=19 (so `strcmp(arr,"literal")` returned NaN bits 0x7FC00000 = 2143289344, breaking every `if (strcmp(...) == 0)` branch). Same bug hit FILE_WRITE_STR=276, LOG_LEVEL=269, LOG_LEVEL_STR=270. All four sites now use the existing `emitSyscall(id)` helper which auto-picks SYSCALL2 (u16) for ids ≥256. (4) IDE: `inferType(CallExpr)` had a hardcoded float-builtin list (sqrt/sin/cos/.../atof) and ignored the symbol-table `returnFloat: true` flag, so `sprintf(buf,"%.2f",shareGetFloat(...))` saw valType='int' and emitted I2F → reinterpreted bits → printed 1056964608.00 (= 0.5f bit-pattern). Now also returns 'float' when `BUILTINS[name].returnFloat === true`; future float-returning builtins work automatically.   Previous: "1.3.18" — Constant pool cap raised 512→1024 on ESP32 (Andreas BYD/Speedwire/EEBus scripts hit 440/512). "1.3.17" — TC_ERR_BOUNDS rich log + RET-time SP-balance check + compiler float→int narrowing warning.
 #define TC_FILE_NAME       "/autoexec.tcb"
-#define TC_MAX_PERSIST     32          // max persist variable entries
+#define TC_MAX_PERSIST     64          // max persist variable entries
 #define TC_MAX_UDP_GLOBALS 64          // max global (UDP auto-update) variable entries
 
 // Flash-safe byte read — enables execute-from-flash on ESP32
@@ -177,8 +239,11 @@ static FS *tc_file_path(char *path) {
   #define TC_MEMCPY(dst, src, len) memcpy(dst, src, len)
 #endif
 
-// Callback support
-#define TC_MAX_CALLBACKS  10           // max well-known callback functions
+// Callback support — covers all 14 TcCallbackId well-known callbacks plus
+// the string-keyed ones (HomeKitWrite, TouchButton, UdpCall, WebOn, WebUI,
+// JsonCall, WebCall, WebPage, Command, Event). Must be ≥ TC_CB_COUNT (14)
+// or load will silently truncate the hot-path callbacks.
+#define TC_MAX_CALLBACKS  24
 #ifdef ESP8266
   #define TC_CALLBACK_MAX_INSTR 20000  // instruction limit per callback (ESP8266)
 #else
@@ -249,8 +314,13 @@ enum TcOp {
   OP_LOAD_HEAP_ARR  = 0xA0,  // u8 handle; pop idx -> push value
   OP_STORE_HEAP_ARR = 0xA1,  // u8 handle; pop val, pop idx -> store
   OP_ADDR_HEAP      = 0xA2,  // u8 handle -> push ref: 0xC0000000 | handle
+  // Runtime array ref (ref params): resolve packed ref stored in local slot
+  OP_LOAD_REF_ARR   = 0xA3,  // u8 local_idx; pop idx -> push *(resolveRef(local[local_idx])+idx)
+  OP_STORE_REF_ARR  = 0xA4,  // u8 local_idx; pop val, pop idx -> *(resolveRef(local[local_idx])+idx)=val
   // Watch variables (change tracking)
   OP_STORE_WATCH    = 0xA5,  // u16 varIdx, u16 shadowIdx, u16 writtenIdx — store with shadow update
+  // Heap ref with slot offset — for strcpy(arr[i].field, ...)
+  OP_ADDR_HEAP_OFF  = 0xA6,  // u8 handle; pop offset -> push ref: 0xC0000000 | (offset<<16) | handle
   // Constants
   OP_LOAD_CONST   = 0x90,
 };
@@ -353,6 +423,13 @@ enum TcSyscall {
   SYS_WEB_SEND_STR        = 94, // (const_idx) -> void — string literal variant
   SYS_LOG                 = 95, // (char_ref) -> void — AddLog to Tasmota console
   SYS_LOG_STR             = 96, // (const_idx) -> void — AddLog string literal
+  SYS_LOG_LVL          = 269, // (level, char_ref) -> void — AddLog with explicit level
+  SYS_LOG_LVL_STR       = 270, // (level, const_idx) -> void — AddLog string literal with level
+  // Minimal I2S output (no USE_I2S_AUDIO needed)
+  SYS_I2S_BEGIN         = 271, // (bclk, lrclk, dout, sampleRate) -> int — init I2S TX, returns 0=ok
+  SYS_I2S_WRITE         = 272, // (arr_ref, len) -> int — write int16 PCM samples, returns written
+  SYS_I2S_STOP          = 273, // () -> void — stop and release I2S
+  SYS_FILE_READ_PCM16   = 274, // (handle, arr_ref, max_samples, channels) -> samples_read
   SYS_LGETSTRING          = 97, // (index, dst_ref) -> int — get localized string
   // UDP multicast (Scripter-compatible, 239.255.255.250:1999)
   SYS_UDP_SEND            = 100, // (const_idx_name, float_val) -> void — binary float
@@ -469,6 +546,12 @@ enum TcSyscall {
   SYS_DSP_IMG_RECT    = 263, // (slot, sx, sy, dx, dy, w, h) -> void — push sub-rect from image to screen
   SYS_DSP_IMG_WIDTH   = 264, // (slot) -> int — get image width
   SYS_DSP_IMG_HEIGHT  = 265, // (slot) -> int — get image height
+  SYS_DSP_TEXT_WIDTH  = 266, // (len) -> int — get pixel width for len chars in current font
+  SYS_DSP_TEXT_HEIGHT = 267, // () -> int — get pixel height for current font
+  SYS_DSP_IMG_TEXT    = 268, // (slot, x, y, color, fieldw, align, buf_ref) -> void — composite text on image
+  SYS_DSP_LOAD_IMG_CAM  = 277, // (cam_slot) -> int — decode JPEG from cam slot into a new img slot (-1=err)
+  SYS_DSP_IMG_TEXT_BURN = 278, // (slot, x, y, color, fieldw, align, buf_ref) -> void — burn text pixels INTO image buffer (no TFT push)
+  SYS_DSP_IMG_TO_CAM    = 279, // (img_slot, cam_slot, quality) -> int — re-encode img slot back into cam slot as JPEG, returns size (-1=err)
   // Audio
   SYS_AUDIO_VOL       = 200, // (vol) -> void — set volume 0-100
   SYS_AUDIO_PLAY      = 201, // (file_const) -> void — play MP3 file
@@ -483,6 +566,73 @@ enum TcSyscall {
   SYS_TCP_WRITE_STR   = 214, // (str_ref) -> void — write string to client
   SYS_TCP_READ_ARR    = 215, // (arr_ref) -> int — read bytes into int array
   SYS_TCP_WRITE_ARR   = 216, // (arr_ref, count, type) -> void — write array to client
+  // TCP client (outgoing connections) — TC_TCP_CLI_SLOTS parallel slots, selected via tcpSelect()
+  SYS_TCP_CONNECT     = 290, // (ip_const, port) -> int — connect to remote ip:port (0=ok, -1=fail, -2=no net)
+  SYS_TCP_DISCONNECT  = 291, // () -> void — close selected TCP client slot
+  SYS_TCP_CONNECTED   = 292, // () -> int — 1 if selected TCP client connected, 0 otherwise
+  SYS_TCP_SELECT      = 293, // (slot) -> void — select outgoing TCP slot (0..TC_TCP_CLI_SLOTS-1)
+  SYS_TCP_CONNECT_REF = 294, // (ip_ref, port) -> int — connect with IP from runtime char array
+  // MQTT subscribe / publish-to-topic (USE_MQTT). Dispatches OnMqttData(topic,payload) callback.
+  SYS_MQTT_SUBSCRIBE   = 295, // (topic_const)          -> int slot (0..9, -1=err)
+  SYS_MQTT_UNSUBSCRIBE = 296, // (topic_const)          -> int (0=ok, -1=err)
+  SYS_MQTT_PUBLISH_TO  = 297, // (topic_const, payload_const) -> int (0=ok, -1=err)
+  // Dynamic task spawn (ESP32 only). Runs a named user function on a new FreeRTOS task
+  // with full delay() support; shares the spawning VM's globals/heap. killTask is cooperative.
+  SYS_SPAWN_TASK       = 298, // (name_const)              -> int pool_idx (0..TC_MAX_SPAWN_TASKS-1), -1=err
+  SYS_SPAWN_TASK_STACK = 299, // (name_const, stack_kb)    -> int pool_idx, -1=err (stack_kb clamped 2..12)
+  SYS_KILL_TASK        = 300, // (name_const)              -> int 0=signaled, -1=not running
+  SYS_TASK_RUNNING     = 301, // (name_const)              -> int 1=running, 0=idle
+  // ── TinyUI — tiny LVGL-like layer on top of existing dsp* primitives ───
+  // Passive widgets (label/progress/gauge/icon) live in a small separate pool
+  // and are auto-redrawn on screen switch. Interactive widgets (checkbox) are
+  // thin wrappers over dspTButton — they live in the existing VButton pool.
+  SYS_UI_SCREEN        = 310, // (id)                                -> void   // switch visible screen; -1 reads current
+  SYS_UI_THEME         = 311, // (bg, accent, text, border)          -> void   // set global theme colors (RGB565)
+  SYS_UI_CLEAR_SCREEN  = 312, // ()                                   -> void   // fill viewport with theme.bg
+  SYS_UI_LABEL         = 320, // (num,x,y,w,h,text_const,align)      -> void   // static text (align: 0=left,1=center,2=right)
+  SYS_UI_LABEL_SET     = 321, // (num, text_ref_or_const)            -> void   // change label text, redraw
+  SYS_UI_CHECKBOX      = 322, // (num,x,y,w,h,label_const)            -> void   // toggle-button-backed checkbox, caller-sized hit area
+  SYS_UI_PROGRESS      = 323, // (num,x,y,w,h,value,max)             -> void   // horizontal fill bar
+  SYS_UI_PROGRESS_SET  = 324, // (num, value)                        -> void   // update progress bar value
+  SYS_UI_GAUGE         = 325, // (num,x,y,r,value,vmin,vmax)         -> void   // circular gauge with needle
+  SYS_UI_ICON          = 326, // (num,x,y,img_slot)                   -> void   // clickable image (uses existing img pool)
+  SYS_UI_BUTTON        = 327, // (num,x,y,w,h,label_const)            -> void   // VButton-backed momentary pushbutton; TouchButton(num,1) on press, (num,0) on release
+  // In-memory RGB565 canvases — let dsp* primitives draw into an image slot
+  SYS_IMG_CREATE       = 328, // (w, h)                                -> int slot (0..3, -1=err) // alloc blank canvas in PSRAM
+  SYS_IMG_BEGIN_DRAW   = 329, // (slot)                                -> void   // redirect all dsp* to the slot's canvas
+  SYS_IMG_END_DRAW     = 330, // ()                                    -> void   // restore panel renderer
+  SYS_IMG_CLEAR        = 331, // (slot, color_rgb565)                  -> void   // fast fill of canvas
+  SYS_IMG_BLIT         = 332, // (dst,src,sx,sy,dx,dy,w,h)             -> void   // canvas->canvas rect copy (clipped)
+  SYS_IMG_INVALIDATE   = 333, // (slot,x,y,w,h)                        -> void   // union rect into slot's dirty region
+  SYS_IMG_FLUSH        = 334, // (slot,panel_x,panel_y)                -> void   // push dirty region to panel + clear
+  // Cross-VM shared key/value store (driver-global, mutex-protected)
+  SYS_SHARE_SET_INT    = 340, // (key_const_idx, val)        -> void
+  SYS_SHARE_GET_INT    = 341, // (key_const_idx)             -> int  (0 if missing)
+  SYS_SHARE_SET_FLT    = 342, // (key_const_idx, val)        -> void
+  SYS_SHARE_GET_FLT    = 343, // (key_const_idx)             -> float (0.0 if missing)
+  SYS_SHARE_SET_STR    = 344, // (key_const_idx, src_ref)    -> void
+  SYS_SHARE_GET_STR    = 345, // (key_const_idx, dst_ref)    -> int  chars copied (0 if missing)
+  SYS_SHARE_HAS        = 346, // (key_const_idx)             -> int  0/1
+  SYS_SHARE_DELETE     = 347, // (key_const_idx)             -> int  1 if removed, 0 if not present
+
+  // Symmetric crypto (AES + HMAC-SHA256). Buffers are TinyC `char[]` (one byte
+  // per int32 slot, low 8 bits used). Lengths in BYTES. All ops are in-place
+  // on the data ref. ESP32-only (mbedtls); ESP8266 returns 0 / no-op.
+  // Tuya local protocol (v3.3): AES-128-ECB + zero-pad. Tuya v3.4: AES-128-GCM
+  // (not exposed yet — add later if needed). Most Smart-Life pool heaters,
+  // plugs, switches use v3.3.
+  SYS_AES_ECB          = 360, // (key16_ref, data16_ref, enc_flag)              -> int  1=ok 0=err
+  SYS_AES_CBC          = 361, // (key16_ref, iv16_ref, data_ref, len, enc_flag) -> int  1=ok 0=err
+                              //   len must be a multiple of 16. iv is updated in-place.
+  SYS_HMAC_SHA256      = 362, // (key_ref, klen, data_ref, dlen, out32_ref)     -> int  1=ok
+  SYS_SHA256           = 363, // (data_ref, dlen, out32_ref)                    -> int  1=ok
+  // Hex / binary helpers (purely byte-twiddling, no crypto state). Convenient
+  // for parsing keys/IDs from string literals into byte buffers and back.
+  SYS_HEX2BIN          = 364, // (hex_ref, hex_len, out_ref)                    -> int  bytes written (hex_len/2)
+                              //   hex_ref may be a const string idx OR a char[] ref.
+                              //   Skips whitespace; returns -1 on bad nibble.
+  SYS_BIN2HEX          = 365, // (bin_ref, bin_len, out_ref)                    -> int  chars written (bin_len*2),
+                              //   lowercase, no separators, NUL-terminated.
   // Deep sleep (ESP32 only)
   SYS_DEEP_SLEEP      = 230, // (seconds) -> void — deep sleep with timer wakeup
   SYS_DEEP_SLEEP_GPIO = 231, // (seconds, pin, level) -> void — + GPIO wakeup
@@ -507,6 +657,9 @@ enum TcSyscall {
   SYS_I2C_FREE       = 249, // (addr, bus) -> void — release claimed I2C address
   SYS_WEB_CHART_SIZE  = 233, // (width, height) -> void — set chart div size in pixels (0=default)
   SYS_WEB_CHART_TBASE = 261, // (minutes) -> void — set time base offset from "now" for chart x-axis
+  SYS_WEB_REPO_PULLDOWN = 280, // (gref, label_c, json_url_c, index_key_c, dest_path_c) -> void — Scripter smlpd()-style remote JSON directory picker
+  SYS_SML_APPLY_PINS    = 281, // (path_c, rx, tx, smlf) -> int — idempotent SML descriptor pin substitution (%0?rxpin%/%0?txpin%/%0?smlf%, leading 0 optional). Inserts "; <template>" comment line above each active line on first call; rebuilds active line from template on subsequent calls. Values are substituted verbatim (e.g. tx=-1 becomes the literal "-1" which SML accepts as "no tx pin"); the original placeholder text is preserved only in the template comment. Returns # subs done, 0 = no change, -1 = err.
+  SYS_SML_SCRIPTER_LOAD = 282, // (path_c) -> int — extract >F/>S sections from descriptor, compile to bytecode, run on EverySecond/Every100ms ticks. Subset: lnv0..lnv9, +=/-=/*=//=/=, +-*/% < <= > >= == !=, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX"). Returns # sections compiled (0..2), -1 = err.
   // Console command callback
   SYS_ADD_COMMAND     = 45, // (const_idx_prefix) -> void — register command prefix
   SYS_RESPONSE_CMND  = 46, // (buf_ref) -> void — send console response
@@ -540,9 +693,11 @@ enum TcSyscall {
   SYS_DEBUG_PRINT     = 250, SYS_DEBUG_PRINT_STR = 251,
   SYS_DEBUG_DUMP      = 252,
   // Extended syscalls (256+, requires OP_SYSCALL2)
+  SYS_STRCMP_CONST    = 275, // (arr_ref, const_idx) -> int — strcmp(char[], "literal")
   SYS_SML_COPY        = 256, // (arr_ref, count) -> int — copy SML values to float array
   SYS_ARRAY_FILL      = 257, // (arr_ref, value, count) -> void — fill array with value
   SYS_ARRAY_COPY      = 258, // (dst_ref, src_ref, count) -> void — copy array to array
+  SYS_VM_STACK_DEPTH  = 283, // () -> int — current operand-stack depth (diagnostic)
 };
 
 /*********************************************************************************************\
@@ -593,6 +748,25 @@ static const char* tc_error_str(int err) {
   return buf;
 }
 
+// Emit an actionable BOUNDS diagnostic just before we return TC_ERR_BOUNDS
+// from one of the array-access opcodes. The generic "Bounds error" in the
+// TaskLoop/crash log tells you nothing about WHICH access; this says
+//   TCC: BOUNDS <kind> idx=<i> size=<n> pc=<p>
+// so you can see whether it was globals[], a local[], or a heap[handle],
+// what index was attempted, what bound was in effect, and the PC.
+//
+// Array names are not available at VM level (the bytecode carries only base
+// addresses / handle IDs), so the caller passes a short literal kind label.
+// For the motivating bug (bat_ctrl.tc, g_sl overwritten to ~230, then
+// pvact[g_sl] with pvact.size == 96), this prints
+//   TCC: BOUNDS global[] idx=230 size=96 pc=43306
+// which points straight at the line.
+static void tc_log_bounds(const char *kind, int32_t idx, uint32_t bound, uint16_t pc) {
+  AddLog(LOG_LEVEL_ERROR,
+         PSTR("TCC: BOUNDS %s idx=%ld size=%u pc=%u"),
+         kind, (long)idx, (unsigned)bound, (unsigned)pc);
+}
+
 // Write crash info to /crash.log (append, keeps last entries)
 static void tc_crash_log(int err, uint16_t pc, uint32_t instr_count, const char *context) {
 #ifdef ESP32
@@ -615,6 +789,10 @@ static void tc_crash_log(int err, uint16_t pc, uint32_t instr_count, const char 
 
 typedef struct {
   uint16_t return_pc;
+  uint16_t saved_sp;    // caller's SP at OP_CALL (including args pushed on top);
+                        // used by RET to flag callees that leaked stack slots.
+                        // sp > saved_sp at RET is a definite leak (pushed more
+                        // than consumed). Not accessed for frame 0 (main/callback).
   int32_t  *locals;     // dynamically allocated — TC_MAX_LOCALS int32_t's per frame
 } TcFrame;
 
@@ -636,6 +814,46 @@ typedef struct {
   char     name[TC_CALLBACK_NAME_MAX];  // e.g. "JsonCall", "WebCall", "EverySecond"
   uint16_t address;                      // code-relative address
 } TcCallback;
+
+// Hot-path callbacks resolved once at load via integer ID, so dispatch
+// avoids strcmp scans on every tick. The ID is just an index into
+// vm->cb_index[] which holds the slot in vm->callbacks[] (or -1 if absent).
+typedef enum {
+  TC_CB_LOOP = 0,             // EveryLoop
+  TC_CB_EVERY_50_MSECOND,     // Every50ms
+  TC_CB_EVERY_100_MSECOND,    // Every100ms
+  TC_CB_EVERY_SECOND,         // EverySecond
+  TC_CB_ON_INIT,              // OnInit
+  TC_CB_ON_WIFI_CONNECT,      // OnWifiConnect
+  TC_CB_ON_WIFI_DISCONNECT,   // OnWifiDisconnect
+  TC_CB_ON_MQTT_CONNECT,      // OnMqttConnect
+  TC_CB_ON_MQTT_DISCONNECT,   // OnMqttDisconnect
+  TC_CB_ON_MQTT_DATA,         // OnMqttData(topic, payload) — dispatched from FUNC_MQTT_DATA
+  TC_CB_ON_TIME_SET,          // OnTimeSet
+  TC_CB_CLEAN_UP,             // CleanUp
+  TC_CB_TASK_LOOP,            // TaskLoop
+  TC_CB_ON_EXIT,              // OnExit
+  TC_CB_COUNT
+} TcCallbackId;
+
+// Name table: index by TcCallbackId. Plain RAM (small, hot data).
+// PROGMEM with pointer-in-table is unreliable on ESP32 — see project notes.
+static const char * const TC_CB_NAME[TC_CB_COUNT] = {
+  "EveryLoop",
+  "Every50ms",
+  "Every100ms",
+  "EverySecond",
+  "OnInit",
+  "OnWifiConnect",
+  "OnWifiDisconnect",
+  "OnMqttConnect",
+  "OnMqttDisconnect",
+  "OnMqttData",
+  "OnTimeSet",
+  "CleanUp",
+  "TaskLoop",
+  "OnExit",
+};
 
 typedef struct {
   // Program
@@ -685,6 +903,9 @@ typedef struct {
   // Callback function table (V3)
   TcCallback    callbacks[TC_MAX_CALLBACKS];
   uint8_t       callback_count;
+  // Hot-path dispatch cache: cb_index[TcCallbackId] = slot in callbacks[] (or -1).
+  // Populated once at load — eliminates strcmp scans on every tick.
+  int8_t        cb_index[TC_CB_COUNT];
   // Persist table (V4: global entries for auto-save/load)
   struct { uint16_t index; uint16_t count; } persist[TC_MAX_PERSIST];
   uint8_t       persist_count;
@@ -789,7 +1010,7 @@ struct TINYC {
   // Upload state (one upload at a time, shared)
   bool     upload_active;           // true during upload — pauses VM callbacks
   uint8_t *upload_buf;
-  uint32_t upload_size;
+  uint32_t upload_alloc_size;       // size of upload_buf allocation (may be < TC_MAX_PROGRAM if client sent ?fsz=N)
   uint32_t upload_received;
   uint8_t  upload_slot;           // target slot for current upload
   char     upload_filename[32];   // filename during upload (copied to slot on completion)
@@ -812,13 +1033,15 @@ struct TINYC {
   bool     udp_port_open;         // port is listening
   uint32_t udp_port_last_rx;     // millis() of last received packet on general port
   uint16_t udp_port_timeout;     // inactivity timeout in seconds (0 = disabled)
+  IPAddress udp_port_mcast;       // multicast group IP (0.0.0.0 = unicast)
   // WebUI pages (up to 6, set by wLabel(), buttons on main page)
 #define TC_MAX_WEB_PAGES 6
   char     page_label[TC_MAX_WEB_PAGES][32];
+  uint8_t  page_slot[TC_MAX_WEB_PAGES];   // which VM slot registered each page
   uint8_t  page_count;            // number of registered pages
   uint8_t  current_page;          // current page being rendered (for wPage())
   // Custom web handlers (webOn)
-#define TC_MAX_WEB_HANDLERS 4
+#define TC_MAX_WEB_HANDLERS 7
   char     web_handler_url[TC_MAX_WEB_HANDLERS][32];
   uint8_t  web_handler_count;
   uint8_t  current_web_handler;   // handler number during WebOn callback
@@ -836,7 +1059,12 @@ struct TINYC {
   uint8_t  http_hdr_count;
   // TCP server state (Scripter-compatible ws* functions)
   WiFiServer *tcp_server;              // TCP listening server (heap-allocated)
-  WiFiClient tcp_client;               // current connected client
+  WiFiClient tcp_client;               // current server-accepted client
+  // TCP client state (outgoing connections — independent from server).
+  // TC_TCP_CLI_SLOTS parallel slots so a script can talk to multiple endpoints
+  // (e.g. BYD BMU + SMA HM2.0 + Wallbox) in parallel. Slot 0 is the default.
+  WiFiClient tcp_cli_clients[TC_TCP_CLI_SLOTS];  // outgoing TCP client slots
+  uint8_t    tcp_cli_slot;                       // currently selected slot (0..TC_TCP_CLI_SLOTS-1)
   // Deferred command — executed in main loop (safe for task-spawning commands like I2SPlay)
   char     deferred_cmd[128];
   volatile bool deferred_pending;
@@ -856,6 +1084,12 @@ struct TINYC {
   bool     email_active;             // true while TinyC-initiated email is being sent
   // Tesla Powerwall state (requires TESLA_POWERWALL)
   char    *pwl_json;                 // last Powerwall JSON response (malloc'd, max 4096)
+#ifdef ESP32
+  // Minimal I2S output (standalone, no USE_I2S_AUDIO needed)
+  i2s_chan_handle_t i2s_tx_handle;   // I2S TX channel handle (nullptr = not active)
+  int32_t  i2s_sample_rate;          // current sample rate
+  int16_t *i2s_pcm_buf;             // stereo PCM buffer (alloc in i2sBegin, free in i2sStop)
+#endif
 } *Tinyc = nullptr;
 
 // Currently executing slot — set before VM execution, used by output functions
@@ -892,18 +1126,50 @@ static TcSlot *tc_sensor_get_slot = nullptr; // re-entry guard: skip this slot's
 static uint16_t tc_chart_width = 0;     // chart div width in px (0 = 100%)
 static uint16_t tc_chart_height = 0;    // chart div height in px (0 = 300px)
 static int32_t  tc_chart_time_base = 0; // time base offset in minutes from "now" (0=now)
-static TasmotaSerial *tc_serial_port = nullptr; // TinyC serial port (shared across VMs)
+#define TC_MAX_SERIAL_PORTS 3
+static TasmotaSerial *tc_serial_ports[TC_MAX_SERIAL_PORTS] = {}; // TinyC serial ports (up to 3, one per handle)
 
 // Image store for dspLoadImage / dspPushImageRect (watchface backgrounds etc.)
+// Slots from imgCreate() additionally carry a RendererCanvas so that all
+// dsp* primitives can be temporarily retargeted to the slot's pixel buffer
+// via imgBeginDraw()/imgEndDraw().
+#ifdef USE_DISPLAY
+  #include <renderer.h>     // for Renderer / RendererCanvas types
+  extern Renderer *renderer;
+#endif
 #define TC_IMG_SLOTS 4
-static struct {
-  uint16_t *buf;   // RGB565 pixel data in PSRAM (NULL = free)
-  uint16_t w, h;   // image dimensions
-} tc_img_store[TC_IMG_SLOTS] = {};
+struct TcImgSlot {
+  uint16_t       *buf;     // RGB565 pixel data in PSRAM (NULL = free)
+  uint16_t        w, h;    // image dimensions
+#ifdef USE_DISPLAY
+  RendererCanvas *canvas;  // non-null if created via imgCreate() (JPG slots set null)
+#endif
+};
+static TcImgSlot tc_img_store[TC_IMG_SLOTS] = {};
 
-// Helper: free all image store slots (called on VM stop)
+#ifdef USE_DISPLAY
+// Saved panel renderer during imgBeginDraw()/imgEndDraw() redirect window.
+// Only one redirect active at a time; nested begin calls are ignored.
+static Renderer *tc_canvas_saved_renderer = nullptr;
+#endif
+
+// Helper: free all image store slots (called on VM stop). If a redirect is
+// still active we restore the panel renderer first so we don't leave the
+// global pointing at a canvas we're about to delete.
 static void tc_img_store_free(void) {
+#ifdef USE_DISPLAY
+  if (tc_canvas_saved_renderer) {
+    renderer = tc_canvas_saved_renderer;
+    tc_canvas_saved_renderer = nullptr;
+  }
+#endif
   for (int i = 0; i < TC_IMG_SLOTS; i++) {
+#ifdef USE_DISPLAY
+    if (tc_img_store[i].canvas) {
+      delete tc_img_store[i].canvas;
+      tc_img_store[i].canvas = nullptr;
+    }
+#endif
     if (tc_img_store[i].buf) {
       free(tc_img_store[i].buf);
       tc_img_store[i].buf = nullptr;
@@ -918,6 +1184,9 @@ static TcSlot *tc_slot_alloc(void) {
   TcSlot *s = (TcSlot *)calloc(1, sizeof(TcSlot));
   if (s) {
     s->extract_handle = -1;
+    // cb_index defaults to zeros from calloc, but zero is a valid slot index.
+    // Explicitly mark all well-known callbacks as "not present" until load.
+    for (int k = 0; k < TC_CB_COUNT; k++) s->vm.cb_index[k] = -1;
   }
   return s;
 }
@@ -969,8 +1238,13 @@ static inline float tc_read_f32(TcVM *vm) { return i2f(tc_read_i32(vm)); }
 
 /*********************************************************************************************\
  * VM: Array ref encoding for string functions
- * Local ref:  (fp << 16) | base_index   (bit 31 = 0)
- * Global ref: 0x80000000 | base_index   (bit 31 = 1)
+ * Local ref:   bits 31-30 = 00/01   (fp << 16) | base_index
+ * Global ref:  bits 31-30 = 10      0x80000000 | base_index
+ * Heap ref:    bits 31-30 = 11      0xC0000000 | (offset << 16) | handle
+ *                                   - bit 15 MUST be 0 (distinguishes from const-pool)
+ *                                   - bits 29-16 = slot offset within the heap block (0..16383)
+ *                                   - bits 7-0   = handle (0..255, TC_MAX_HEAP_HANDLES=128)
+ * Const-pool:  bits 31-30 = 11, bit 15 = 1   0xC0008000 | const_idx (15-bit idx)
 \*********************************************************************************************/
 
 static inline int32_t tc_make_local_ref(uint8_t fp, uint8_t base) {
@@ -979,15 +1253,22 @@ static inline int32_t tc_make_local_ref(uint8_t fp, uint8_t base) {
 static inline int32_t tc_make_global_ref(uint16_t base) {
   return (int32_t)0x80000000 | base;
 }
+// Pack a heap ref with optional slot offset. offset must be < 16384 (14 bits).
+static inline int32_t tc_make_heap_ref(uint8_t handle, uint16_t offset) {
+  return (int32_t)(0xC0000000U | (((uint32_t)(offset & 0x3FFF)) << 16) | handle);
+}
 
 // Resolve a packed array ref to a pointer into VM memory, returns NULL on error
-// Ref encoding:  bits 31-30 = 00/01 → local, 10 → global, 11 → heap
 static int32_t* tc_resolve_ref(TcVM *vm, int32_t ref) {
   uint32_t uref = (uint32_t)ref;
   uint8_t tag = uref >> 30;
   if (tag == 3) {
-    // Heap ref: 0xC0000000 | handle
-    uint16_t handle = uref & 0xFFFF;
+    // Heap ref with optional slot offset: 0xC0000000 | (offset<<16) | handle
+    // (const-pool refs are detected separately via tc_is_const_ref — callers
+    //  that need string-literal support check that FIRST; this path assumes
+    //  a regular heap ref.)
+    uint8_t handle = (uint8_t)(uref & 0xFF);
+    uint16_t offset = (uint16_t)((uref >> 16) & 0x3FFF);
     if (handle >= TC_MAX_HEAP_HANDLES) {
       AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap handle %d >= max %d"), handle, TC_MAX_HEAP_HANDLES);
       return nullptr;
@@ -998,7 +1279,12 @@ static int32_t* tc_resolve_ref(TcVM *vm, int32_t ref) {
              vm->heap_handles ? vm->heap_handles[handle].alive : 0);
       return nullptr;
     }
-    return &vm->heap_data[vm->heap_handles[handle].offset];
+    if (offset >= vm->heap_handles[handle].size) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap ref offset %d >= size %d (handle %d)"),
+             offset, vm->heap_handles[handle].size, handle);
+      return nullptr;
+    }
+    return &vm->heap_data[vm->heap_handles[handle].offset + offset];
   }
   if (tag == 2) {
     // Global ref: 0x80000000 | base_idx
@@ -1018,10 +1304,13 @@ static int32_t tc_ref_maxlen(TcVM *vm, int32_t ref) {
   uint32_t uref = (uint32_t)ref;
   uint8_t tag = uref >> 30;
   if (tag == 3) {
-    // Heap ref
-    uint16_t handle = uref & 0xFFFF;
+    // Heap ref — subtract offset from total size so a sub-ref sees only
+    // its own tail of the block.
+    uint8_t handle = (uint8_t)(uref & 0xFF);
+    uint16_t offset = (uint16_t)((uref >> 16) & 0x3FFF);
     if (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive) {
-      return vm->heap_handles[handle].size;
+      uint16_t sz = vm->heap_handles[handle].size;
+      return (offset < sz) ? (int32_t)(sz - offset) : 0;
     }
     return 0;
   }
@@ -1042,9 +1331,29 @@ static inline int32_t tc_file_mode(int32_t mode) {
   return mode;  // already 0/1/2 or invalid
 }
 
+// Detect a const-pool ref emitted by emitStringArg: tag=3 (0xC0000000) with
+// the 0x8000 bit of the handle set. Compiler uses this encoding to pass a
+// string literal where a char[] ref is expected (e.g. user function arg).
+static inline bool tc_is_const_ref(int32_t ref) {
+  uint32_t uref = (uint32_t)ref;
+  return ((uref >> 30) == 3) && ((uref & 0x8000) != 0);
+}
+
 // Extract null-terminated C string from VM array ref into char buffer
 // Returns number of chars written (excluding null terminator)
 static int tc_ref_to_cstr(TcVM *vm, int32_t ref, char *out, int maxOut) {
+  if (tc_is_const_ref(ref)) {
+    uint16_t idx = (uint16_t)(((uint32_t)ref) & 0x7FFF);
+    const char *s = nullptr;
+    if (idx < vm->const_count && vm->constants[idx].type == 1) {
+      s = vm->constants[idx].str.ptr;
+    }
+    if (!s) { out[0] = '\0'; return 0; }
+    int i;
+    for (i = 0; i < maxOut - 1 && s[i]; i++) out[i] = s[i];
+    out[i] = '\0';
+    return i;
+  }
   int32_t *buf = tc_resolve_ref(vm, ref);
   if (!buf) { out[0] = '\0'; return 0; }
   int32_t maxLen = tc_ref_maxlen(vm, ref);
@@ -1156,6 +1465,169 @@ static void tc_send_web(const char *buf, int len) {
     XdrvMailbox.data_len = strlen(tbuf);
     DisplayText();
     XdrvMailbox.data = savptr;
+  }
+
+/*********************************************************************************************\
+ * TinyUI — lightweight retained-mode UI layer on top of TinyC display primitives
+ *
+ * Design: two parallel widget pools with DIFFERENT index spaces:
+ *   - Existing VButton pool (buttons[MAX_TOUCH_BUTTONS]) for INTERACTIVE widgets:
+ *     Button/TButton/PButton/Slider/Checkbox/Icon — handled via existing USE_TOUCH_BUTTONS
+ *   - New TcUiWidget pool (tc_ui_widgets[]) for PASSIVE widgets:
+ *     Label/Progress/Gauge — drawn immediately + stored for screen-switch redraw
+ *
+ * Screens: uiScreen(id) sets current screen, clears canvas w/ theme.bg, removes all VButtons,
+ * then redraws any passive widgets tagged with the new screen id. The user's script re-creates
+ * interactive widgets via their Build*() functions on screen change.
+\*********************************************************************************************/
+#define TC_UI_MAX_WIDGETS        16
+#define TC_UI_WIDGET_NONE        0
+#define TC_UI_WIDGET_LABEL       1
+#define TC_UI_WIDGET_PROGRESS    2
+#define TC_UI_WIDGET_GAUGE       3
+
+  typedef struct {
+    uint16_t bg;      // screen background
+    uint16_t fg;      // default foreground (text)
+    uint16_t accent;  // accent / fill / needle
+    uint16_t border;  // border / gauge scale
+    uint16_t muted;   // secondary text / empty track
+    uint8_t  pad;     // default padding inside widgets (px)
+    uint8_t  radius;  // corner radius for future use
+  } TcUiTheme;
+
+  typedef struct {
+    uint8_t  type;      // TC_UI_WIDGET_*
+    uint8_t  screen;    // screen id (0 = all)
+    int16_t  x, y, w, h;
+    int32_t  value;
+    int32_t  vmin;
+    int32_t  vmax;
+    uint16_t fg;
+    uint16_t bg;
+    uint16_t accent;
+    int8_t   align;     // -1 right, 0 centre, 1 left
+    char     text_buf[48]; // label text (copied from const string on create / uiLabelSet)
+  } TcUiWidget;
+
+  static TcUiTheme tc_ui_theme = {
+    /*bg*/     0x0000, /*fg*/     0xFFFF, /*accent*/ 0x07FF,
+    /*border*/ 0x39E7, /*muted*/  0x7BEF, /*pad*/    4, /*radius*/ 6
+  };
+  static uint8_t     tc_ui_current_screen = 0;
+  static TcUiWidget  tc_ui_widgets[TC_UI_MAX_WIDGETS];
+
+  // Draw a single passive widget using existing display primitives.
+  static void tc_ui_draw_widget(const TcUiWidget *w) {
+    if (!renderer || w->type == TC_UI_WIDGET_NONE) return;
+    uint16_t saved_fg = fg_color;
+    switch (w->type) {
+      case TC_UI_WIDGET_LABEL: {
+        // Clear label area with theme.bg, then draw text left/centre/right of area.
+        renderer->fillRect(w->x, w->y, w->w, w->h, w->bg);
+        const char *txt = w->text_buf;
+        fg_color = w->fg;
+        int16_t tx = w->x + tc_ui_theme.pad;
+        if (w->align == 0) {        // centre (rough — full Adafruit textBounds not needed here)
+          int16_t tw = (int16_t)(strlen(txt) * 6); // approx 6 px / char for default font
+          tx = w->x + (w->w - tw) / 2;
+          if (tx < w->x) tx = w->x;
+        } else if (w->align == -1) { // right
+          int16_t tw = (int16_t)(strlen(txt) * 6);
+          tx = w->x + w->w - tw - tc_ui_theme.pad;
+          if (tx < w->x) tx = w->x;
+        }
+        disp_xpos = tx;
+        disp_ypos = w->y + tc_ui_theme.pad;
+        renderer->setCursor(disp_xpos, disp_ypos);
+        renderer->setTextColor(w->fg, w->bg);
+        renderer->println(txt);
+        break;
+      }
+      case TC_UI_WIDGET_PROGRESS: {
+        // Empty track
+        renderer->fillRect(w->x, w->y, w->w, w->h, w->bg);
+        // Border
+        renderer->drawRect(w->x, w->y, w->w, w->h, tc_ui_theme.border);
+        // Filled portion
+        int32_t range = w->vmax - w->vmin;
+        if (range <= 0) range = 1;
+        int32_t v = w->value;
+        if (v < w->vmin) v = w->vmin;
+        if (v > w->vmax) v = w->vmax;
+        int32_t fw = ((int32_t)(w->w - 2) * (v - w->vmin)) / range;
+        if (fw > 0) {
+          renderer->fillRect(w->x + 1, w->y + 1, (int16_t)fw, w->h - 2, w->accent);
+        }
+        break;
+      }
+      case TC_UI_WIDGET_GAUGE: {
+        // Semicircular gauge drawn as short line segments.
+        // x,y = centre; w = radius; value/vmin/vmax map to -120..+120 degrees arc.
+        int16_t cx = w->x, cy = w->y;
+        int16_t r  = w->w;
+        if (r < 4) r = 4;
+        // Erase previous needle: wipe the interior with bg. The scale ring at
+        // radius r is preserved (we only clear up to r-3; needle extends to r-4,
+        // so the old line is fully inside the wiped disc).
+        renderer->fillCircle(cx, cy, r - 3, w->bg);
+        const int SEGMENTS = 30;
+        const float a_start = -2.0944f; // -120 deg
+        const float a_span  =  4.1888f; //  240 deg
+        // Scale track (muted)
+        for (int i = 0; i < SEGMENTS; i++) {
+          float a0 = a_start + a_span * ((float)i       / SEGMENTS);
+          float a1 = a_start + a_span * ((float)(i + 1) / SEGMENTS);
+          int16_t x0 = cx + (int16_t)((float)r       * cosf(a0));
+          int16_t y0 = cy + (int16_t)((float)r       * sinf(a0));
+          int16_t x1 = cx + (int16_t)((float)r       * cosf(a1));
+          int16_t y1 = cy + (int16_t)((float)r       * sinf(a1));
+          renderer->drawLine(x0, y0, x1, y1, tc_ui_theme.border);
+        }
+        // Needle
+        int32_t range = w->vmax - w->vmin;
+        if (range <= 0) range = 1;
+        int32_t v = w->value;
+        if (v < w->vmin) v = w->vmin;
+        if (v > w->vmax) v = w->vmax;
+        float frac = (float)(v - w->vmin) / (float)range;
+        float a = a_start + a_span * frac;
+        int16_t nx = cx + (int16_t)((float)(r - 4) * cosf(a));
+        int16_t ny = cy + (int16_t)((float)(r - 4) * sinf(a));
+        renderer->drawLine(cx, cy, nx, ny, w->accent);
+        renderer->fillCircle(cx, cy, 3, w->accent);
+        break;
+      }
+      default: break;
+    }
+    fg_color = saved_fg;
+  }
+
+  // Helper: clear screen by drawing a filled rect of theme.bg covering the display
+  static void tc_ui_clear_screen() {
+    if (!renderer) return;
+    int16_t dw = renderer->width();
+    int16_t dh = renderer->height();
+    renderer->fillRect(0, 0, dw, dh, tc_ui_theme.bg);
+  }
+
+  // Helper: redraw every passive widget that belongs to the current screen (or screen 0 = all)
+  static void tc_ui_redraw_all_widgets() {
+    for (int i = 0; i < TC_UI_MAX_WIDGETS; i++) {
+      const TcUiWidget *w = &tc_ui_widgets[i];
+      if (w->type == TC_UI_WIDGET_NONE) continue;
+      if (w->screen != 0 && w->screen != tc_ui_current_screen) continue;
+      tc_ui_draw_widget(w);
+    }
+  }
+
+  // Helper: delete all VButtons (used on screen switch)
+  static void tc_ui_delete_all_vbuttons() {
+#ifdef USE_TOUCH_BUTTONS
+    for (uint32_t i = 0; i < MAX_TOUCH_BUTTONS; i++) {
+      if (buttons[i]) { delete buttons[i]; buttons[i] = nullptr; }
+    }
+#endif
   }
 #endif
 
@@ -1649,8 +2121,9 @@ static TcUdpVar* tc_udp_find_var(const char *name, bool create) {
   return nullptr;  // table full
 }
 
-// Forward declaration — defined later in this file
+// Forward declarations — defined later in this file
 static int tc_vm_call_callback(TcVM *vm, const char *name);
+static int tc_vm_call_callback_id(TcVM *vm, TcCallbackId cid);
 
 // Check if a named callback exists in the loaded program
 static bool tc_has_callback(TcVM *vm, const char *name) {
@@ -1898,7 +2371,15 @@ static void tc_udp_stop(void) {
     Tinyc->udp_port.stop();
     Tinyc->udp_port_open = false;
     Tinyc->udp_port_num = 0;
+    Tinyc->udp_port_mcast = IPAddress(0,0,0,0);
   }
+  // Stop all outgoing TCP client slots
+  for (uint8_t _s = 0; _s < TC_TCP_CLI_SLOTS; _s++) {
+    if (Tinyc->tcp_cli_clients[_s].connected()) {
+      Tinyc->tcp_cli_clients[_s].stop();
+    }
+  }
+  Tinyc->tcp_cli_slot = 0;
   // Stop TCP server
   if (Tinyc->tcp_server) {
     Tinyc->tcp_client.stop();
@@ -2205,14 +2686,22 @@ static void tc_close_all_files(void) {
   }
 }
 
-static void tc_serial_close(void) {
-  if (tc_serial_port) {
-    tc_serial_port->flush();
+static void tc_serial_close(int h) {
+  if (h >= 0 && h < TC_MAX_SERIAL_PORTS && tc_serial_ports[h]) {
+    tc_serial_ports[h]->flush();
     delay(50);
-    delete tc_serial_port;
-    tc_serial_port = nullptr;
-    AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial port closed"));
+    delete tc_serial_ports[h];
+    tc_serial_ports[h] = nullptr;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial port %d closed"), h);
   }
+}
+
+static void tc_serial_close_all(void) {
+  for (int i = 0; i < TC_MAX_SERIAL_PORTS; i++) tc_serial_close(i);
+}
+
+static inline TasmotaSerial *tc_serial_get(int h) {
+  return (h >= 0 && h < TC_MAX_SERIAL_PORTS) ? tc_serial_ports[h] : nullptr;
 }
 
 // Find a free file handle slot, returns -1 if none available
@@ -2416,6 +2905,1054 @@ static bool tc_pin_forbidden(int32_t pin) {
   }
 
 /*********************************************************************************************\
+ * SML descriptor pin substitution helpers — used by SYS_SML_APPLY_PINS
+ *
+ * Recognizes 3 placeholders: %0?rxpin% / %0?txpin% / %0?smlf% (leading 0 optional,
+ * matching the IDE's regex). Substitution is idempotent via "; <template>" comment
+ * lines kept above the active line.
+\*********************************************************************************************/
+
+// Try to match a %placeholder% at p[0..end). Returns chars consumed (>=5) on
+// match and writes 0/1/2 (rx/tx/smlf) to *kind. Returns 0 on no match.
+static int tc_sml_match_ph(const char *p, const char *end, int *kind) {
+  if (p >= end || *p != '%') return 0;
+  const char *q = p + 1;
+  if (q < end && *q == '0') q++;  // optional leading "0"
+  size_t r = end - q;
+  if (r >= 6 && memcmp(q, "rxpin%", 6) == 0) { *kind = 0; return (int)((q + 6) - p); }
+  if (r >= 6 && memcmp(q, "txpin%", 6) == 0) { *kind = 1; return (int)((q + 6) - p); }
+  if (r >= 5 && memcmp(q, "smlf%",  5) == 0) { *kind = 2; return (int)((q + 5) - p); }
+  return 0;
+}
+
+static bool tc_sml_line_has_ph(const char *p, size_t len) {
+  const char *end = p + len;
+  for (const char *q = p; q < end; q++) {
+    int kind;
+    if (tc_sml_match_ph(q, end, &kind)) return true;
+  }
+  return false;
+}
+
+// Copy src→dst substituting placeholders with the literal numeric value (including
+// negative values — e.g. -1 becomes "-1" in the output, which SML accepts as "no pin"
+// for txpin). The original placeholders stay in the "; <template>" comment line so
+// subsequent calls can still re-substitute with different values. Returns bytes
+// written.
+//
+// Rationale: SML's descriptor parser uses strtol() and requires every field to be a
+// valid integer. Leaving any "%0xxx%" text in the active line makes SML reject the
+// descriptor entirely. The template-comment line preserves the placeholder form for
+// later edits, while the active line is always fully substituted.
+static size_t tc_sml_subst_line(const char *src, size_t src_len,
+                                char *dst, size_t dst_cap,
+                                const int values[3]) {
+  const char *end = src + src_len;
+  const char *p = src;
+  size_t out = 0;
+  while (p < end && out < dst_cap) {
+    int kind;
+    int phlen = tc_sml_match_ph(p, end, &kind);
+    if (phlen > 0) {
+      char numbuf[12];
+      int nlen = snprintf(numbuf, sizeof(numbuf), "%d", values[kind]);
+      if (nlen > 0 && (size_t)(out + nlen) <= dst_cap) {
+        memcpy(dst + out, numbuf, (size_t)nlen);
+        out += (size_t)nlen;
+      }
+      p += phlen;
+    } else {
+      dst[out++] = *p++;
+    }
+  }
+  return out;
+}
+
+/*********************************************************************************************\
+ * Mini-Scripter — runs a tiny Tasmota Scripter subset extracted from an SML descriptor's
+ *   >F (Every100ms) and >S (EverySecond) sections. Aimed at builds without full Scripter
+ *   (e.g. -DTINYC_NO_SCRIPTER) where the user wants the descriptor's IEC mode-A handshake
+ *   or similar tick-driven logic to keep working.
+ *
+ * Subset (anything outside is a compile-time error → load fails, descriptor unaffected):
+ *   variables   lnv0..lnv9           (10 int32, volatile, zeroed at load)
+ *   operators   = += -= *= /=        + - * / %     < <= > >= == !=
+ *   control     switch <lnv> [case <int> ...]+ ends
+ *               if <expr> ... endif
+ *   syscalls    sml(meter, 0, baud)      → SML_SetBaud
+ *               sml(meter, 1, "HEX..")   → SML_Write (send hex bytes)
+ *               sml(-meter, 1, "BAUD:8X1") → SML_Write (reconfigure serial framing,
+ *                                           handled natively by SML_Write's flag<0 path,
+ *                                           e.g. "2400:8E1" to switch to 8E1 for M-Bus)
+ *               delay(ms)                → yield-style delay (capped at 1000 ms; see note)
+ *               spinm(pin, mode)         → pinMode(pin, mode?OUTPUT:INPUT)
+ *               spin(pin, val)           → digitalWrite(pin, val?HIGH:LOW)
+ *                                          (used by IR-reading-head descriptors like
+ *                                           EasyMeter Q3A to drive the optical TX LED)
+ *   sections    >F (Every100ms)   >S (EverySecond)
+ *   misc        ; end-of-line comment   ;-prefixed line comment   blank lines OK
+ *
+ * Compiled to a stack-machine bytecode at smlScripterLoad() time. Runtime cost per tick
+ * is dispatch + a handful of arithmetic/cmp ops; no allocations after load.
+ *
+ * `delay(ms)` is intended for short M-Bus pre-wake pauses (few hundred ms) — it runs
+ * inside the Tasmota main loop so long delays will stall other drivers. The exec caps
+ * at 1000 ms as a safety net; longer waits should be expressed as `case N` ticks instead.
+ *
+ * NOTE: If full Tasmota Scripter is also present and parsing the same file, both will run
+ * the >F/>S blocks → double work / double SML sends. Use this only when Scripter is off.
+\*********************************************************************************************/
+
+#define TC_MSCR_BC_MAX     512      // bytecode bytes per section (>F or >S)
+#define TC_MSCR_LNV_COUNT  10
+#define TC_MSCR_STK_MAX    16
+#define TC_MSCR_HEX_MAX    128      // max payload bytes for sml(m,1,"HEX..") — up to
+                                    // 256 hex chars, enough for ~1 s of 0x55 wake at 2400 bd
+#define TC_MSCR_DELAY_CAP  1000     // ms — hard cap for delay() to avoid loop starvation
+
+enum TcMsOp {
+  MS_OP_END = 0,
+  MS_OP_PUSH_LNV,    // [op][var]                    — push lnv[var]
+  MS_OP_PUSH_IMM,    // [op][i32 LE]                 — push imm
+  MS_OP_POP_LNV,     // [op][var]                    — pop → lnv[var]
+  MS_OP_ADD, MS_OP_SUB, MS_OP_MUL, MS_OP_DIV, MS_OP_MOD,
+  MS_OP_LT, MS_OP_LE, MS_OP_GT, MS_OP_GE, MS_OP_EQ, MS_OP_NE,
+  MS_OP_JMP,         // [op][u16 LE abs]             — unconditional
+  MS_OP_JZ,          // [op][u16 LE abs]             — pop, if 0 jump
+  MS_OP_SML_BAUD,    // pop baud, pop meter          → SML_SetBaud
+  MS_OP_SML_HEX,     // [op][len_lo][len_hi][chars...] pop meter → SML_Write(meter, hexstr)
+                     // (for negative meter, the payload is "BAUD:8X1" and SML_Write's
+                     //  flag<0 path reconfigures serial framing instead of sending bytes)
+  MS_OP_DELAY,       // pop ms → delay(min(ms, TC_MSCR_DELAY_CAP))
+  MS_OP_SPIN,        // pop val, pop pin             → digitalWrite(pin, val?HIGH:LOW)
+  MS_OP_SPINM,       // pop mode, pop pin            → pinMode(pin, mode?OUTPUT:INPUT)
+};
+
+typedef struct TcMiniScripter {
+  int32_t  lnv[TC_MSCR_LNV_COUNT];
+  uint8_t  bc_f[TC_MSCR_BC_MAX];
+  uint8_t  bc_s[TC_MSCR_BC_MAX];
+  uint16_t bc_f_len;
+  uint16_t bc_s_len;
+  uint8_t  loaded;          // 0/1 — bytecode populated?
+  uint8_t  has_f;
+  uint8_t  has_s;
+} TcMiniScripter;
+
+static TcMiniScripter tc_mscr;
+
+// ── Tokenizer ─────────────────────────────────────────────────────
+enum TcMsTokKind {
+  MTK_END = 0, MTK_NL, MTK_INT, MTK_HEXSTR, MTK_LNV,
+  MTK_KW_SWITCH, MTK_KW_CASE, MTK_KW_ENDS, MTK_KW_IF, MTK_KW_ENDIF, MTK_KW_SML,
+  MTK_KW_DELAY, MTK_KW_SPIN, MTK_KW_SPINM,
+  MTK_KW_FOR, MTK_KW_NEXT,
+  MTK_PLUS, MTK_MINUS, MTK_MUL, MTK_DIV, MTK_MOD,
+  MTK_LT, MTK_LE, MTK_GT, MTK_GE, MTK_EQ, MTK_NE,
+  MTK_ASSIGN, MTK_PLUSEQ, MTK_MINUSEQ, MTK_MULEQ, MTK_DIVEQ,
+  MTK_LPAREN, MTK_RPAREN,
+  MTK_ERR
+};
+
+typedef struct {
+  uint8_t k;
+  int32_t i;            // int value, lnv idx
+  const char *str;      // hex content
+  uint16_t slen;
+} TcMsTok;
+
+typedef struct {
+  const char *p, *end;
+  uint8_t *bc;
+  uint16_t cap, len;
+  uint16_t line;
+  uint8_t err;          // 0=ok, 1=overflow, 2=syntax
+  TcMsTok cur;
+  uint8_t have_cur;
+} TcMsCompiler;
+
+static void tc_mscr_skip_inline_ws(TcMsCompiler *c) {
+  while (c->p < c->end) {
+    char ch = *c->p;
+    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == ',') { c->p++; continue; }
+    if (ch == ';') {                              // comment to end of line
+      while (c->p < c->end && *c->p != '\n') c->p++;
+      continue;
+    }
+    break;
+  }
+}
+
+static void tc_mscr_lex(TcMsCompiler *c, TcMsTok *t) {
+  tc_mscr_skip_inline_ws(c);
+  t->str = NULL; t->slen = 0; t->i = 0;
+  if (c->p >= c->end) { t->k = MTK_END; return; }
+  char ch = *c->p;
+  if (ch == '\n') { c->p++; c->line++; t->k = MTK_NL; return; }
+  if (ch >= '0' && ch <= '9') {
+    int32_t v = 0;
+    while (c->p < c->end && *c->p >= '0' && *c->p <= '9') { v = v*10 + (*c->p - '0'); c->p++; }
+    t->k = MTK_INT; t->i = v; return;
+  }
+  if (ch == '"') {
+    c->p++;                                       // opening quote
+    t->str = c->p;
+    while (c->p < c->end && *c->p != '"' && *c->p != '\n') c->p++;
+    t->slen = (uint16_t)(c->p - t->str);
+    if (c->p < c->end && *c->p == '"') c->p++;    // closing quote
+    t->k = MTK_HEXSTR; return;
+  }
+  // Multi-char operators
+  if (ch == '<' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_LE; return; }
+  if (ch == '>' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_GE; return; }
+  if (ch == '=' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_EQ; return; }
+  if (ch == '!' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_NE; return; }
+  if (ch == '+' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_PLUSEQ; return; }
+  if (ch == '-' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_MINUSEQ; return; }
+  if (ch == '*' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_MULEQ; return; }
+  if (ch == '/' && c->p+1 < c->end && c->p[1] == '=') { c->p+=2; t->k = MTK_DIVEQ; return; }
+  switch (ch) {
+    case '+': c->p++; t->k = MTK_PLUS;   return;
+    case '-': c->p++; t->k = MTK_MINUS;  return;
+    case '*': c->p++; t->k = MTK_MUL;    return;
+    case '/': c->p++; t->k = MTK_DIV;    return;
+    case '%': c->p++; t->k = MTK_MOD;    return;
+    case '<': c->p++; t->k = MTK_LT;     return;
+    case '>': c->p++; t->k = MTK_GT;     return;
+    case '=': c->p++; t->k = MTK_ASSIGN; return;
+    case '(': c->p++; t->k = MTK_LPAREN; return;
+    case ')': c->p++; t->k = MTK_RPAREN; return;
+  }
+  // Identifier / keyword
+  if ((ch>='a' && ch<='z') || (ch>='A' && ch<='Z') || ch=='_') {
+    const char *s = c->p;
+    while (c->p < c->end && ((*c->p>='a'&&*c->p<='z')||(*c->p>='A'&&*c->p<='Z')||(*c->p>='0'&&*c->p<='9')||*c->p=='_')) c->p++;
+    size_t n = (size_t)(c->p - s);
+    // lnv0..lnv9
+    if (n == 4 && (s[0]=='l'||s[0]=='L') && (s[1]=='n'||s[1]=='N') && (s[2]=='v'||s[2]=='V') && s[3]>='0' && s[3]<='9') {
+      t->k = MTK_LNV; t->i = s[3] - '0'; return;
+    }
+    // keywords
+    #define KWMATCH(kw,lit) (n==sizeof(lit)-1 && memcmp(s,lit,sizeof(lit)-1)==0 ? (t->k=kw, 1) : 0)
+    if (KWMATCH(MTK_KW_SWITCH,"switch")) return;
+    if (KWMATCH(MTK_KW_CASE,  "case"))   return;
+    if (KWMATCH(MTK_KW_ENDS,  "ends"))   return;
+    if (KWMATCH(MTK_KW_IF,    "if"))     return;
+    if (KWMATCH(MTK_KW_ENDIF, "endif"))  return;
+    if (KWMATCH(MTK_KW_SML,   "sml"))    return;
+    if (KWMATCH(MTK_KW_DELAY, "delay"))  return;
+    if (KWMATCH(MTK_KW_SPINM, "spinm"))  return;
+    if (KWMATCH(MTK_KW_SPIN,  "spin"))   return;
+    if (KWMATCH(MTK_KW_FOR,   "for"))    return;
+    if (KWMATCH(MTK_KW_NEXT,  "next"))   return;
+    #undef KWMATCH
+    // Unknown identifier — carry text in str/slen so the block-level
+    // dispatcher can emit an actionable diagnostic ("unknown identifier 'X'",
+    // soft-skip for 'print', etc.).
+    t->str = s;
+    t->slen = (uint16_t)n;
+    t->k = MTK_ERR; return;
+  }
+  // Non-identifier garbage (e.g. `#`, `@`, `{`). Stash the byte in `i` so the
+  // dispatcher can say "unexpected '#'" instead of "unknown statement".
+  t->i = (int32_t)(uint8_t)ch;
+  c->p++; t->k = MTK_ERR;
+}
+
+static void tc_mscr_peek(TcMsCompiler *c, TcMsTok *out) {
+  if (!c->have_cur) { tc_mscr_lex(c, &c->cur); c->have_cur = 1; }
+  *out = c->cur;
+}
+static void tc_mscr_next(TcMsCompiler *c, TcMsTok *out) {
+  tc_mscr_peek(c, out);
+  c->have_cur = 0;
+}
+static void tc_mscr_skip_nls(TcMsCompiler *c) {
+  TcMsTok t;
+  for (;;) { tc_mscr_peek(c, &t); if (t.k != MTK_NL) break; tc_mscr_next(c, &t); }
+}
+
+// ── Bytecode emit helpers ─────────────────────────────────────────
+static void tc_mscr_emit(TcMsCompiler *c, uint8_t b) {
+  if (c->len < c->cap) c->bc[c->len++] = b;
+  else { c->err = 1; }
+}
+static void tc_mscr_emit_i32(TcMsCompiler *c, int32_t v) {
+  tc_mscr_emit(c, (uint8_t)v); tc_mscr_emit(c, (uint8_t)(v>>8));
+  tc_mscr_emit(c, (uint8_t)(v>>16)); tc_mscr_emit(c, (uint8_t)(v>>24));
+}
+static uint16_t tc_mscr_emit_jmp(TcMsCompiler *c, uint8_t op) {
+  tc_mscr_emit(c, op);
+  uint16_t pos = c->len;
+  tc_mscr_emit(c, 0); tc_mscr_emit(c, 0);
+  return pos;
+}
+static void tc_mscr_patch(TcMsCompiler *c, uint16_t at, uint16_t v) {
+  if ((uint32_t)at + 1 < c->cap) { c->bc[at] = (uint8_t)v; c->bc[at+1] = (uint8_t)(v>>8); }
+}
+static void tc_mscr_syntax(TcMsCompiler *c, const char *what) {
+  if (!c->err) {
+    c->err = 2;
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: mscr syntax @line %u: %s"), (unsigned)c->line, what);
+  }
+}
+
+// Actionable error that quotes the offending identifier, e.g.
+//   "TCC: mscr @line 7: 'for'/next loops not supported ('for')"
+// Truncates identifier to 23 chars to keep stack small.
+static void tc_mscr_err_with_ident(TcMsCompiler *c, const char *msg, const TcMsTok *t) {
+  if (c->err) return;
+  c->err = 2;
+  char buf[24];
+  size_t n = (t->slen < sizeof(buf) - 1) ? t->slen : sizeof(buf) - 1;
+  if (t->str && n) memcpy(buf, t->str, n);
+  buf[n] = 0;
+  AddLog(LOG_LEVEL_ERROR, PSTR("TCC: mscr @line %u: %s ('%s')"),
+         (unsigned)c->line, msg, buf);
+}
+
+// Compare the captured identifier in an MTK_ERR token against a C string literal.
+static int tc_mscr_ident_eq(const TcMsTok *t, const char *kw) {
+  size_t n = 0;
+  while (kw[n]) n++;
+  return (t->slen == (uint16_t)n && t->str && memcmp(t->str, kw, n) == 0);
+}
+
+// Advance the source pointer past the current line (to the next '\n' or EOF).
+// Used when soft-skipping an unsupported-but-safe statement like `print`.
+// Does not consume the '\n' — the block loop's skip_nls handles that and
+// increments c->line, so diagnostics keep their line numbers accurate.
+static void tc_mscr_skip_to_eol(TcMsCompiler *c) {
+  while (c->p < c->end && *c->p != '\n') c->p++;
+  c->have_cur = 0;   // drop any peeked token, it's stale now
+}
+
+// ── Expression parser (recursive-descent, four precedence levels) ─
+static void tc_mscr_expr_eq(TcMsCompiler *c);
+
+static void tc_mscr_primary(TcMsCompiler *c) {
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k == MTK_INT)       { tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, t.i); return; }
+  if (t.k == MTK_LNV)       { tc_mscr_emit(c, MS_OP_PUSH_LNV); tc_mscr_emit(c, (uint8_t)t.i); return; }
+  if (t.k == MTK_MINUS) {                                        // unary -
+    tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, 0);
+    tc_mscr_primary(c);
+    tc_mscr_emit(c, MS_OP_SUB);
+    return;
+  }
+  if (t.k == MTK_LPAREN) {
+    tc_mscr_expr_eq(c);
+    tc_mscr_next(c, &t);
+    if (t.k != MTK_RPAREN) tc_mscr_syntax(c, "expected )");
+    return;
+  }
+  tc_mscr_syntax(c, "expected expression");
+}
+static void tc_mscr_expr_mul(TcMsCompiler *c) {
+  tc_mscr_primary(c);
+  for (;;) {
+    TcMsTok t; tc_mscr_peek(c, &t);
+    uint8_t op;
+    if      (t.k == MTK_MUL) op = MS_OP_MUL;
+    else if (t.k == MTK_DIV) op = MS_OP_DIV;
+    else if (t.k == MTK_MOD) op = MS_OP_MOD;
+    else break;
+    tc_mscr_next(c, &t);
+    tc_mscr_primary(c);
+    tc_mscr_emit(c, op);
+  }
+}
+static void tc_mscr_expr_add(TcMsCompiler *c) {
+  tc_mscr_expr_mul(c);
+  for (;;) {
+    TcMsTok t; tc_mscr_peek(c, &t);
+    uint8_t op;
+    if      (t.k == MTK_PLUS)  op = MS_OP_ADD;
+    else if (t.k == MTK_MINUS) op = MS_OP_SUB;
+    else break;
+    tc_mscr_next(c, &t);
+    tc_mscr_expr_mul(c);
+    tc_mscr_emit(c, op);
+  }
+}
+static void tc_mscr_expr_cmp(TcMsCompiler *c) {
+  tc_mscr_expr_add(c);
+  for (;;) {
+    TcMsTok t; tc_mscr_peek(c, &t);
+    uint8_t op;
+    if      (t.k == MTK_LT) op = MS_OP_LT;
+    else if (t.k == MTK_LE) op = MS_OP_LE;
+    else if (t.k == MTK_GT) op = MS_OP_GT;
+    else if (t.k == MTK_GE) op = MS_OP_GE;
+    else break;
+    tc_mscr_next(c, &t);
+    tc_mscr_expr_add(c);
+    tc_mscr_emit(c, op);
+  }
+}
+static void tc_mscr_expr_eq(TcMsCompiler *c) {
+  tc_mscr_expr_cmp(c);
+  for (;;) {
+    TcMsTok t; tc_mscr_peek(c, &t);
+    uint8_t op;
+    if      (t.k == MTK_EQ) op = MS_OP_EQ;
+    else if (t.k == MTK_NE) op = MS_OP_NE;
+    else break;
+    tc_mscr_next(c, &t);
+    tc_mscr_expr_cmp(c);
+    tc_mscr_emit(c, op);
+  }
+}
+
+// ── Statement / block parser ──────────────────────────────────────
+static void tc_mscr_block(TcMsCompiler *c, uint8_t term1, uint8_t term2);
+
+static void tc_mscr_stmt_assign(TcMsCompiler *c, int lnv_idx, uint8_t opkind) {
+  // opkind: MTK_ASSIGN/PLUSEQ/MINUSEQ/MULEQ/DIVEQ
+  if (opkind == MTK_ASSIGN) {
+    tc_mscr_expr_eq(c);
+  } else {
+    uint8_t op = MS_OP_ADD;
+    switch (opkind) {
+      case MTK_PLUSEQ:  op = MS_OP_ADD; break;
+      case MTK_MINUSEQ: op = MS_OP_SUB; break;
+      case MTK_MULEQ:   op = MS_OP_MUL; break;
+      case MTK_DIVEQ:   op = MS_OP_DIV; break;
+    }
+    tc_mscr_emit(c, MS_OP_PUSH_LNV); tc_mscr_emit(c, (uint8_t)lnv_idx);
+    tc_mscr_expr_eq(c);
+    tc_mscr_emit(c, op);
+  }
+  tc_mscr_emit(c, MS_OP_POP_LNV); tc_mscr_emit(c, (uint8_t)lnv_idx);
+}
+
+static void tc_mscr_stmt_sml(TcMsCompiler *c) {
+  // Already consumed "sml" keyword. Expect "(" int sub  rest ")"
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k != MTK_LPAREN) { tc_mscr_syntax(c, "sml expected ("); return; }
+  tc_mscr_expr_eq(c);                              // meter on stack
+  TcMsTok ts; tc_mscr_next(c, &ts);
+  if (ts.k != MTK_INT) { tc_mscr_syntax(c, "sml subop must be literal int"); return; }
+  if (ts.i == 0) {                                 // sml(m, 0, baud) → SetBaud
+    tc_mscr_expr_eq(c);                            // baud on stack
+    tc_mscr_next(c, &t);
+    if (t.k != MTK_RPAREN) { tc_mscr_syntax(c, "sml expected )"); return; }
+    tc_mscr_emit(c, MS_OP_SML_BAUD);
+  } else if (ts.i == 1) {                          // sml(m, 1, "HEX..") → SML_Write hex
+    tc_mscr_next(c, &t);
+    if (t.k != MTK_HEXSTR) { tc_mscr_syntax(c, "sml(.,1,..) needs \"…\" literal"); return; }
+    if (t.slen == 0 || t.slen > TC_MSCR_HEX_MAX*2) {
+      tc_mscr_syntax(c, "sml string empty or too long"); return;
+    }
+    TcMsTok tc2; tc_mscr_next(c, &tc2);
+    if (tc2.k != MTK_RPAREN) { tc_mscr_syntax(c, "sml expected )"); return; }
+    // encoding: [op][len_lo][len_hi][chars…]
+    // Note: string contents are not hex-validated at compile time. SML_Write
+    // itself parses the payload: positive meter = hex bytes; negative meter
+    // = "BAUD:8X1" serial reconfigure (M-Bus mid-stream parity switch).
+    tc_mscr_emit(c, MS_OP_SML_HEX);
+    tc_mscr_emit(c, (uint8_t)(t.slen & 0xFF));
+    tc_mscr_emit(c, (uint8_t)(t.slen >> 8));
+    for (uint16_t k = 0; k < t.slen; k++) tc_mscr_emit(c, (uint8_t)t.str[k]);
+  } else {
+    tc_mscr_syntax(c, "sml subop must be 0 or 1"); return;
+  }
+}
+
+static void tc_mscr_stmt_delay(TcMsCompiler *c) {
+  // "delay" already consumed. Expect: ( <expr> )
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k != MTK_LPAREN) { tc_mscr_syntax(c, "delay expected ("); return; }
+  tc_mscr_expr_eq(c);                              // ms on stack
+  tc_mscr_next(c, &t);
+  if (t.k != MTK_RPAREN) { tc_mscr_syntax(c, "delay expected )"); return; }
+  tc_mscr_emit(c, MS_OP_DELAY);
+}
+
+// Shared parser for spin(pin, val) / spinm(pin, mode). Both forms take two
+// int expressions; op selects digitalWrite vs pinMode at runtime.
+static void tc_mscr_stmt_spin_like(TcMsCompiler *c, uint8_t op) {
+  // "spin" or "spinm" already consumed. Expect: ( <expr> , <expr> )
+  // (commas are lexer whitespace → `spin(pin val)` also accepted.)
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k != MTK_LPAREN) { tc_mscr_syntax(c, "spin expected ("); return; }
+  tc_mscr_expr_eq(c);                              // pin on stack
+  tc_mscr_expr_eq(c);                              // val/mode on stack
+  tc_mscr_next(c, &t);
+  if (t.k != MTK_RPAREN) { tc_mscr_syntax(c, "spin expected )"); return; }
+  tc_mscr_emit(c, op);
+}
+
+static void tc_mscr_stmt_switch(TcMsCompiler *c) {
+  // "switch" already consumed. Expect: <lnv> NL  [case <int> NL block]+ ends
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k != MTK_LNV) { tc_mscr_syntax(c, "switch needs lnvN"); return; }
+  uint8_t var = (uint8_t)t.i;
+  // Expect newline
+  TcMsTok nl; tc_mscr_next(c, &nl);
+  if (nl.k != MTK_NL && nl.k != MTK_END) { tc_mscr_syntax(c, "switch: expected newline"); return; }
+  tc_mscr_skip_nls(c);
+  uint16_t end_jumps[16]; uint8_t end_jumps_n = 0;
+  for (;;) {
+    TcMsTok kw; tc_mscr_peek(c, &kw);
+    if (kw.k == MTK_KW_ENDS) { tc_mscr_next(c, &kw); break; }
+    if (kw.k == MTK_END)     { tc_mscr_syntax(c, "switch: missing ends"); return; }
+    if (kw.k != MTK_KW_CASE) { tc_mscr_syntax(c, "switch: expected case"); return; }
+    tc_mscr_next(c, &kw);
+    TcMsTok ci; tc_mscr_next(c, &ci);
+    if (ci.k != MTK_INT) { tc_mscr_syntax(c, "case needs int"); return; }
+    TcMsTok cnl; tc_mscr_next(c, &cnl);
+    if (cnl.k != MTK_NL && cnl.k != MTK_END) { tc_mscr_syntax(c, "case: expected newline"); return; }
+    tc_mscr_skip_nls(c);
+    // emit:  PUSH_LNV var; PUSH_IMM ci.i; EQ; JZ next_case
+    tc_mscr_emit(c, MS_OP_PUSH_LNV); tc_mscr_emit(c, var);
+    tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, ci.i);
+    tc_mscr_emit(c, MS_OP_EQ);
+    uint16_t jz_pos = tc_mscr_emit_jmp(c, MS_OP_JZ);
+    // body until next case or ends
+    tc_mscr_block(c, MTK_KW_CASE, MTK_KW_ENDS);
+    // jump to end-of-switch
+    if (end_jumps_n < 16) {
+      end_jumps[end_jumps_n++] = tc_mscr_emit_jmp(c, MS_OP_JMP);
+    } else {
+      tc_mscr_syntax(c, "switch too many cases"); return;
+    }
+    tc_mscr_patch(c, jz_pos, c->len);
+  }
+  // patch all end-of-switch jumps
+  for (uint8_t i = 0; i < end_jumps_n; i++) tc_mscr_patch(c, end_jumps[i], c->len);
+}
+
+static void tc_mscr_stmt_if(TcMsCompiler *c) {
+  // "if" already consumed. Expect: <expr> NL  body  endif
+  tc_mscr_expr_eq(c);
+  TcMsTok nl; tc_mscr_next(c, &nl);
+  if (nl.k != MTK_NL && nl.k != MTK_END) { tc_mscr_syntax(c, "if: expected newline"); return; }
+  tc_mscr_skip_nls(c);
+  uint16_t jz_pos = tc_mscr_emit_jmp(c, MS_OP_JZ);
+  tc_mscr_block(c, MTK_KW_ENDIF, MTK_KW_ENDIF);
+  TcMsTok endif; tc_mscr_next(c, &endif);
+  if (endif.k != MTK_KW_ENDIF) { tc_mscr_syntax(c, "if: missing endif"); return; }
+  tc_mscr_patch(c, jz_pos, c->len);
+}
+
+// Consume an optional unary '-' then an int literal. Returns 1 on success,
+// 0 on parse failure (calls tc_mscr_syntax with `ctx` on failure).
+static int tc_mscr_read_signed_int(TcMsCompiler *c, int32_t *out, const char *ctx) {
+  TcMsTok t; tc_mscr_next(c, &t);
+  int negate = 0;
+  if (t.k == MTK_MINUS) { negate = 1; tc_mscr_next(c, &t); }
+  if (t.k != MTK_INT) { tc_mscr_syntax(c, ctx); return 0; }
+  *out = negate ? -t.i : t.i;
+  return 1;
+}
+
+// for <lnv>  <start>  <end>  <step>
+//   <body>
+// next
+//
+// Scripter-compatible integer range loop. Bounds and step must be signed
+// int literals so the direction test (LE vs GE) is decidable at compile
+// time and we don't need a separate backward-loop opcode.
+//
+// Compiles to (reusing existing opcodes, no new VM additions):
+//     PUSH_IMM start; POP_LNV var          ; init
+//   LOOP:
+//     PUSH_LNV var; PUSH_IMM end; (LE|GE)
+//     JZ DONE                              ; falls through if in range
+//     <body>                               ; recursive block, term=MTK_KW_NEXT
+//     PUSH_LNV var; PUSH_IMM step; ADD; POP_LNV var
+//     JMP LOOP
+//   DONE:
+//
+// Typical cost vs. unrolling: a 53-iteration M-Bus wake preamble
+// (`for lnv1 1 53 1 ; sml(1 1 "55…") ; next`) compiles to ~60 B of bytecode
+// versus ~1100 B when the loop is manually decomposed — the difference
+// between fitting inside TC_MSCR_BC_MAX (512 B) and silently overflowing.
+static void tc_mscr_stmt_for(TcMsCompiler *c) {
+  // "for" already consumed.
+  TcMsTok t; tc_mscr_next(c, &t);
+  if (t.k != MTK_LNV) { tc_mscr_syntax(c, "for needs lnvN"); return; }
+  uint8_t var = (uint8_t)t.i;
+  int32_t start, end, step;
+  if (!tc_mscr_read_signed_int(c, &start, "for: start must be int literal")) return;
+  if (!tc_mscr_read_signed_int(c, &end,   "for: end must be int literal"))   return;
+  if (!tc_mscr_read_signed_int(c, &step,  "for: step must be int literal"))  return;
+  if (step == 0) { tc_mscr_syntax(c, "for: step must not be 0"); return; }
+  TcMsTok nl; tc_mscr_next(c, &nl);
+  if (nl.k != MTK_NL && nl.k != MTK_END) { tc_mscr_syntax(c, "for: expected newline"); return; }
+  tc_mscr_skip_nls(c);
+
+  // init: var = start
+  tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, start);
+  tc_mscr_emit(c, MS_OP_POP_LNV);  tc_mscr_emit(c, var);
+
+  // loop top: PUSH var; PUSH end; (LE|GE); JZ done
+  uint16_t loop_top = c->len;
+  tc_mscr_emit(c, MS_OP_PUSH_LNV); tc_mscr_emit(c, var);
+  tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, end);
+  tc_mscr_emit(c, step > 0 ? MS_OP_LE : MS_OP_GE);
+  uint16_t done_jz = tc_mscr_emit_jmp(c, MS_OP_JZ);
+
+  // body (block reads until `next`)
+  tc_mscr_block(c, MTK_KW_NEXT, MTK_KW_NEXT);
+  TcMsTok nx; tc_mscr_next(c, &nx);
+  if (nx.k != MTK_KW_NEXT) { tc_mscr_syntax(c, "for: missing next"); return; }
+
+  // increment: var = var + step
+  tc_mscr_emit(c, MS_OP_PUSH_LNV); tc_mscr_emit(c, var);
+  tc_mscr_emit(c, MS_OP_PUSH_IMM); tc_mscr_emit_i32(c, step);
+  tc_mscr_emit(c, MS_OP_ADD);
+  tc_mscr_emit(c, MS_OP_POP_LNV);  tc_mscr_emit(c, var);
+
+  // unconditional back-jump to loop_top (MS_OP_JMP is [op][u16 LE abs])
+  tc_mscr_emit(c, MS_OP_JMP);
+  tc_mscr_emit(c, (uint8_t)(loop_top & 0xFF));
+  tc_mscr_emit(c, (uint8_t)(loop_top >> 8));
+
+  // patch exit-jump target to here
+  tc_mscr_patch(c, done_jz, c->len);
+}
+
+static void tc_mscr_block(TcMsCompiler *c, uint8_t term1, uint8_t term2) {
+  for (;;) {
+    if (c->err) return;
+    tc_mscr_skip_nls(c);
+    TcMsTok t; tc_mscr_peek(c, &t);
+    if (t.k == MTK_END) return;
+    if (t.k == term1 || t.k == term2) return;
+    if (t.k == MTK_LNV) {
+      tc_mscr_next(c, &t);
+      int v = t.i;
+      TcMsTok op; tc_mscr_next(c, &op);
+      if (op.k != MTK_ASSIGN && op.k != MTK_PLUSEQ && op.k != MTK_MINUSEQ &&
+          op.k != MTK_MULEQ  && op.k != MTK_DIVEQ) {
+        tc_mscr_syntax(c, "expected = += -= *= /="); return;
+      }
+      tc_mscr_stmt_assign(c, v, op.k);
+    } else if (t.k == MTK_KW_SML) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_sml(c);
+    } else if (t.k == MTK_KW_DELAY) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_delay(c);
+    } else if (t.k == MTK_KW_SPIN) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_spin_like(c, MS_OP_SPIN);
+    } else if (t.k == MTK_KW_SPINM) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_spin_like(c, MS_OP_SPINM);
+    } else if (t.k == MTK_KW_SWITCH) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_switch(c);
+    } else if (t.k == MTK_KW_IF) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_if(c);
+    } else if (t.k == MTK_KW_FOR) {
+      tc_mscr_next(c, &t);
+      tc_mscr_stmt_for(c);
+    } else if (t.k == MTK_ERR && t.slen > 0) {
+      // Unknown identifier — check for known-unsupported Scripter constructs
+      // and give actionable hints so users know which rewrite to apply.
+      // ── Soft-skip: `print …` is diagnostic output only, always safe to drop.
+      if (tc_mscr_ident_eq(&t, "print")) {
+        tc_mscr_next(c, &t);
+        tc_mscr_skip_to_eol(c);
+        AddLog(LOG_LEVEL_INFO,
+               PSTR("TCC: mscr @line %u: 'print' line dropped (diagnostic only)"),
+               (unsigned)c->line);
+        continue;  // retry at next statement
+      }
+      // ── Hard failures with rewrite hints (see tinyc/examples/sml/README.md).
+      // NOTE: `for`/`next` are real keywords since v1.3.16 — they lex as
+      // MTK_KW_FOR/MTK_KW_NEXT and never reach this branch. No diagnostic
+      // needed.
+      if (tc_mscr_ident_eq(&t, "mins")   || tc_mscr_ident_eq(&t, "secs") ||
+          tc_mscr_ident_eq(&t, "hours")  || tc_mscr_ident_eq(&t, "upsecs") ||
+          tc_mscr_ident_eq(&t, "upmins") || tc_mscr_ident_eq(&t, "tstamp") ||
+          tc_mscr_ident_eq(&t, "time")) {
+        tc_mscr_err_with_ident(c,
+          "builtin time variable not supported — use a local lnv tick counter", &t);
+        return;
+      }
+      if (tc_mscr_ident_eq(&t, "sb") || tc_mscr_ident_eq(&t, "st") ||
+          tc_mscr_ident_eq(&t, "sl")) {
+        tc_mscr_err_with_ident(c,
+          "string slicing not supported in mini-scripter", &t);
+        return;
+      }
+      // Generic: name the identifier so the user knows what to look for.
+      tc_mscr_err_with_ident(c, "unknown identifier", &t);
+      return;
+    } else if (t.k == MTK_ERR && t.slen == 0) {
+      // Bad character (not an identifier). Most common case: `#` at line start
+      // of a `#subname` subroutine definition.
+      if (t.i == '#') {
+        tc_mscr_syntax(c,
+          "'#' found — =# subroutines not supported, inline the body at call site");
+      } else if (t.i >= 32 && t.i < 127) {
+        char msg[40];
+        snprintf(msg, sizeof(msg), "unexpected '%c'", (char)t.i);
+        tc_mscr_syntax(c, msg);
+      } else {
+        tc_mscr_syntax(c, "unexpected byte in source");
+      }
+      return;
+    } else if (t.k == MTK_ASSIGN) {
+      // Bare `=` at statement start (no lnv in front) — almost certainly a
+      // Scripter `=#subname` call site, which we don't support.
+      tc_mscr_syntax(c,
+        "'=' at statement start — =#subroutine calls not supported, inline the body");
+      return;
+    } else {
+      tc_mscr_syntax(c, "unknown statement"); return;
+    }
+    // consume statement-terminating newline (one or more)
+    tc_mscr_skip_nls(c);
+  }
+}
+
+static int tc_mscr_compile(const char *src, size_t src_len, uint8_t *bc, uint16_t cap, uint16_t *out_len) {
+  TcMsCompiler c;
+  memset(&c, 0, sizeof(c));
+  c.p = src; c.end = src + src_len;
+  c.bc = bc; c.cap = cap;
+  c.line = 1;
+  tc_mscr_block(&c, MTK_END, MTK_END);
+  if (c.err) { *out_len = 0; return -1; }
+  tc_mscr_emit(&c, MS_OP_END);
+  if (c.err) { *out_len = 0; return -1; }
+  *out_len = c.len;
+  return 0;
+}
+
+// ── VM (stack interpreter) ────────────────────────────────────────
+static int tc_mscr_hexnibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static void tc_mscr_exec(uint8_t *bc, uint16_t bc_len, int32_t *lnv) {
+  if (!bc || !bc_len) return;
+  int32_t stk[TC_MSCR_STK_MAX];
+  int sp = 0;
+  uint16_t ip = 0;
+  uint32_t guard = 0;
+  while (ip < bc_len && guard++ < 4096) {
+    uint8_t op = bc[ip++];
+    switch (op) {
+      case MS_OP_END: return;
+      case MS_OP_PUSH_LNV: {
+        if (ip >= bc_len) return;
+        uint8_t v = bc[ip++];
+        if (sp >= TC_MSCR_STK_MAX || v >= TC_MSCR_LNV_COUNT) return;
+        stk[sp++] = lnv[v];
+        break;
+      }
+      case MS_OP_PUSH_IMM: {
+        if (ip + 4 > bc_len) return;
+        int32_t v = (int32_t)(bc[ip] | (bc[ip+1]<<8) | (bc[ip+2]<<16) | (bc[ip+3]<<24));
+        ip += 4;
+        if (sp >= TC_MSCR_STK_MAX) return;
+        stk[sp++] = v;
+        break;
+      }
+      case MS_OP_POP_LNV: {
+        if (ip >= bc_len || sp <= 0) return;
+        uint8_t v = bc[ip++];
+        if (v >= TC_MSCR_LNV_COUNT) return;
+        lnv[v] = stk[--sp];
+        break;
+      }
+      case MS_OP_ADD: case MS_OP_SUB: case MS_OP_MUL: case MS_OP_DIV: case MS_OP_MOD:
+      case MS_OP_LT:  case MS_OP_LE:  case MS_OP_GT:  case MS_OP_GE:  case MS_OP_EQ: case MS_OP_NE: {
+        if (sp < 2) return;
+        int32_t b = stk[--sp];
+        int32_t a = stk[--sp];
+        int32_t r = 0;
+        switch (op) {
+          case MS_OP_ADD: r = a + b; break;
+          case MS_OP_SUB: r = a - b; break;
+          case MS_OP_MUL: r = a * b; break;
+          case MS_OP_DIV: r = (b==0) ? 0 : a / b; break;
+          case MS_OP_MOD: r = (b==0) ? 0 : a % b; break;
+          case MS_OP_LT:  r = (a <  b); break;
+          case MS_OP_LE:  r = (a <= b); break;
+          case MS_OP_GT:  r = (a >  b); break;
+          case MS_OP_GE:  r = (a >= b); break;
+          case MS_OP_EQ:  r = (a == b); break;
+          case MS_OP_NE:  r = (a != b); break;
+        }
+        stk[sp++] = r;
+        break;
+      }
+      case MS_OP_JMP: {
+        if (ip + 2 > bc_len) return;
+        uint16_t tgt = (uint16_t)(bc[ip] | (bc[ip+1]<<8));
+        ip = tgt;
+        break;
+      }
+      case MS_OP_JZ: {
+        if (ip + 2 > bc_len || sp <= 0) return;
+        uint16_t tgt = (uint16_t)(bc[ip] | (bc[ip+1]<<8));
+        ip += 2;
+        int32_t v = stk[--sp];
+        if (!v) ip = tgt;
+        break;
+      }
+      case MS_OP_SML_BAUD: {
+        if (sp < 2) return;
+        int32_t baud  = stk[--sp];
+        int32_t meter = stk[--sp];
+#if defined(USE_SML_M) || defined(USE_SML)
+        SML_SetBaud((uint32_t)meter, (uint32_t)baud);
+#else
+        // SML driver not compiled in — consume args, no-op. Lets pre-compiled
+        // .tas bytecode load without crashing the VM, but the meter call is
+        // silently dropped.
+        (void)meter; (void)baud;
+#endif
+        break;
+      }
+      case MS_OP_SML_HEX: {
+        if (ip + 2 > bc_len || sp < 1) return;
+        uint16_t hlen = (uint16_t)(bc[ip] | (bc[ip+1] << 8));
+        ip += 2;
+        if (ip + hlen > bc_len) return;
+        // Build a NUL-terminated string for SML_Write. Positive meter → hex
+        // bytes; negative meter → "BAUD:8X1" serial-reconfigure (parsed by
+        // SML_Write's flag<0 path).
+        char hbuf[TC_MSCR_HEX_MAX*2 + 4];
+        if (hlen >= sizeof(hbuf)) return;
+        memcpy(hbuf, bc + ip, hlen);
+        hbuf[hlen] = 0;
+        ip += hlen;
+        int32_t meter = stk[--sp];
+#if defined(USE_SML_M) || defined(USE_SML)
+        SML_Write((int32_t)meter, hbuf);
+#else
+        // SML driver not compiled in — consume args, no-op (see MS_OP_SML_BAUD).
+        (void)meter; (void)hbuf;
+#endif
+        break;
+      }
+      case MS_OP_DELAY: {
+        if (sp < 1) return;
+        int32_t ms = stk[--sp];
+        if (ms < 0) ms = 0;
+        if (ms > TC_MSCR_DELAY_CAP) ms = TC_MSCR_DELAY_CAP;
+        if (ms > 0) delay((uint32_t)ms);
+        break;
+      }
+      case MS_OP_SPIN: {
+        // spin(pin, val) → digitalWrite(pin, val ? HIGH : LOW)
+        if (sp < 2) return;
+        int32_t val = stk[--sp];
+        int32_t pin = stk[--sp];
+        if (pin >= 0 && pin < MAX_GPIO_PIN) {
+          digitalWrite((uint8_t)pin, val ? HIGH : LOW);
+        }
+        break;
+      }
+      case MS_OP_SPINM: {
+        // spinm(pin, mode) → pinMode(pin, mode ? OUTPUT : INPUT)
+        // Tasmota Scripter semantics: 1 = OUTPUT, 0 = INPUT.
+        if (sp < 2) return;
+        int32_t mode = stk[--sp];
+        int32_t pin  = stk[--sp];
+        if (pin >= 0 && pin < MAX_GPIO_PIN) {
+          pinMode((uint8_t)pin, mode ? OUTPUT : INPUT);
+        }
+        break;
+      }
+      default: return;                              // unknown opcode → bail
+    }
+  }
+}
+
+// ── Tick dispatcher (called from tc_all_callbacks_id) ─────────────
+static inline void tc_mscr_tick_f(void) {
+  if (tc_mscr.loaded && tc_mscr.has_f) tc_mscr_exec(tc_mscr.bc_f, tc_mscr.bc_f_len, tc_mscr.lnv);
+}
+static inline void tc_mscr_tick_s(void) {
+  if (tc_mscr.loaded && tc_mscr.has_s) tc_mscr_exec(tc_mscr.bc_s, tc_mscr.bc_s_len, tc_mscr.lnv);
+}
+
+// ── Section extractor ─────────────────────────────────────────────
+// Find the first line beginning with `marker` (e.g. ">F"). Returns pointer to
+// the line AFTER the marker (i.e. start of body), and writes the body length up
+// to the next ">X" line or end-of-buffer to *out_len. Returns NULL if not found.
+static const char *tc_mscr_find_section(const char *buf, size_t buf_len, const char *marker, size_t *out_len) {
+  size_t mlen = strlen(marker);
+  const char *p = buf;
+  const char *end = buf + buf_len;
+  while (p < end) {
+    // Is this line the marker?
+    size_t rem = (size_t)(end - p);
+    if (rem >= mlen && memcmp(p, marker, mlen) == 0) {
+      // Verify it's followed by NL/space/EOL (so ">F" doesn't match ">FOO")
+      char nx = (p + mlen < end) ? p[mlen] : '\n';
+      if (nx == '\n' || nx == '\r' || nx == ' ' || nx == '\t') {
+        // skip to next line
+        const char *body = (const char*)memchr(p, '\n', rem);
+        body = body ? body + 1 : end;
+        // body extends until next line starting with '>' or EOF
+        const char *q = body;
+        while (q < end) {
+          const char *eol = (const char*)memchr(q, '\n', (size_t)(end - q));
+          const char *next_line_start = eol ? eol + 1 : end;
+          if (next_line_start < end && *next_line_start == '>') {
+            *out_len = (size_t)(next_line_start - body);
+            return body;
+          }
+          q = next_line_start;
+        }
+        *out_len = (size_t)(end - body);
+        return body;
+      }
+    }
+    // advance to next line
+    const char *eol = (const char*)memchr(p, '\n', rem);
+    p = eol ? eol + 1 : end;
+  }
+  *out_len = 0;
+  return NULL;
+}
+
+// Public load entry — read file at `path`, extract >F/>S, compile both. Returns:
+//   number of sections successfully compiled (0..2), -1 = error (open/size).
+static int tc_mscr_load(const char *path) {
+#ifdef USE_UFILESYS
+  memset(&tc_mscr, 0, sizeof(tc_mscr));
+  char fpath[128]; strlcpy(fpath, path, sizeof(fpath));
+  FS *fsp = tc_file_path(fpath);
+  if (!fsp) return -1;
+  File f = fsp->open(fpath, "r");
+  if (!f) return -1;
+  size_t fsize = (size_t)f.size();
+  if (fsize == 0 || fsize > 8192) { f.close(); return -1; }
+  char *buf = (char*)malloc(fsize + 1);
+  if (!buf) { f.close(); return -1; }
+  size_t got = (size_t)f.read((uint8_t*)buf, fsize);
+  buf[got] = 0;
+  f.close();
+  int ok = 0;
+  size_t sec_len = 0;
+  const char *body;
+  body = tc_mscr_find_section(buf, got, ">F", &sec_len);
+  if (body) {
+    if (tc_mscr_compile(body, sec_len, tc_mscr.bc_f, TC_MSCR_BC_MAX, &tc_mscr.bc_f_len) == 0) {
+      tc_mscr.has_f = 1; ok++;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: mscr compiled >F %u src→%u bc"), (unsigned)sec_len, (unsigned)tc_mscr.bc_f_len);
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: mscr >F compile failed"));
+    }
+  }
+  body = tc_mscr_find_section(buf, got, ">S", &sec_len);
+  if (body) {
+    if (tc_mscr_compile(body, sec_len, tc_mscr.bc_s, TC_MSCR_BC_MAX, &tc_mscr.bc_s_len) == 0) {
+      tc_mscr.has_s = 1; ok++;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: mscr compiled >S %u src→%u bc"), (unsigned)sec_len, (unsigned)tc_mscr.bc_s_len);
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: mscr >S compile failed"));
+    }
+  }
+  free(buf);
+  if (ok > 0) tc_mscr.loaded = 1;
+  return ok;
+#else
+  (void)path;
+  return -1;
+#endif
+}
+
+/*********************************************************************************************\
+ * Cross-VM shared key/value store
+ *
+ * A small driver-global table (mutex-protected on ESP32) that lets multiple
+ * TinyC slots share named scalars/strings — useful when a single program
+ * outgrows TC_MAX_PROGRAM and is split across two or more slots.
+ *
+ *   shareSetInt("key", v);   int   v = shareGetInt("key");
+ *   shareSetFloat("key", f); float f = shareGetFloat("key");
+ *   shareSetStr("key", buf); shareGetStr("key", outBuf);
+ *   shareHas("key");         shareDelete("key");
+ *
+ * Keys are string literals (compile-time constants). A get on a missing key
+ * returns 0 / 0.0 / "" — never errors — so reader code stays simple.
+ * Caps: TC_SHARE_MAX entries × (TC_SHARE_KEY_LEN+1 key + TC_SHARE_STR_LEN+1
+ * value) ≈ 32 × 81 B ≈ 2.6 KB worst case. Storage is not persisted across
+ * reboots; if a script needs persistence it can write its own pvars.
+\*********************************************************************************************/
+
+#ifndef TC_SHARE_MAX
+  #define TC_SHARE_MAX     32     // total named entries across all slots
+#endif
+#ifndef TC_SHARE_KEY_LEN
+  #define TC_SHARE_KEY_LEN 16     // max key length (excluding NUL)
+#endif
+#ifndef TC_SHARE_STR_LEN
+  #define TC_SHARE_STR_LEN 64     // max string-value length (excluding NUL)
+#endif
+
+#define TC_SHARE_TYPE_NONE 0
+#define TC_SHARE_TYPE_INT  1
+#define TC_SHARE_TYPE_FLT  2
+#define TC_SHARE_TYPE_STR  3
+
+typedef struct TcShareEntry {
+  char     key[TC_SHARE_KEY_LEN + 1];
+  uint8_t  type;                                // TC_SHARE_TYPE_*
+  union { int32_t i; float f; } v;
+  char     s[TC_SHARE_STR_LEN + 1];             // populated only when type == STR
+} TcShareEntry;
+
+static TcShareEntry tc_share_table[TC_SHARE_MAX] = { };
+
+#ifdef ESP32
+static SemaphoreHandle_t tc_share_mutex = nullptr;
+static inline void tc_share_lock(void) {
+  if (!tc_share_mutex) tc_share_mutex = xSemaphoreCreateMutex();
+  if (tc_share_mutex)  xSemaphoreTake(tc_share_mutex, portMAX_DELAY);
+}
+static inline void tc_share_unlock(void) {
+  if (tc_share_mutex) xSemaphoreGive(tc_share_mutex);
+}
+#else
+static inline void tc_share_lock(void)   {}
+static inline void tc_share_unlock(void) {}
+#endif
+
+// Returns table index for `key`, or -1 if not present. Caller holds lock.
+static int tc_share_find(const char *key) {
+  if (!key || !*key) return -1;
+  for (int i = 0; i < TC_SHARE_MAX; i++) {
+    if (tc_share_table[i].type != TC_SHARE_TYPE_NONE &&
+        strncmp(tc_share_table[i].key, key, TC_SHARE_KEY_LEN) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Returns existing slot for `key`, or first free slot (claimed by writing the
+// key); -1 if the table is full. Caller holds lock.
+static int tc_share_find_or_alloc(const char *key) {
+  int idx = tc_share_find(key);
+  if (idx >= 0) return idx;
+  for (int i = 0; i < TC_SHARE_MAX; i++) {
+    if (tc_share_table[i].type == TC_SHARE_TYPE_NONE) {
+      strlcpy(tc_share_table[i].key, key, sizeof(tc_share_table[i].key));
+      tc_share_table[i].s[0] = '\0';
+      return i;
+    }
+  }
+  return -1;
+}
+
+/*********************************************************************************************\
  * VM: Syscall dispatch
 \*********************************************************************************************/
 
@@ -2582,6 +4119,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     case SYS_MICROS:
       TC_PUSH(vm, (int32_t)micros());
       break;
+    case SYS_VM_STACK_DEPTH: {
+      // Diagnostic: report current operand-stack depth *before* this syscall's return push.
+      // Useful for detecting SP leaks in user scripts / callback chains.
+      int32_t depth = (int32_t)vm->sp;
+      TC_PUSH(vm, depth);
+      break;
+    }
     case SYS_TIMER_START: {
       a = TC_POP(vm);  // ms
       b = TC_POP(vm);  // id
@@ -2620,14 +4164,21 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
 
     // ── Serial ─────────────────────────────────────────
     case SYS_SERIAL_BEGIN: {
-      // serialBegin(rxpin, txpin, baud, config, bufsize) -> int
+      // serialBegin(rxpin, txpin, baud, config, bufsize) -> int (handle 0..2, or -1 on error)
       int32_t bufsize = TC_POP(vm);
       int32_t config  = TC_POP(vm);
       int32_t baud    = TC_POP(vm);
       int32_t txpin   = TC_POP(vm);
       int32_t rxpin   = TC_POP(vm);
-      if (tc_serial_port) {
-        tc_serial_close();  // close previous instance
+      // find a free slot
+      int slot = -1;
+      for (int i = 0; i < TC_MAX_SERIAL_PORTS; i++) {
+        if (!tc_serial_ports[i]) { slot = i; break; }
+      }
+      if (slot < 0) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: serialBegin — all %d ports in use"), TC_MAX_SERIAL_PORTS);
+        TC_PUSH(vm, -1);
+        break;
       }
       if (bufsize < 64) bufsize = 64;
       if (bufsize > 2048) bufsize = 2048;
@@ -2637,18 +4188,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial warning — pins %d/%d may be in use"), rxpin, txpin);
       }
 #endif
-      tc_serial_port = new TasmotaSerial(rxpin, txpin, HARDWARE_FALLBACK, 0, bufsize);
-      if (tc_serial_port) {
-        if (tc_serial_port->begin(baud, ConvertSerialConfig(config))) {
-          if (tc_serial_port->hardwareSerial()) {
+      tc_serial_ports[slot] = new TasmotaSerial(rxpin, txpin, HARDWARE_FALLBACK, 0, bufsize);
+      if (tc_serial_ports[slot]) {
+        if (tc_serial_ports[slot]->begin(baud, ConvertSerialConfig(config))) {
+          if (tc_serial_ports[slot]->hardwareSerial()) {
             ClaimSerial();
           }
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial opened rx=%d tx=%d baud=%d cfg=%d buf=%d hw=%d"),
-                 rxpin, txpin, baud, config, bufsize, tc_serial_port->hardwareSerial());
-          TC_PUSH(vm, 1);
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial[%d] opened rx=%d tx=%d baud=%d cfg=%d buf=%d hw=%d"),
+                 slot, rxpin, txpin, baud, config, bufsize, tc_serial_ports[slot]->hardwareSerial());
+          TC_PUSH(vm, slot);
         } else {
-          delete tc_serial_port;
-          tc_serial_port = nullptr;
+          delete tc_serial_ports[slot];
+          tc_serial_ports[slot] = nullptr;
           AddLog(LOG_LEVEL_ERROR, PSTR("TCC: serial begin failed"));
           TC_PUSH(vm, -1);
         }
@@ -2658,106 +4209,96 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
-    case SYS_SERIAL_CLOSE:
-      tc_serial_close();
+    case SYS_SERIAL_CLOSE: {
+      a = TC_POP(vm);  // handle
+      tc_serial_close(a);
       break;
-    case SYS_SERIAL_PRINT:
-      a = TC_POP(vm);
+    }
+    case SYS_SERIAL_PRINT: {
+      a = TC_POP(vm);  // const_id
+      b = TC_POP(vm);  // handle
       if (a >= 0 && a < vm->const_count && vm->constants[a].type == 1) {
         const char *s = vm->constants[a].str.ptr;
-        if (tc_serial_port) {
-          tc_serial_port->write(s, strlen(s));
-        } else {
-          tc_output_string(s);
-        }
+        TasmotaSerial *p = tc_serial_get(b);
+        if (p) { p->write(s, strlen(s)); } else { tc_output_string(s); }
       }
       break;
+    }
     case SYS_SERIAL_PRINT_INT: {
-      a = TC_POP(vm);
+      a = TC_POP(vm);  // val
+      b = TC_POP(vm);  // handle
       char ibuf[16];
       itoa(a, ibuf, 10);
-      if (tc_serial_port) {
-        tc_serial_port->write(ibuf, strlen(ibuf));
-      } else {
-        tc_output_int(a);
-      }
+      TasmotaSerial *p = tc_serial_get(b);
+      if (p) { p->write(ibuf, strlen(ibuf)); } else { tc_output_int(a); }
       break;
     }
     case SYS_SERIAL_PRINT_FLT: {
-      fa = TC_POPF(vm);
+      fa = TC_POPF(vm);  // val
+      b  = TC_POP(vm);   // handle
       char fbuf[24];
       dtostrf(fa, 1, 2, fbuf);
-      if (tc_serial_port) {
-        tc_serial_port->write(fbuf, strlen(fbuf));
+      TasmotaSerial *p = tc_serial_get(b);
+      if (p) { p->write(fbuf, strlen(fbuf)); } else { tc_output_float(fa); }
+      break;
+    }
+    case SYS_SERIAL_PRINTLN: {
+      a = TC_POP(vm);  // const_id
+      b = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(b);
+      if (a >= 0 && a < vm->const_count && vm->constants[a].type == 1) {
+        const char *s = vm->constants[a].str.ptr;
+        if (p) { p->write(s, strlen(s)); p->write("\r\n", 2); }
+        else   { tc_output_string(s); tc_output_char('\n'); }
       } else {
-        tc_output_float(fa);
+        if (p) { p->write("\r\n", 2); } else { tc_output_char('\n'); }
       }
       break;
     }
-    case SYS_SERIAL_PRINTLN:
-      a = TC_POP(vm);
-      if (a >= 0 && a < vm->const_count && vm->constants[a].type == 1) {
-        const char *s = vm->constants[a].str.ptr;
-        if (tc_serial_port) {
-          tc_serial_port->write(s, strlen(s));
-          tc_serial_port->write("\r\n", 2);
-        } else {
-          tc_output_string(s);
-          tc_output_char('\n');
-        }
-      } else {
-        if (tc_serial_port) {
-          tc_serial_port->write("\r\n", 2);
-        } else {
-          tc_output_char('\n');
-        }
-      }
+    case SYS_SERIAL_READ: {
+      a = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(a);
+      TC_PUSH(vm, (p && p->available()) ? p->read() : -1);
       break;
-    case SYS_SERIAL_READ:
-      if (tc_serial_port && tc_serial_port->available()) {
-        TC_PUSH(vm, tc_serial_port->read());
-      } else {
-        TC_PUSH(vm, -1);
-      }
+    }
+    case SYS_SERIAL_AVAILABLE: {
+      a = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(a);
+      TC_PUSH(vm, p ? p->available() : 0);
       break;
-    case SYS_SERIAL_AVAILABLE:
-      if (tc_serial_port) {
-        TC_PUSH(vm, tc_serial_port->available());
-      } else {
-        TC_PUSH(vm, 0);
-      }
+    }
+    case SYS_SERIAL_WRITE_BYTE: {
+      a = TC_POP(vm);  // byte
+      b = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(b);
+      if (p) p->write((uint8_t)(a & 0xFF));
       break;
-    case SYS_SERIAL_WRITE_BYTE:
-      a = TC_POP(vm);
-      if (tc_serial_port) {
-        tc_serial_port->write((uint8_t)(a & 0xFF));
-      }
-      break;
+    }
     case SYS_SERIAL_WRITE_STR: {
       a = TC_POP(vm);  // buf_ref
-      if (tc_serial_port) {
+      b = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(b);
+      if (p) {
         char tbuf[256];
         int len = tc_ref_to_cstr(vm, a, tbuf, sizeof(tbuf));
-        if (len > 0) {
-          tc_serial_port->write(tbuf, len);
-        }
+        if (len > 0) p->write(tbuf, len);
       }
       break;
     }
     case SYS_SERIAL_WRITE_BUF: {
-      // serialWriteBytes(buf_ref, len) — write exactly len bytes (binary safe)
+      // serialWriteBytes(h, buf_ref, len) — write exactly len bytes (binary safe)
       b = TC_POP(vm);  // len
       a = TC_POP(vm);  // buf_ref
-      if (tc_serial_port && b > 0 && b <= 256) {
+      int hh = TC_POP(vm);  // handle
+      TasmotaSerial *p = tc_serial_get(hh);
+      if (p && b > 0 && b <= 256) {
         int32_t *buf = tc_resolve_ref(vm, a);
         if (buf) {
           int32_t maxLen = tc_ref_maxlen(vm, a);
           if (b > maxLen) b = maxLen;
           uint8_t tbuf[256];
-          for (int i = 0; i < b; i++) {
-            tbuf[i] = (uint8_t)(buf[i] & 0xFF);
-          }
-          tc_serial_port->write(tbuf, b);
+          for (int i = 0; i < b; i++) tbuf[i] = (uint8_t)(buf[i] & 0xFF);
+          p->write(tbuf, b);
         }
       }
       break;
@@ -2893,12 +4434,28 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t src_ref = TC_POP(vm);
       int32_t dst_ref = TC_POP(vm);
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
-      int32_t *src = tc_resolve_ref(vm, src_ref);
-      if (dst && src) {
-        int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
-        int32_t i = 0;
-        while (src[i] != 0 && i < max) { dst[i] = src[i]; i++; }
-        dst[i] = 0;
+      if (!dst) break;
+      int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
+      // Source may be a const-pool string ref (e.g. string literal passed
+      // through a function param). Detect and use char* path; otherwise
+      // treat as an int32 VM array.
+      if (tc_is_const_ref(src_ref)) {
+        uint16_t ci = (uint16_t)(((uint32_t)src_ref) & 0x7FFF);
+        if (ci < vm->const_count && vm->constants[ci].type == 1) {
+          const char *s = vm->constants[ci].str.ptr;
+          int32_t i = 0;
+          while (s && s[i] != 0 && i < max) { dst[i] = (int32_t)(uint8_t)s[i]; i++; }
+          dst[i] = 0;
+        } else {
+          dst[0] = 0;
+        }
+      } else {
+        int32_t *src = tc_resolve_ref(vm, src_ref);
+        if (src) {
+          int32_t i = 0;
+          while (src[i] != 0 && i < max) { dst[i] = src[i]; i++; }
+          dst[i] = 0;
+        }
       }
       break;
     }
@@ -2930,6 +4487,23 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         int32_t i = 0;
         while (pa[i] != 0 && pb[i] != 0 && pa[i] == pb[i] && i < max) i++;
         result = pa[i] - pb[i];
+      }
+      TC_PUSH(vm, result);
+      break;
+    }
+    case SYS_STRCMP_CONST: {
+      // strcmp(char[] arr, "literal") — arr_ref pushed first, const_idx second
+      int32_t ci = TC_POP(vm);
+      int32_t a_ref = TC_POP(vm);
+      int32_t *pa = tc_resolve_ref(vm, a_ref);
+      int32_t result = 0;
+      if (pa && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
+        const char *pb = vm->constants[ci].str.ptr;
+        int32_t max_a = tc_ref_maxlen(vm, a_ref);
+        int32_t i = 0;
+        while (pa[i] != 0 && pb[i] != 0 && pa[i] == (int32_t)(uint8_t)pb[i] && i < max_a) i++;
+        int32_t bv = (i < max_a) ? (int32_t)(uint8_t)pb[i] : 0;
+        result = pa[i] - bv;
       }
       TC_PUSH(vm, result);
       break;
@@ -2979,6 +4553,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     // ── sprintf variants ──────────────────────────────
     // All use snprintf() on device, then copy result into VM array.
     // Supports: %d %u %x %X %o %c %s %f %e %g and width/precision modifiers.
+    //
+    // Buffer sizing: the variadic-sprintf compile-time splitter can hand
+    // segments with arbitrarily-long literal prefixes to these syscalls
+    // (e.g. webSend-style HTML strings of 60–200 chars). A 64-byte tmp[]
+    // would silently truncate the value at the end. TC_SPRINTF_TMP_SIZE
+    // is the working buffer used by snprintf() for one segment — at 256 B
+    // it covers every realistic single-format emission and still costs
+    // <0.5 KB of stack on ESP32 task workers (4–16 KB total). ESP8266 is
+    // not affected — it does not run the variadic path on long literals.
     case SYS_SPRINTF_INT: {
       int32_t val = TC_POP(vm);          // int argument
       int32_t ci  = TC_POP(vm);          // format string const index
@@ -2987,7 +4570,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *fmt = tc_get_const_str(vm, ci);
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      char tmp[64];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, val);
       TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
       break;
@@ -3000,7 +4583,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *fmt = tc_get_const_str(vm, ci);
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      char tmp[64];
+      char tmp[256];
       tc_sprintf_float(tmp, sizeof(tmp), fmt, fval);
       TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
       break;
@@ -3016,14 +4599,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       // Extract source string from VM int32 array into temp char buffer
       int32_t srcMax = tc_ref_maxlen(vm, src_ref);
-      char srcbuf[128];
+      char srcbuf[256];
       int32_t si = 0;
       while (src[si] != 0 && si < srcMax && si < (int32_t)sizeof(srcbuf) - 1) {
         srcbuf[si] = (char)(src[si] & 0xFF);
         si++;
       }
       srcbuf[si] = '\0';
-      char tmp[128];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, srcbuf);
       TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
       break;
@@ -3039,7 +4622,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       int32_t ofs = tc_strlen_ref(dst, maxSlots);
-      char tmp[64];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, val);
       tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
       TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
@@ -3054,7 +4637,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       int32_t ofs = tc_strlen_ref(dst, maxSlots);
-      char tmp[64];
+      char tmp[256];
       tc_sprintf_float(tmp, sizeof(tmp), fmt, fval);
       tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
       TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
@@ -3071,13 +4654,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       int32_t ofs = tc_strlen_ref(dst, maxSlots);
       int32_t srcMax = tc_ref_maxlen(vm, src_ref);
-      char srcbuf[128];
+      char srcbuf[256];
       int32_t si = 0;
       while (src[si] != 0 && si < srcMax && si < (int32_t)sizeof(srcbuf) - 1) {
         srcbuf[si] = (char)(src[si] & 0xFF); si++;
       }
       srcbuf[si] = '\0';
-      char tmp[128];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, srcbuf);
       tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
       TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
@@ -3094,7 +4677,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *srcStr = tc_get_const_str(vm, src_ci);
       if (!dst || !fmt || !srcStr) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      char tmp[128];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, srcStr);
       TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
       break;
@@ -3109,7 +4692,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!dst || !fmt || !srcStr) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       int32_t ofs = tc_strlen_ref(dst, maxSlots);
-      char tmp[128];
+      char tmp[256];
       snprintf(tmp, sizeof(tmp), fmt, srcStr);
       tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
       TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
@@ -4374,6 +5957,27 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
+    case SYS_LOG_LVL: {
+      a = TC_POP(vm);  // char array ref
+      int32_t level = TC_POP(vm);  // log level (1=ERROR, 2=INFO, 3=DEBUG, 4=DEBUG_MORE)
+      if (level < 1) level = 1;
+      if (level > 4) level = 4;
+      char tmp[TC_OUTPUT_SIZE];
+      if (tc_ref_to_cstr(vm, a, tmp, sizeof(tmp)) > 0) {
+        AddLog(level, PSTR("TCC: %s"), tmp);
+      }
+      break;
+    }
+    case SYS_LOG_LVL_STR: {
+      a = TC_POP(vm);  // constant pool index
+      int32_t level = TC_POP(vm);  // log level
+      if (level < 1) level = 1;
+      if (level > 4) level = 4;
+      if (a >= 0 && a < vm->const_count && vm->constants[a].type == 1) {
+        AddLog(level, PSTR("TCC: %s"), vm->constants[a].str.ptr);
+      }
+      break;
+    }
 
     // ── Localized strings ─────────────────────────────
     case SYS_LGETSTRING: {
@@ -4570,6 +6174,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           int32_t port = TC_POP(vm);
           if (port > 0 && port < 65536) {
             Tinyc->udp_port.stop();
+            Tinyc->udp_port_mcast = IPAddress(0,0,0,0);  // plain unicast
             if (Tinyc->udp_port.begin(port)) {
               Tinyc->udp_port_num = port;
               Tinyc->udp_port_open = true;
@@ -4588,7 +6193,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           }
           break;
         }
-        case 1: { // udp(1, buf) → read string from UDP
+        case 1: { // udp(1, buf) → read string from UDP (works for unicast + multicast)
           int32_t buf_ref = TC_POP(vm);
           int32_t result = 0;
           if (Tinyc->udp_port_open && !TasmotaGlobal.global_state.network_down) {
@@ -4600,14 +6205,23 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
                        Tinyc->udp_port_num, Tinyc->udp_port_timeout);
                 uint16_t saved_port = Tinyc->udp_port_num;
                 Tinyc->udp_port.stop();
-                Tinyc->udp_port.begin(saved_port);
+                if ((uint32_t)Tinyc->udp_port_mcast != 0) {
+#ifdef ESP8266
+                  Tinyc->udp_port.beginMulticast(WiFi.localIP(), Tinyc->udp_port_mcast, saved_port);
+#else
+                  Tinyc->udp_port.beginMulticast(Tinyc->udp_port_mcast, saved_port);
+#endif
+                } else {
+                  Tinyc->udp_port.begin(saved_port);
+                }
                 Tinyc->udp_port_last_rx = millis();
               }
             }
             int32_t plen = Tinyc->udp_port.parsePacket();
             if (plen > 0) {
               Tinyc->udp_port_last_rx = millis();  // packet received — reset watchdog
-              char packet[512];
+              // 1024 bytes covers SMA Speedwire (~600B) and most binary UDP telegrams.
+              char packet[1024];
               int32_t len = Tinyc->udp_port.read(packet, sizeof(packet) - 1);
               if (len > 0) {
                 packet[len] = 0;
@@ -4748,6 +6362,40 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP port timeout set to %ds"), seconds);
           }
           TC_PUSH(vm, 1);
+          break;
+        }
+        case 9: { // udp(9, mcast_ip_ref, port) → join multicast group on udp_port
+          int32_t port = TC_POP(vm);
+          int32_t ip_ref = TC_POP(vm);
+          char ip_str[32];
+          tc_ref_to_cstr(vm, ip_ref, ip_str, sizeof(ip_str));
+          IPAddress mcast;
+          if (!mcast.fromString(ip_str) || port <= 0 || port >= 65536) {
+            TC_PUSH(vm, 0);
+            break;
+          }
+          Tinyc->udp_port.stop();
+#ifdef ESP8266
+          bool ok = Tinyc->udp_port.beginMulticast(WiFi.localIP(), mcast, (uint16_t)port);
+#else
+          bool ok = Tinyc->udp_port.beginMulticast(mcast, (uint16_t)port);
+#endif
+          if (ok) {
+            Tinyc->udp_port_num = (uint16_t)port;
+            Tinyc->udp_port_open = true;
+            Tinyc->udp_port_mcast = mcast;
+            Tinyc->udp_port_last_rx = millis();
+            if (!Tinyc->udp_port_timeout) {
+              Tinyc->udp_port_timeout = TC_UDP_TIMEOUT_SEC;
+            }
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP joined %s:%d"), ip_str, port);
+            TC_PUSH(vm, 1);
+          } else {
+            Tinyc->udp_port_open = false;
+            Tinyc->udp_port_mcast = IPAddress(0,0,0,0);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP multicast join failed %s:%d"), ip_str, port);
+            TC_PUSH(vm, 0);
+          }
           break;
         }
         default:
@@ -5014,11 +6662,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     }
     case SYS_SML_GETSTR: {
       int32_t ref = TC_POP(vm);  // buf_ref for output
-      a = TC_POP(vm);            // meter index
+      a = TC_POP(vm);            // meter index (negative = full-precision numeric-as-string)
 #if defined(USE_SML_M) || defined(USE_SML)
-      char *sval = SML_GetSVal((uint32_t)a);
+      char sbuf[FLOATSZ];
+      const char *sval;
+      if (a < 0) {
+        // Scripter smls[-x] equivalent: full-precision numeric value as string
+        dtostrfd(SML_GetVal((uint32_t)(-a)), 4, sbuf);
+        sval = sbuf;
+      } else {
+        sval = SML_GetSVal((uint32_t)a);
+      }
       if (sval && ref) {
-        // Copy string into TinyC char array
         int32_t *buf = tc_resolve_ref(vm, ref);
         int32_t maxLen = tc_ref_maxlen(vm, ref);
         if (buf && maxLen > 0) {
@@ -5430,6 +7085,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     //  21 = tasm_smlj       (rw) SML JSON output enable/disable
     //  22 = tasm_npwr       (ro) number of power devices
     //  23 = tasm_rule       (rw) rule1 enabled (bit 0 of Settings->rule_enabled)
+    //  24 = tasm_lat        (rw) latitude in decimal degrees (float)
+    //  25 = tasm_lon        (rw) longitude in decimal degrees (float)
     case SYS_TASM_GET: {
       a = TC_POP(vm);  // variable index
       int32_t val = 0;
@@ -5494,6 +7151,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
 #endif
         case 22: val = (int32_t)TasmotaGlobal.devices_present; break;  // tasm_npwr
         case 23: val = bitRead(Settings->rule_enabled, 0); break;  // tasm_rule
+        case 24: {  // tasm_lat — float degrees
+          float latf = (float)((double)Settings->latitude / 1000000.0);
+          uint32_t lati; memcpy(&lati, &latf, 4);
+          TC_PUSH(vm, (int32_t)lati);
+          goto tasm_get_done;
+        }
+        case 25: {  // tasm_lon — float degrees
+          float lonf = (float)((double)Settings->longitude / 1000000.0);
+          uint32_t loni; memcpy(&loni, &lonf, 4);
+          TC_PUSH(vm, (int32_t)loni);
+          goto tasm_get_done;
+        }
         default: break;
       }
       TC_PUSH(vm, val);
@@ -5590,6 +7259,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             bitClear(Settings->rule_enabled, 0);
           }
           break;
+        case 24: {  // tasm_lat — float degrees
+          float latf; memcpy(&latf, &val, 4);
+          Settings->latitude = (int)((double)latf * 1000000.0);
+          break;
+        }
+        case 25: {  // tasm_lon — float degrees
+          float lonf; memcpy(&lonf, &val, 4);
+          Settings->longitude = (int)((double)lonf * 1000000.0);
+          break;
+        }
         default: break;  // read-only variables silently ignored
       }
       break;
@@ -5776,11 +7455,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       a = TC_POP(vm);  // url ref
       char url[256];
       tc_ref_to_cstr(vm, a, url, sizeof(url));
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+      HTTPClientLight http;
+      http.setTimeout(5000);
+      http.begin(url);
+#else
       WiFiClient http_client;
       HTTPClient http;
       http.setTimeout(5000);
       http.begin(http_client, url);
-      // Add custom headers
+#endif
       for (int i = 0; i < Tinyc->http_hdr_count; i++) {
         http.addHeader(Tinyc->http_hdr_name[i], Tinyc->http_hdr_value[i]);
       }
@@ -5802,7 +7486,6 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         result = httpCode;  // negative error code
       }
       http.end();
-      http_client.stop();
       TC_PUSH(vm, result);
       break;
     }
@@ -5814,10 +7497,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       tc_ref_to_cstr(vm, a, url, sizeof(url));
       char postData[TC_OUTPUT_SIZE];
       tc_ref_to_cstr(vm, dataRef, postData, sizeof(postData));
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+      HTTPClientLight http;
+      http.setTimeout(5000);
+      http.begin(url);
+#else
       WiFiClient http_client;
       HTTPClient http;
       http.setTimeout(5000);
       http.begin(http_client, url);
+#endif
       http.addHeader(F("Content-Type"), F("application/x-www-form-urlencoded"));
       for (int i = 0; i < Tinyc->http_hdr_count; i++) {
         http.addHeader(Tinyc->http_hdr_name[i], Tinyc->http_hdr_value[i]);
@@ -5840,7 +7529,6 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         result = httpCode;
       }
       http.end();
-      http_client.stop();
       TC_PUSH(vm, result);
       break;
     }
@@ -6094,6 +7782,240 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
+    case SYS_SML_APPLY_PINS: {
+      // smlApplyPins("/path", rx, tx, smlf) — idempotent template-comment-preserving pin
+      // substitution. Recognized placeholders: %0?rxpin%, %0?txpin%, %0?smlf%.
+      // First call inserts "; <original>" template line above the active line and substitutes
+      // placeholders in the active copy. Subsequent calls rebuild the active line from the
+      // template comment (so re-edits always derive from the original markers, never from
+      // already-substituted values). Pass -1 to leave a placeholder untouched.
+      int32_t smlf = TC_POP(vm);
+      int32_t txp  = TC_POP(vm);
+      int32_t rxp  = TC_POP(vm);
+      int32_t pi   = TC_POP(vm);
+#ifdef USE_UFILESYS
+      const char *cpath = tc_get_const_str(vm, pi);
+      if (!cpath) { TC_PUSH(vm, -1); break; }
+      char path[128];
+      strlcpy(path, cpath, sizeof(path));
+      FS *fsp = tc_file_path(path);
+      if (!fsp) { TC_PUSH(vm, -1); break; }
+      File f = fsp->open(path, "r");
+      if (!f) { TC_PUSH(vm, -1); break; }
+      size_t fsize = (size_t)f.size();
+      if (fsize == 0 || fsize > 8192) {  // hard cap — SML descriptors are tiny
+        f.close();
+        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: smlApplyPins '%s' size %u out of range"), path, (unsigned)fsize);
+        TC_PUSH(vm, -1);
+        break;
+      }
+      char *in_buf = (char*)malloc(fsize + 1);
+      if (!in_buf) { f.close(); TC_PUSH(vm, -1); break; }
+      size_t got = (size_t)f.read((uint8_t*)in_buf, fsize);
+      in_buf[got] = 0;
+      f.close();
+      // Worst case: every line gets a duplicated template comment → 2x.
+      size_t out_cap = got * 2 + 64;
+      char *out_buf = (char*)malloc(out_cap);
+      if (!out_buf) { free(in_buf); TC_PUSH(vm, -1); break; }
+      size_t out_len = 0;
+      int subs = 0;
+      const int values[3] = { (int)rxp, (int)txp, (int)smlf };
+      const char *p = in_buf;
+      const char *end = in_buf + got;
+      while (p < end) {
+        const char *eol = (const char*)memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = (size_t)((eol ? eol : end) - p);
+        // Strip trailing \r so CRLF files become LF after a write.
+        size_t content_len = line_len;
+        if (content_len > 0 && p[content_len - 1] == '\r') content_len--;
+
+        // Skip leading whitespace to test for ';' template marker.
+        size_t lead = 0;
+        while (lead < content_len && (p[lead] == ' ' || p[lead] == '\t')) lead++;
+        bool is_comment = (lead < content_len && p[lead] == ';');
+        bool has_ph = tc_sml_line_has_ph(p, content_len);
+
+        if (is_comment && has_ph) {
+          // Template line — emit as-is, then emit a freshly-substituted active line.
+          memcpy(out_buf + out_len, p, content_len);
+          out_len += content_len;
+          out_buf[out_len++] = '\n';
+          // Template body = content after the ';' (and any leading spaces after it).
+          const char *body = p + lead + 1;  // skip ;
+          while (body < p + content_len && (*body == ' ' || *body == '\t')) body++;
+          size_t body_len = (size_t)((p + content_len) - body);
+          size_t s = tc_sml_subst_line(body, body_len, out_buf + out_len, out_cap - out_len - 1, values);
+          out_len += s;
+          out_buf[out_len++] = '\n';
+          subs++;
+          // Discard the next existing line (the previous active copy) — convention says
+          // the line directly below a "; ...%placeholder%..." template is the substituted
+          // active version we just regenerated.
+          if (eol && eol + 1 < end) {
+            const char *next = eol + 1;
+            const char *next_eol = (const char*)memchr(next, '\n', (size_t)(end - next));
+            size_t next_len = (size_t)((next_eol ? next_eol : end) - next);
+            size_t next_lead = 0;
+            while (next_lead < next_len && (next[next_lead] == ' ' || next[next_lead] == '\t')) next_lead++;
+            // Skip if it's a non-empty, non-comment line (i.e. an active candidate).
+            if (next_lead < next_len && next[next_lead] != ';') {
+              p = next_eol ? next_eol + 1 : end;
+              continue;
+            }
+          }
+          p = eol ? eol + 1 : end;
+          continue;
+        }
+
+        if (!is_comment && has_ph) {
+          // Active line with placeholders, no template above yet → insert template, then sub.
+          out_buf[out_len++] = ';';
+          out_buf[out_len++] = ' ';
+          memcpy(out_buf + out_len, p, content_len);
+          out_len += content_len;
+          out_buf[out_len++] = '\n';
+          size_t s = tc_sml_subst_line(p, content_len, out_buf + out_len, out_cap - out_len - 1, values);
+          out_len += s;
+          if (eol) out_buf[out_len++] = '\n';
+          subs++;
+          p = eol ? eol + 1 : end;
+          continue;
+        }
+
+        // Plain line — copy as-is (without the \r if present).
+        memcpy(out_buf + out_len, p, content_len);
+        out_len += content_len;
+        if (eol) out_buf[out_len++] = '\n';
+        p = eol ? eol + 1 : end;
+      }
+
+      // Idempotency: skip the write if nothing actually changed.
+      bool changed = (out_len != got) || (memcmp(in_buf, out_buf, got) != 0);
+      int rc = 0;
+      if (changed) {
+        File w = fsp->open(path, "w");
+        if (!w) { rc = -1; }
+        else {
+          size_t wn = w.write((const uint8_t*)out_buf, out_len);
+          w.close();
+          if (wn != out_len) {
+            AddLog(LOG_LEVEL_ERROR, PSTR("TCC: smlApplyPins short write %u/%u"), (unsigned)wn, (unsigned)out_len);
+            rc = -1;
+          } else {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: smlApplyPins '%s' rx=%d tx=%d smlf=%d → %d sub(s), %u→%u bytes"),
+                   path, (int)rxp, (int)txp, (int)smlf, subs, (unsigned)got, (unsigned)out_len);
+            rc = subs;
+          }
+        }
+      }
+      free(in_buf);
+      free(out_buf);
+      TC_PUSH(vm, rc);
+#else
+      (void)smlf; (void)txp; (void)rxp; (void)pi;
+      TC_PUSH(vm, -1);
+#endif
+      break;
+    }
+    case SYS_SML_SCRIPTER_LOAD: {
+      // smlScripterLoad("/path") — read the SML descriptor, extract any >F (Every100ms)
+      // and >S (EverySecond) Scripter sections, compile each to a tiny bytecode that the
+      // tick dispatcher runs without touching the full Scripter engine. Subset support:
+      // lnv0..9, arithmetic+cmp, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX").
+      // Returns # sections compiled (0..2), or -1 on file/open error.
+      int32_t pi = TC_POP(vm);
+      const char *cpath = tc_get_const_str(vm, pi);
+      if (!cpath) { TC_PUSH(vm, -1); break; }
+      int rc = tc_mscr_load(cpath);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: smlScripterLoad('%s') = %d (>F=%d >S=%d)"),
+             cpath, rc, (int)tc_mscr.has_f, (int)tc_mscr.has_s);
+      TC_PUSH(vm, rc);
+      break;
+    }
+    case SYS_WEB_REPO_PULLDOWN: {
+      // webRepoPulldown(&sel, "label", "json_url", "index_key", "/dest_path")
+      //   Fetches {json_url} (a Scripter-smlpd-compatible directory JSON of the form
+      //     {"<index_key>":[{"label":"...","filename":"..."}, ...]} ),
+      //   renders a <select> whose options are the entries, pre-selects the current
+      //   global's value, on-change writes the new index back to the global via
+      //   the standard seva(value,idx) path, then (if dest_path non-empty) downloads
+      //   the selected {base}/{filename} and POSTs it to /tc_api?cmd=writefile&path={dest_path}.
+      //   base = json_url with the trailing '/basename' stripped.
+      int32_t dpi  = TC_POP(vm);   // dest_path const idx ("" = no download)
+      int32_t ki   = TC_POP(vm);   // index_key const idx
+      int32_t ji   = TC_POP(vm);   // json_url const idx
+      int32_t li   = TC_POP(vm);   // label const idx
+      int32_t gref = TC_POP(vm);
+      uint16_t idx = ((uint32_t)gref) & 0xFFFF;
+      int32_t *p = tc_resolve_ref(vm, gref);
+      int32_t val = p ? *p : 0;
+      const char *label    = tc_get_const_str(vm, li);
+      const char *json_url = tc_get_const_str(vm, ji);
+      const char *key      = tc_get_const_str(vm, ki);
+      const char *dest     = tc_get_const_str(vm, dpi);
+      if (!label)    label    = "";
+      if (!json_url) json_url = "";
+      if (!key)      key      = "files";
+      if (!dest)     dest     = "";
+      // Render shell
+      if (label[0]) {
+        WSContentSend_P(PSTR("<div><label><b>%s</b> "), label);
+      } else {
+        WSContentSend_P(PSTR("<div>"));
+      }
+      WSContentSend_P(PSTR("<select id='rp%d' onfocusin='pr(0)' onfocusout='pr(1)' onchange='rpCh%d(this.value)'>"
+                           "<option value='-1'>loading...</option></select>"),
+                      idx, idx);
+      if (label[0]) {
+        WSContentSend_P(PSTR("</label></div>"));
+      } else {
+        WSContentSend_P(PSTR("</div>"));
+      }
+      // Inline JS — own handler per idx so we can capture the entry list
+      WSContentSend_P(PSTR(
+        "<script>"
+        "(function(){"
+          "var U='%s',K='%s',D='%s',V=%d,ID='rp%d',IDX=%d;"
+          "var base=U.replace(/\\/[^\\/]+$/,'');"
+          "window._rp=window._rp||{};"
+          "window['rpCh'+IDX]=function(v){"
+            "var i=parseInt(v,10);"
+            "if(isNaN(i)||i<0){seva(i,IDX);return;}"
+            "seva(i,IDX);"
+            "if(!D||!window._rp[IDX])return;"
+            "var e=window._rp[IDX][i];if(!e||!e.filename)return;"
+            "fetch(base+'/'+e.filename.split('/').map(encodeURIComponent).join('/'))"
+              ".then(function(r){return r.text();})"
+              ".then(function(t){"
+                "return fetch('/tc_api?cmd=writefile&path='+encodeURIComponent(D),"
+                  "{method:'POST',headers:{'Content-Type':'text/plain'},body:t});"
+              "})"
+              ".then(function(r){return r.json();})"
+              ".then(function(j){console.log('[repoPulldown] saved',D,j);})"
+              ".catch(function(e){console.error('[repoPulldown]',e);});"
+          "};"
+          "function paint(L){"
+            "var sel=document.getElementById(ID);if(!sel)return;"
+            "var h='';for(var i=0;i<L.length;i++){"
+              "h+='<option value=\"'+i+'\"'+(i===V?' selected':'')+'>'+"
+                 "(L[i].label||L[i].filename||('#'+i))+'</option>';"
+            "}"
+            "sel.innerHTML=h;"
+          "}"
+          "if(window._rp[IDX]){paint(window._rp[IDX]);return;}"    // cache hit — no GitHub fetch
+          "fetch(U).then(function(r){return r.json();}).then(function(j){"
+            "var L=j[K]||[];window._rp[IDX]=L;paint(L);"
+          "}).catch(function(e){"
+            "var sel=document.getElementById(ID);"
+            "if(sel)sel.innerHTML='<option value=\"-1\">load error</option>';"
+            "console.error('[repoPulldown]',e);"
+          "});"
+        "})();"
+        "</script>"),
+        json_url, key, dest, val, idx, idx);
+      break;
+    }
     case SYS_WEB_RADIO: {
       int32_t ci = TC_POP(vm);   // options const idx ("opt1|opt2|opt3")
       int32_t gref = TC_POP(vm);
@@ -6144,6 +8066,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *label = tc_get_const_str(vm, ci);
       if (label && Tinyc && pn >= 0 && pn < TC_MAX_WEB_PAGES) {
         strlcpy(Tinyc->page_label[pn], label, sizeof(Tinyc->page_label[0]));
+        // track which slot registered this page
+        for (uint8_t si = 0; si < TC_MAX_VMS; si++) {
+          if (Tinyc->slots[si] && tc_current_slot == Tinyc->slots[si]) {
+            Tinyc->page_slot[pn] = si;
+            break;
+          }
+        }
         if (pn >= Tinyc->page_count) Tinyc->page_count = pn + 1;
       }
       break;
@@ -7080,7 +9009,6 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     case SYS_DSP_LOAD_IMG: {
       // dspLoadImage("file.jpg") -> slot (0-3, -1 on error)
       int32_t ci = TC_POP(vm);
-      int32_t result = -1;
       if (!renderer) { TC_PUSH(vm, -1); break; }
       const char *fname = tc_get_const_str(vm, ci);
       if (!fname) { TC_PUSH(vm, -1); break; }
@@ -7089,17 +9017,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       for (int i = 0; i < TC_IMG_SLOTS; i++) {
         if (!tc_img_store[i].buf) { slot = i; break; }
       }
-      if (slot < 0) { TC_PUSH(vm, -1); break; }
+      if (slot < 0) { AddLog(LOG_LEVEL_INFO, PSTR("TCC: img no free slot")); TC_PUSH(vm, -1); break; }
       // load file
       File fp = ufsp->open(fname, FS_FILE_READ);
-      if (!fp) { TC_PUSH(vm, -1); break; }
+      if (!fp) { AddLog(LOG_LEVEL_INFO, PSTR("TCC: img file '%s' not found"), fname); TC_PUSH(vm, -1); break; }
       uint32_t size = fp.size();
       uint8_t *mem = (uint8_t *)special_malloc(size + 4);
       if (!mem) { fp.close(); TC_PUSH(vm, -1); break; }
       fp.read(mem, size);
       fp.close();
       if (mem[0] != 0xff || mem[1] != 0xd8) {
-        // not a JPEG
         free(mem); TC_PUSH(vm, -1); break;
       }
       uint16_t xsize, ysize;
@@ -7118,7 +9045,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         .flags = { .swap_color_bytes = 0 }
       };
       esp_jpeg_image_output_t outimg;
+      OsWatchLoop();
       esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &outimg);
+      OsWatchLoop();
       free(mem);
       if (err != ESP_OK) { free(out_buf); TC_PUSH(vm, -1); break; }
       tc_img_store[slot].buf = out_buf;
@@ -7150,10 +9079,24 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (sx + w > img_w) w = img_w - sx;
       if (sy + h > img_h) h = img_h - sy;
       if (w <= 0 || h <= 0) break;
-      // push row by row from image buffer to screen
-      for (int row = 0; row < h; row++) {
-        renderer->setAddrWindow(dx, dy + row, dx + w, dy + row + 1);
-        renderer->pushColors(&img[(sy + row) * img_w + sx], w, true);
+      // Always use single setAddrWindow + pushColors (like Draw_RGB_Bitmap)
+      // Row-by-row push freezes SPI displays (tested on ESP32 + ILI9341)
+      if (sx == 0 && w == img_w) {
+        // full-width: contiguous in buffer, single push
+        renderer->setAddrWindow(dx, dy, dx + w, dy + h);
+        renderer->pushColors(&img[sy * img_w], w * h, true);
+      } else {
+        // sub-rect: gather rows into contiguous temp buffer, single push
+        uint32_t total = w * h;
+        uint16_t *tmp = (uint16_t *)special_malloc(total * 2);
+        if (tmp) {
+          for (int row = 0; row < h; row++) {
+            memcpy(&tmp[row * w], &img[(sy + row) * img_w + sx], w * 2);
+          }
+          renderer->setAddrWindow(dx, dy, dx + w, dy + h);
+          renderer->pushColors(tmp, total, true);
+          free(tmp);
+        }
       }
       renderer->setAddrWindow(0, 0, 0, 0);
       break;
@@ -7176,6 +9119,315 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
+
+    // ── Canvas-backed image slots: draw procedurally, blit via dspPushImageRect ──
+    case SYS_IMG_CREATE: {
+      // imgCreate(w, h) -> slot (0..TC_IMG_SLOTS-1, -1 on error)
+      // Allocates a blank RGB565 buffer in PSRAM plus a RendererCanvas around
+      // it. The slot behaves exactly like a JPG-loaded slot except you can
+      // also call imgBeginDraw() to make dsp* primitives target it.
+      int32_t h = TC_POP(vm);
+      int32_t w = TC_POP(vm);
+      if (w <= 0 || h <= 0 || w > 1024 || h > 1024) { TC_PUSH(vm, -1); break; }
+      int slot = -1;
+      for (int i = 0; i < TC_IMG_SLOTS; i++) {
+        if (!tc_img_store[i].buf) { slot = i; break; }
+      }
+      if (slot < 0) { AddLog(LOG_LEVEL_INFO, PSTR("TCC: img no free slot")); TC_PUSH(vm, -1); break; }
+      uint32_t bytes = (uint32_t)w * (uint32_t)h * 2;
+      uint16_t *buf = (uint16_t *)special_malloc(bytes + 4);
+      if (!buf) { AddLog(LOG_LEVEL_INFO, PSTR("TCC: img %dx%d OOM (%u B)"), w, h, bytes); TC_PUSH(vm, -1); break; }
+      memset(buf, 0, bytes);  // start black
+      RendererCanvas *cv = new RendererCanvas(buf, (uint16_t)w, (uint16_t)h);
+      if (!cv) { free(buf); TC_PUSH(vm, -1); break; }
+      tc_img_store[slot].buf    = buf;
+      tc_img_store[slot].w      = (uint16_t)w;
+      tc_img_store[slot].h      = (uint16_t)h;
+      tc_img_store[slot].canvas = cv;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: img slot %d canvas %dx%d (%u KB)"),
+             slot, w, h, bytes / 1024);
+      TC_PUSH(vm, slot);
+      break;
+    }
+    case SYS_IMG_BEGIN_DRAW: {
+      // imgBeginDraw(slot) -> void
+      // Swap the global `renderer` to the slot's canvas so subsequent dsp*
+      // calls draw into its pixel buffer. Nested calls are ignored (Phase 1:
+      // single redirect at a time). Must be paired with imgEndDraw().
+      int32_t slot = TC_POP(vm);
+      if (slot < 0 || slot >= TC_IMG_SLOTS) break;
+      if (!tc_img_store[slot].canvas) break;         // not a canvas slot (JPG-only)
+      if (tc_canvas_saved_renderer) break;            // already redirected
+      tc_canvas_saved_renderer = renderer;
+      renderer = tc_img_store[slot].canvas;
+      break;
+    }
+    case SYS_IMG_END_DRAW: {
+      // imgEndDraw() -> void. No-op if no redirect is active.
+      if (tc_canvas_saved_renderer) {
+        renderer = tc_canvas_saved_renderer;
+        tc_canvas_saved_renderer = nullptr;
+      }
+      break;
+    }
+    case SYS_IMG_CLEAR: {
+      // imgClear(slot, color) -> void. Fast memset-based fill.
+      int32_t color = TC_POP(vm);
+      int32_t slot  = TC_POP(vm);
+      if (slot < 0 || slot >= TC_IMG_SLOTS) break;
+      if (!tc_img_store[slot].buf)       break;
+      uint32_t pixels = (uint32_t)tc_img_store[slot].w * tc_img_store[slot].h;
+      uint16_t c16 = (uint16_t)color;
+      uint8_t  hi = c16 >> 8, lo = c16 & 0xff;
+      if (hi == lo) {
+        memset(tc_img_store[slot].buf, lo, pixels * 2);
+      } else {
+        uint16_t *p = tc_img_store[slot].buf;
+        for (uint32_t i = 0; i < pixels; i++) p[i] = c16;
+      }
+      // fillScreen-equivalent: whole canvas is now dirty
+      if (tc_img_store[slot].canvas) {
+        tc_img_store[slot].canvas->markDirty(0, 0, tc_img_store[slot].w, tc_img_store[slot].h);
+      }
+      break;
+    }
+    case SYS_IMG_BLIT: {
+      // imgBlit(dst, src, sx, sy, dx, dy, w, h) -> void
+      // Row-major memcpy between two canvas slots, with full clipping on
+      // both source and destination rects. Unions the touched dest rect
+      // into the dest canvas's dirty region.
+      int32_t h  = TC_POP(vm);
+      int32_t w  = TC_POP(vm);
+      int32_t dy = TC_POP(vm);
+      int32_t dx = TC_POP(vm);
+      int32_t sy = TC_POP(vm);
+      int32_t sx = TC_POP(vm);
+      int32_t src = TC_POP(vm);
+      int32_t dst = TC_POP(vm);
+      if (dst < 0 || dst >= TC_IMG_SLOTS) break;
+      if (src < 0 || src >= TC_IMG_SLOTS) break;
+      TcImgSlot *ds = &tc_img_store[dst];
+      TcImgSlot *ss = &tc_img_store[src];
+      if (!ds->buf || !ss->buf) break;
+      // clip against source
+      if (sx < 0) { dx -= sx; w += sx; sx = 0; }
+      if (sy < 0) { dy -= sy; h += sy; sy = 0; }
+      if (sx + w > (int32_t)ss->w) w = (int32_t)ss->w - sx;
+      if (sy + h > (int32_t)ss->h) h = (int32_t)ss->h - sy;
+      // clip against destination
+      if (dx < 0) { sx -= dx; w += dx; dx = 0; }
+      if (dy < 0) { sy -= dy; h += dy; dy = 0; }
+      if (dx + w > (int32_t)ds->w) w = (int32_t)ds->w - dx;
+      if (dy + h > (int32_t)ds->h) h = (int32_t)ds->h - dy;
+      if (w <= 0 || h <= 0) break;
+      // same-buffer overlap: iterate bottom-up if dy > sy to avoid trash
+      bool same = (ds->buf == ss->buf);
+      if (same && dy > sy) {
+        for (int32_t y = h - 1; y >= 0; y--) {
+          memmove(ds->buf + (uint32_t)(dy + y) * ds->w + dx,
+                  ss->buf + (uint32_t)(sy + y) * ss->w + sx,
+                  (size_t)w * 2);
+        }
+      } else {
+        for (int32_t y = 0; y < h; y++) {
+          memmove(ds->buf + (uint32_t)(dy + y) * ds->w + dx,
+                  ss->buf + (uint32_t)(sy + y) * ss->w + sx,
+                  (size_t)w * 2);
+        }
+      }
+      if (ds->canvas) ds->canvas->markDirty((int16_t)dx, (int16_t)dy, (int16_t)w, (int16_t)h);
+      break;
+    }
+    case SYS_IMG_INVALIDATE: {
+      // imgInvalidate(slot, x, y, w, h) -> void. Union rect into dirty region.
+      int32_t ih = TC_POP(vm);
+      int32_t iw = TC_POP(vm);
+      int32_t iy = TC_POP(vm);
+      int32_t ix = TC_POP(vm);
+      int32_t slot = TC_POP(vm);
+      if (slot < 0 || slot >= TC_IMG_SLOTS) break;
+      RendererCanvas *cv = tc_img_store[slot].canvas;
+      if (!cv) break;
+      cv->markDirty((int16_t)ix, (int16_t)iy, (int16_t)iw, (int16_t)ih);
+      break;
+    }
+    case SYS_IMG_FLUSH: {
+      // imgFlush(slot, panel_x, panel_y) -> void.
+      // Push the slot's dirty region to (panel_x+dx, panel_y+dy), then clear
+      // the dirty region. Must NOT be inside an imgBeginDraw redirect (panel
+      // renderer needed). No-op if dirty is empty.
+      //
+      // Implementation mirrors SYS_DSP_IMG_RECT: gather the sub-rect into a
+      // contiguous temp buffer and send via ONE setAddrWindow + pushColors
+      // call. Row-by-row pushColors freezes/scrambles SPI displays.
+      int32_t py = TC_POP(vm);
+      int32_t px = TC_POP(vm);
+      int32_t slot = TC_POP(vm);
+      if (slot < 0 || slot >= TC_IMG_SLOTS) break;
+      TcImgSlot *s = &tc_img_store[slot];
+      if (!s->buf || !s->canvas) break;
+      if (!renderer) break;
+      RendererCanvas *cv = s->canvas;
+      if (!cv->hasDirty()) break;
+      int16_t dx = cv->dirtyX(), dy = cv->dirtyY();
+      int16_t dw = cv->dirtyW(), dh = cv->dirtyH();
+      if (dw <= 0 || dh <= 0) { cv->clearDirty(); break; }
+      uint16_t *img = s->buf;
+      uint16_t img_w = s->w;
+      if (dx == 0 && dw == (int16_t)img_w) {
+        // full-width dirty: rows are contiguous, single push directly
+        renderer->setAddrWindow((uint16_t)(px),
+                                (uint16_t)(py + dy),
+                                (uint16_t)(px + dw),
+                                (uint16_t)(py + dy + dh));
+        renderer->pushColors(&img[(uint32_t)dy * img_w], (uint32_t)dw * dh, true);
+      } else {
+        uint32_t total = (uint32_t)dw * dh;
+        uint16_t *tmp = (uint16_t *)special_malloc(total * 2);
+        if (tmp) {
+          for (int16_t row = 0; row < dh; row++) {
+            memcpy(&tmp[(uint32_t)row * dw],
+                   &img[(uint32_t)(dy + row) * img_w + dx],
+                   (size_t)dw * 2);
+          }
+          renderer->setAddrWindow((uint16_t)(px + dx),
+                                  (uint16_t)(py + dy),
+                                  (uint16_t)(px + dx + dw),
+                                  (uint16_t)(py + dy + dh));
+          renderer->pushColors(tmp, total, true);
+          free(tmp);
+        }
+      }
+      renderer->setAddrWindow(0, 0, 0, 0);
+      cv->clearDirty();
+      break;
+    }
+
+    // ── Bridge: camera JPEG slot  <->  display image slot (RGB565) ──
+#if defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA)
+    case SYS_DSP_LOAD_IMG_CAM: {
+      // dspLoadImageFromCam(cam_slot) -> img_slot (0..TC_IMG_SLOTS-1, -1 on error)
+      // Decodes a JPEG already captured into tc_cam_slot[cam-1] into a free RGB565
+      // image slot, making it editable with dspImgTextBurn / re-encodable with
+      // dspImageToCam. Non-destructive: the source cam slot is untouched.
+      int32_t cam = TC_POP(vm);
+      if (cam < 1 || cam > TC_CAM_MAX_SLOTS) { TC_PUSH(vm, -1); break; }
+      cam--;
+      if (!tc_cam_slot[cam].buf || tc_cam_slot[cam].len < 4) { TC_PUSH(vm, -1); break; }
+      uint8_t *jpg  = tc_cam_slot[cam].buf;
+      uint32_t jlen = tc_cam_slot[cam].len;
+      if (jpg[0] != 0xff || jpg[1] != 0xd8) { TC_PUSH(vm, -1); break; }
+
+      // find free img slot
+      int slot = -1;
+      for (int i = 0; i < TC_IMG_SLOTS; i++) {
+        if (!tc_img_store[i].buf) { slot = i; break; }
+      }
+      if (slot < 0) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: img no free slot (cam %d)"), cam + 1);
+        TC_PUSH(vm, -1); break;
+      }
+
+      uint16_t xsize = 0, ysize = 0;
+      get_jpeg_size(jpg, jlen, &xsize, &ysize);
+      if (!xsize || !ysize) { TC_PUSH(vm, -1); break; }
+      uint32_t outsize = (uint32_t)xsize * ysize * 2;
+      uint16_t *out_buf = (uint16_t *)special_malloc(outsize + 4);
+      if (!out_buf) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: img %dx%d RGB565 alloc failed (%u KB)"),
+               xsize, ysize, outsize / 1024);
+        TC_PUSH(vm, -1); break;
+      }
+      esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = jpg,
+        .indata_size = jlen,
+        .outbuf = (uint8_t*)out_buf,
+        .outbuf_size = outsize,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = { .swap_color_bytes = 0 }
+      };
+      esp_jpeg_image_output_t outimg;
+      OsWatchLoop();
+      esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &outimg);
+      OsWatchLoop();
+      if (err != ESP_OK) {
+        free(out_buf);
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: JPEG decode failed (cam %d, err=%d)"), cam + 1, err);
+        TC_PUSH(vm, -1); break;
+      }
+      tc_img_store[slot].buf = out_buf;
+      tc_img_store[slot].w = xsize;
+      tc_img_store[slot].h = ysize;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: img slot %d from cam %d: %dx%d (%u KB)"),
+             slot, cam + 1, xsize, ysize, outsize / 1024);
+      TC_PUSH(vm, slot);
+      break;
+    }
+
+    case SYS_DSP_IMG_TO_CAM: {
+      // dspImageToCam(img_slot, cam_slot, quality) -> bytes written (-1 on error)
+      // Re-encodes RGB565 image slot back into a cam slot as JPEG using
+      // esp32-camera's fmt2jpg(). Quality is esp_camera's range (1..63,
+      // lower = better). 12 is a good default (~ JPEG Q=85).
+      int32_t q        = TC_POP(vm);
+      int32_t cam      = TC_POP(vm);
+      int32_t img_slot = TC_POP(vm);
+      if (img_slot < 0 || img_slot >= TC_IMG_SLOTS || !tc_img_store[img_slot].buf) {
+        TC_PUSH(vm, -1); break;
+      }
+      if (cam < 1 || cam > TC_CAM_MAX_SLOTS) { TC_PUSH(vm, -1); break; }
+      if (q < 1)  q = 12;
+      if (q > 63) q = 63;
+      cam--;
+
+      uint16_t w = tc_img_store[img_slot].w;
+      uint16_t h = tc_img_store[img_slot].h;
+      uint8_t *out_buf = nullptr;
+      size_t   out_len = 0;
+      OsWatchLoop();
+      bool ok = fmt2jpg((uint8_t*)tc_img_store[img_slot].buf,
+                        (size_t)w * h * 2,
+                        w, h,
+                        PIXFORMAT_RGB565,
+                        (uint8_t)q,
+                        &out_buf, &out_len);
+      OsWatchLoop();
+      if (!ok || !out_buf || !out_len) {
+        if (out_buf) free(out_buf);
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: fmt2jpg failed (%dx%d q=%d)"), w, h, (int)q);
+        TC_PUSH(vm, -1); break;
+      }
+
+      // (Re)allocate PSRAM cam slot buffer
+      if (tc_cam_slot[cam].buf && tc_cam_slot[cam].len < out_len) {
+        free(tc_cam_slot[cam].buf);
+        tc_cam_slot[cam].buf = nullptr;
+      }
+      if (!tc_cam_slot[cam].buf) {
+        tc_cam_slot[cam].buf = (uint8_t*)heap_caps_malloc(out_len,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      }
+      if (!tc_cam_slot[cam].buf) {
+        free(out_buf);
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cam slot %d PSRAM alloc failed (%u bytes)"),
+               cam + 1, (uint32_t)out_len);
+        TC_PUSH(vm, -1); break;
+      }
+      tc_cam_slot[cam].writing = 1;
+      memcpy(tc_cam_slot[cam].buf, out_buf, out_len);
+      tc_cam_slot[cam].len    = out_len;
+      tc_cam_slot[cam].width  = w;
+      tc_cam_slot[cam].height = h;
+      tc_cam_slot[cam].writing = 0;
+      free(out_buf);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: cam slot %d from img %d: %dx%d -> %u bytes (q=%d)"),
+             cam + 1, img_slot, w, h, (uint32_t)out_len, (int)q);
+      TC_PUSH(vm, (int32_t)out_len);
+      break;
+    }
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
+
 #else
     case SYS_DSP_LOAD_IMG: {
       TC_POP(vm); // filename
@@ -7192,7 +9444,56 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       TC_PUSH(vm, 0);
       break;
     }
+    case SYS_IMG_CREATE: {
+      TC_POP(vm); TC_POP(vm);  // w, h
+      TC_PUSH(vm, -1);
+      break;
+    }
+    case SYS_IMG_BEGIN_DRAW: {
+      TC_POP(vm); // slot
+      break;
+    }
+    case SYS_IMG_END_DRAW: {
+      break;
+    }
+    case SYS_IMG_CLEAR: {
+      TC_POP(vm); TC_POP(vm);  // slot, color
+      break;
+    }
+    case SYS_IMG_BLIT: {
+      for (int i = 0; i < 8; i++) TC_POP(vm);  // dst,src,sx,sy,dx,dy,w,h
+      break;
+    }
+    case SYS_IMG_INVALIDATE: {
+      for (int i = 0; i < 5; i++) TC_POP(vm);  // slot,x,y,w,h
+      break;
+    }
+    case SYS_IMG_FLUSH: {
+      TC_POP(vm); TC_POP(vm); TC_POP(vm);  // slot,panel_x,panel_y
+      break;
+    }
+    case SYS_DSP_LOAD_IMG_CAM: {
+      TC_POP(vm); // cam_slot
+      TC_PUSH(vm, -1); // not available
+      break;
+    }
+    case SYS_DSP_IMG_TO_CAM: {
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); // img_slot, cam_slot, quality
+      TC_PUSH(vm, -1);
+      break;
+    }
 #endif // USE_DISPLAY && ESP32 && JPEG_PICTS
+
+#if !defined(USE_WEBCAM) && !defined(USE_TINYC_CAMERA) && \
+     defined(USE_DISPLAY) && defined(ESP32) && defined(JPEG_PICTS)
+    // Fallback when display/JPEG is available but no camera support compiled in
+    case SYS_DSP_LOAD_IMG_CAM: {
+      TC_POP(vm); TC_PUSH(vm, -1); break;
+    }
+    case SYS_DSP_IMG_TO_CAM: {
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, -1); break;
+    }
+#endif
 
     // ── Display drawing (direct renderer calls) ──────
 #ifdef USE_DISPLAY
@@ -7383,6 +9684,241 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       tc_dsp_pad = (int16_t)TC_POP(vm);
       break;
 
+    case SYS_DSP_TEXT_WIDTH: {
+      // Get pixel width for N chars in current font/size
+      int32_t len = TC_POP(vm);
+      if (!renderer) { TC_PUSH(vm, 0); break; }
+      int cw = 0;
+      uint8_t csize = renderer->getTextSize();
+#ifdef USE_EPD_FONTS
+      if (renderer->getFont() > 0 && renderer->getFont() < 5 && renderer->getSelectedFont()) {
+        cw = renderer->getSelectedFont()->Width;
+      } else
+#endif
+      {
+        cw = 6;  // GFX default: 5px char + 1px gap
+      }
+      TC_PUSH(vm, len * cw * csize);
+      break;
+    }
+    case SYS_DSP_TEXT_HEIGHT: {
+      // Get pixel height for current font/size
+      if (!renderer) { TC_PUSH(vm, 0); break; }
+      int ch = 0;
+      uint8_t csize = renderer->getTextSize();
+#ifdef USE_EPD_FONTS
+      if (renderer->getFont() > 0 && renderer->getFont() < 5 && renderer->getSelectedFont()) {
+        ch = renderer->getSelectedFont()->Height;
+      } else
+#endif
+      {
+        ch = 8;  // GFX default: 8px
+      }
+      TC_PUSH(vm, ch * csize);
+      break;
+    }
+
+    case SYS_DSP_IMG_TEXT: {
+      // dspImgText(slot, x, y, color, fieldWidth, align, text_buf)
+      // Composite text onto image sub-rect in RAM, then push once — flicker-free
+      // fieldWidth: total field width in chars (0 = auto from text length)
+      // align: 0=left, 1=right, 2=center
+      int32_t ref    = TC_POP(vm);
+      int32_t align  = TC_POP(vm);
+      int32_t fieldw = TC_POP(vm);
+      int32_t color  = TC_POP(vm);
+      int32_t y      = TC_POP(vm);
+      int32_t x      = TC_POP(vm);
+      int32_t slot   = TC_POP(vm);
+      if (!renderer) break;
+      if (slot < 0 || slot >= TC_IMG_SLOTS || !tc_img_store[slot].buf) break;
+
+      char text[128];
+      tc_ref_to_cstr(vm, ref, text, sizeof(text));
+      int tlen = strlen(text);
+      if (tlen == 0 && fieldw == 0) break;
+
+      uint16_t *img = tc_img_store[slot].buf;
+      uint16_t img_w = tc_img_store[slot].w;
+      uint16_t img_h = tc_img_store[slot].h;
+
+      // determine character dimensions
+      int cw = 6, ch_h = 8;  // GFX defaults
+      uint8_t csize = renderer->getTextSize();
+#ifdef USE_EPD_FONTS
+      sFONT *fnt = nullptr;
+      if (renderer->getFont() > 0 && renderer->getFont() < 5 && renderer->getSelectedFont()) {
+        fnt = renderer->getSelectedFont();
+        cw = fnt->Width;
+        ch_h = fnt->Height;
+      }
+#endif
+      // field width in chars determines the pixel rect width
+      int nchars = (fieldw > 0) ? fieldw : tlen;
+      int tw = nchars * cw * csize;
+      int th = ch_h * csize;
+
+      // clamp to image bounds
+      if (x < 0) x = 0;
+      if (y < 0) y = 0;
+      if (x + tw > img_w) tw = img_w - x;
+      if (y + th > img_h) th = img_h - y;
+      if (tw <= 0 || th <= 0) break;
+
+      // allocate temp buffer and copy image rect
+      uint32_t total = tw * th;
+      uint16_t *buf = (uint16_t *)special_malloc(total * 2);
+      if (!buf) break;
+      for (int row = 0; row < th; row++) {
+        memcpy(&buf[row * tw], &img[(y + row) * img_w + x], tw * 2);
+      }
+
+      // calculate text offset for alignment within field
+      int text_pw = tlen * cw * csize;  // actual text pixel width
+      int x_off = 0;  // pixel offset within field rect
+      if (align == 1) {        // right
+        x_off = tw - text_pw;
+      } else if (align == 2) { // center
+        x_off = (tw - text_pw) / 2;
+      }
+      if (x_off < 0) x_off = 0;
+
+      // render text characters into buf
+      uint16_t fg = (uint16_t)color;
+#ifdef USE_EPD_FONTS
+      if (fnt) {
+        for (int ci = 0; ci < tlen; ci++) {
+          int cx = x_off + ci * cw * csize;
+          if (cx >= tw) break;
+          char ascii_char = text[ci];
+          if (ascii_char < ' ') continue;
+          unsigned int char_offset = (ascii_char - ' ') * fnt->Height * (fnt->Width / 8 + (fnt->Width % 8 ? 1 : 0));
+          const unsigned char *ptr = &fnt->table[char_offset];
+          for (int fj = 0; fj < fnt->Height; fj++) {
+            for (int fi = 0; fi < fnt->Width; fi++) {
+              if (pgm_read_byte(ptr) & (0x80 >> (fi % 8))) {
+                // foreground pixel — write into buf for each scaled pixel
+                for (int sy = 0; sy < csize; sy++) {
+                  for (int sx = 0; sx < csize; sx++) {
+                    int px = cx + fi * csize + sx;
+                    int py = fj * csize + sy;
+                    if (px < tw && py < th) {
+                      buf[py * tw + px] = fg;
+                    }
+                  }
+                }
+              }
+              // background pixels: keep image data (already in buf)
+              if (fi % 8 == 7) ptr++;
+            }
+            if (fnt->Width % 8 != 0) ptr++;
+          }
+        }
+      }
+#endif
+
+      // push composited result in one SPI transaction
+      renderer->setAddrWindow(x, y, x + tw, y + th);
+      renderer->pushColors(buf, total, true);
+      renderer->setAddrWindow(0, 0, 0, 0);
+      free(buf);
+      break;
+    }
+
+    case SYS_DSP_IMG_TEXT_BURN: {
+      // dspImgTextBurn(slot, x, y, color, fieldWidth, align, text_buf)
+      // Same args / font logic as SYS_DSP_IMG_TEXT, but burns text pixels INTO
+      // the image buffer. Does NOT push anything to the TFT. Use this when you
+      // need to modify a captured camera frame before re-encoding to JPEG
+      // (dspImageToCam). The image slot is mutated in place.
+      //
+      // NOTE: camera boards usually compile USE_DISPLAY but never initialize
+      // renderer (no physical panel). We therefore DO NOT require renderer —
+      // we read the EPD font table (PROGMEM constant Font12) directly. If a
+      // real display IS attached and a font/size is selected, we honor it.
+      int32_t ref    = TC_POP(vm);
+      int32_t align  = TC_POP(vm);
+      int32_t fieldw = TC_POP(vm);
+      int32_t color  = TC_POP(vm);
+      int32_t y      = TC_POP(vm);
+      int32_t x      = TC_POP(vm);
+      int32_t slot   = TC_POP(vm);
+      if (slot < 0 || slot >= TC_IMG_SLOTS || !tc_img_store[slot].buf) break;
+
+      char text[128];
+      tc_ref_to_cstr(vm, ref, text, sizeof(text));
+      int tlen = strlen(text);
+      if (tlen == 0 && fieldw == 0) break;
+
+      uint16_t *img  = tc_img_store[slot].buf;
+      uint16_t img_w = tc_img_store[slot].w;
+      uint16_t img_h = tc_img_store[slot].h;
+
+#ifdef USE_EPD_FONTS
+      // Default font when no display is wired up / selected: Font12 @ size 1.
+      // Always linked as long as USE_DISPLAY is compiled (ESP32-CAM boards).
+      sFONT *fnt   = &Font12;
+      uint8_t csize = 1;
+      if (renderer) {
+        csize = renderer->getTextSize();
+        if (csize < 1) csize = 1;
+        if (renderer->getFont() > 0 && renderer->getFont() < 5 &&
+            renderer->getSelectedFont()) {
+          fnt = renderer->getSelectedFont();
+        }
+      }
+      int cw   = fnt->Width;
+      int ch_h = fnt->Height;
+
+      int nchars = (fieldw > 0) ? fieldw : tlen;
+      int tw = nchars * cw * csize;
+      int th = ch_h  * csize;
+      if (x < 0) x = 0;
+      if (y < 0) y = 0;
+      if (x + tw > img_w) tw = img_w - x;
+      if (y + th > img_h) th = img_h - y;
+      if (tw <= 0 || th <= 0) break;
+
+      int text_pw = tlen * cw * csize;
+      int x_off = 0;
+      if      (align == 1) x_off = tw - text_pw;
+      else if (align == 2) x_off = (tw - text_pw) / 2;
+      if (x_off < 0) x_off = 0;
+
+      uint16_t fg = (uint16_t)color;
+      for (int ci = 0; ci < tlen; ci++) {
+        int cx = x_off + ci * cw * csize;
+        if (cx >= tw) break;
+        char ascii_char = text[ci];
+        if (ascii_char < ' ') continue;
+        unsigned int char_offset = (ascii_char - ' ') * fnt->Height *
+                                   (fnt->Width / 8 + (fnt->Width % 8 ? 1 : 0));
+        const unsigned char *ptr = &fnt->table[char_offset];
+        for (int fj = 0; fj < fnt->Height; fj++) {
+          for (int fi = 0; fi < fnt->Width; fi++) {
+            if (pgm_read_byte(ptr) & (0x80 >> (fi % 8))) {
+              for (int sy_i = 0; sy_i < csize; sy_i++) {
+                for (int sx_i = 0; sx_i < csize; sx_i++) {
+                  int px = x + cx + fi * csize + sx_i;
+                  int py = y + fj * csize + sy_i;
+                  if (px >= 0 && px < img_w && py >= 0 && py < img_h) {
+                    img[py * img_w + px] = fg;
+                  }
+                }
+              }
+            }
+            if (fi % 8 == 7) ptr++;
+          }
+          if (fnt->Width % 8 != 0) ptr++;
+        }
+      }
+#else
+      (void)renderer; (void)img; (void)img_w; (void)img_h;
+      (void)x; (void)y; (void)color; (void)fieldw; (void)align; (void)text;
+#endif
+      break;
+    }
+
     // ── Touch buttons & sliders ──────────────────────
 #ifdef USE_TOUCH_BUTTONS
     case SYS_DSP_BUTTON:    // power button
@@ -7490,6 +10026,203 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
+
+    // ── TinyUI ──────────────────────────────────────────
+    case SYS_UI_SCREEN: { // (id) -> void  switch screen
+      int32_t id = TC_POP(vm);
+      if (id < 0) id = 0; if (id > 255) id = 255;
+      tc_ui_current_screen = (uint8_t)id;
+      tc_ui_clear_screen();
+      tc_ui_delete_all_vbuttons();
+      tc_ui_redraw_all_widgets();
+      break;
+    }
+    case SYS_UI_THEME: { // (bg, accent, text, border) -> void
+      int32_t border = TC_POP(vm);
+      int32_t text   = TC_POP(vm);
+      int32_t accent = TC_POP(vm);
+      int32_t bg     = TC_POP(vm);
+      tc_ui_theme.bg     = (uint16_t)bg;
+      tc_ui_theme.fg     = (uint16_t)text;
+      tc_ui_theme.accent = (uint16_t)accent;
+      tc_ui_theme.border = (uint16_t)border;
+      break;
+    }
+    case SYS_UI_CLEAR_SCREEN: { // () -> void
+      tc_ui_clear_screen();
+      break;
+    }
+    case SYS_UI_LABEL: { // (num,x,y,w,h,text_const,align) -> void
+      int32_t align = TC_POP(vm);
+      int32_t tci   = TC_POP(vm);
+      int32_t h     = TC_POP(vm);
+      int32_t w     = TC_POP(vm);
+      int32_t y     = TC_POP(vm);
+      int32_t x     = TC_POP(vm);
+      int32_t num   = TC_POP(vm);
+      if (num >= 0 && num < TC_UI_MAX_WIDGETS) {
+        TcUiWidget *W = &tc_ui_widgets[num];
+        W->type   = TC_UI_WIDGET_LABEL;
+        W->screen = tc_ui_current_screen;
+        W->x = (int16_t)x; W->y = (int16_t)y;
+        W->w = (int16_t)w; W->h = (int16_t)h;
+        W->fg = tc_ui_theme.fg;
+        W->bg = tc_ui_theme.bg;
+        W->accent = tc_ui_theme.accent;
+        if (align < -1) align = -1; if (align > 1) align = 1;
+        W->align = (int8_t)align;
+        const char *s = tc_get_const_str(vm, tci);
+        if (s) { strlcpy(W->text_buf, s, sizeof(W->text_buf)); }
+        else   { W->text_buf[0] = 0; }
+        tc_ui_draw_widget(W);
+      }
+      break;
+    }
+    case SYS_UI_LABEL_SET: { // (num, text_ref_or_const) -> void
+      int32_t tci = TC_POP(vm);
+      int32_t num = TC_POP(vm);
+      if (num >= 0 && num < TC_UI_MAX_WIDGETS) {
+        TcUiWidget *W = &tc_ui_widgets[num];
+        if (W->type == TC_UI_WIDGET_LABEL) {
+          // tc_ref_to_cstr handles both const refs and int32-array refs
+          tc_ref_to_cstr(vm, tci, W->text_buf, sizeof(W->text_buf));
+          tc_ui_draw_widget(W);
+        }
+      }
+      break;
+    }
+    case SYS_UI_CHECKBOX: { // (num,x,y,w,h,label_const) -> void   — VButton-backed toggle
+      int32_t lci = TC_POP(vm);
+      int32_t h   = TC_POP(vm);
+      int32_t w   = TC_POP(vm);
+      int32_t y   = TC_POP(vm);
+      int32_t x   = TC_POP(vm);
+      int32_t num = TC_POP(vm);
+      num = ((num % MAX_TOUCH_BUTTONS) + MAX_TOUCH_BUTTONS) % MAX_TOUCH_BUTTONS;
+      const char *label = tc_get_const_str(vm, lci);
+      if (!label) label = "";
+      // Clamp sizes so a 0 or negative value still produces a usable hit area
+      if (w < 8)  w = 8;
+      if (h < 8)  h = 8;
+      if (renderer) {
+        if (buttons[num]) { delete buttons[num]; buttons[num] = nullptr; }
+        buttons[num] = new VButton();
+        if (buttons[num]) {
+          char lbl[32];
+          strlcpy(lbl, label, sizeof(lbl));
+          // Match dspTButton init order exactly (slider before init, virtual flags after)
+          buttons[num]->vpower.data = 0;           // zero all flags (esp. 'disable')
+          buttons[num]->vpower.slider = 0;
+          buttons[num]->xinitButtonUL(renderer, (int16_t)x, (int16_t)y,
+            (uint16_t)w, (uint16_t)h,
+            tc_ui_theme.border, tc_ui_theme.bg, tc_ui_theme.fg, lbl, 1);
+          buttons[num]->vpower.is_virtual    = 1;
+          buttons[num]->vpower.is_pushbutton = 0;  // toggle
+          buttons[num]->xdrawButton(buttons[num]->vpower.on_off);
+        }
+      }
+      break;
+    }
+    case SYS_UI_BUTTON: { // (num,x,y,w,h,label_const) -> void   — VButton-backed momentary pushbutton
+      int32_t lci = TC_POP(vm);
+      int32_t h   = TC_POP(vm);
+      int32_t w   = TC_POP(vm);
+      int32_t y   = TC_POP(vm);
+      int32_t x   = TC_POP(vm);
+      int32_t num = TC_POP(vm);
+      num = ((num % MAX_TOUCH_BUTTONS) + MAX_TOUCH_BUTTONS) % MAX_TOUCH_BUTTONS;
+      const char *label = tc_get_const_str(vm, lci);
+      if (!label) label = "";
+      if (w < 8)  w = 8;
+      if (h < 8)  h = 8;
+      if (renderer) {
+        if (buttons[num]) { delete buttons[num]; buttons[num] = nullptr; }
+        buttons[num] = new VButton();
+        if (buttons[num]) {
+          char lbl[32];
+          strlcpy(lbl, label, sizeof(lbl));
+          buttons[num]->vpower.data = 0;
+          buttons[num]->vpower.slider = 0;
+          buttons[num]->xinitButtonUL(renderer, (int16_t)x, (int16_t)y,
+            (uint16_t)w, (uint16_t)h,
+            tc_ui_theme.border, tc_ui_theme.bg, tc_ui_theme.fg, lbl, 1);
+          buttons[num]->vpower.is_virtual    = 1;
+          buttons[num]->vpower.is_pushbutton = 1;  // momentary — TouchButton(num,1) press, (num,0) release
+          buttons[num]->xdrawButton(buttons[num]->vpower.on_off);
+        }
+      }
+      break;
+    }
+    case SYS_UI_PROGRESS: { // (num,x,y,w,h,value,max) -> void
+      int32_t vmax  = TC_POP(vm);
+      int32_t value = TC_POP(vm);
+      int32_t h     = TC_POP(vm);
+      int32_t w     = TC_POP(vm);
+      int32_t y     = TC_POP(vm);
+      int32_t x     = TC_POP(vm);
+      int32_t num   = TC_POP(vm);
+      if (num >= 0 && num < TC_UI_MAX_WIDGETS) {
+        TcUiWidget *W = &tc_ui_widgets[num];
+        W->type   = TC_UI_WIDGET_PROGRESS;
+        W->screen = tc_ui_current_screen;
+        W->x = (int16_t)x; W->y = (int16_t)y;
+        W->w = (int16_t)w; W->h = (int16_t)h;
+        W->value = value;
+        W->vmin  = 0;
+        W->vmax  = (vmax > 0) ? vmax : 100;
+        W->fg = tc_ui_theme.fg;
+        W->bg = tc_ui_theme.muted;
+        W->accent = tc_ui_theme.accent;
+        tc_ui_draw_widget(W);
+      }
+      break;
+    }
+    case SYS_UI_PROGRESS_SET: { // (num, value) -> void
+      int32_t value = TC_POP(vm);
+      int32_t num   = TC_POP(vm);
+      if (num >= 0 && num < TC_UI_MAX_WIDGETS) {
+        TcUiWidget *W = &tc_ui_widgets[num];
+        if (W->type == TC_UI_WIDGET_PROGRESS) {
+          W->value = value;
+          tc_ui_draw_widget(W);
+        }
+      }
+      break;
+    }
+    case SYS_UI_GAUGE: { // (num,x,y,r,value,vmin,vmax) -> void
+      int32_t vmax  = TC_POP(vm);
+      int32_t vmin  = TC_POP(vm);
+      int32_t value = TC_POP(vm);
+      int32_t r     = TC_POP(vm);
+      int32_t y     = TC_POP(vm);
+      int32_t x     = TC_POP(vm);
+      int32_t num   = TC_POP(vm);
+      if (num >= 0 && num < TC_UI_MAX_WIDGETS) {
+        TcUiWidget *W = &tc_ui_widgets[num];
+        W->type   = TC_UI_WIDGET_GAUGE;
+        W->screen = tc_ui_current_screen;
+        W->x = (int16_t)x; W->y = (int16_t)y;
+        W->w = (int16_t)r; W->h = (int16_t)r;
+        W->value = value;
+        W->vmin  = vmin;
+        W->vmax  = (vmax > vmin) ? vmax : (vmin + 1);
+        W->fg = tc_ui_theme.fg;
+        W->bg = tc_ui_theme.bg;
+        W->accent = tc_ui_theme.accent;
+        tc_ui_draw_widget(W);
+      }
+      break;
+    }
+    case SYS_UI_ICON: { // (num,x,y,img_slot) -> void  (image button wrapper)
+      int32_t slot = TC_POP(vm);
+      int32_t y    = TC_POP(vm);
+      int32_t x    = TC_POP(vm);
+      int32_t num  = TC_POP(vm);
+      // For now draw via dspPicture-equivalent by calling renderer directly via the img slot path.
+      // TODO: wire to the existing image-slot lookup once that path is exposed.
+      (void)slot; (void)x; (void)y; (void)num;
+      break;
+    }
 #else  // !USE_TOUCH_BUTTONS — pop args but do nothing
     case SYS_DSP_BUTTON:
     case SYS_DSP_TBUTTON:
@@ -7503,6 +10236,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       TC_POP(vm); TC_PUSH(vm, -1); break;
     case SYS_DSP_BTN_DEL:
       TC_POP(vm); break;
+    // TinyUI stubs (no-touch display build)
+    case SYS_UI_SCREEN:         TC_POP(vm); break;
+    case SYS_UI_THEME:          TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_CLEAR_SCREEN:   break;
+    case SYS_UI_LABEL:          for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_LABEL_SET:      TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_CHECKBOX:       for (int i = 0; i < 6; i++) TC_POP(vm); break;
+    case SYS_UI_PROGRESS:       for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_PROGRESS_SET:   TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_GAUGE:          for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_ICON:           for (int i = 0; i < 4; i++) TC_POP(vm); break;
+    case SYS_UI_BUTTON:         for (int i = 0; i < 6; i++) TC_POP(vm); break;
 #endif // USE_TOUCH_BUTTONS
 
 #else  // !USE_DISPLAY — pop args from stack but do nothing
@@ -7557,6 +10302,33 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       TC_POP(vm); TC_PUSH(vm, -1); break;
     case SYS_DSP_BTN_DEL:
       TC_POP(vm); break;
+    case SYS_DSP_TEXT_WIDTH:
+      TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_DSP_TEXT_HEIGHT:
+      TC_PUSH(vm, 0); break;
+    case SYS_DSP_IMG_TEXT:
+    case SYS_DSP_IMG_TEXT_BURN:
+      // 7 args: slot, x, y, color, fieldw, align, buf_ref
+      for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    // TinyUI stubs (no-display build)
+    case SYS_UI_SCREEN:         TC_POP(vm); break;
+    case SYS_UI_THEME:          TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_CLEAR_SCREEN:   break;
+    case SYS_UI_LABEL:          for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_LABEL_SET:      TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_CHECKBOX:       for (int i = 0; i < 6; i++) TC_POP(vm); break;
+    case SYS_UI_PROGRESS:       for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_PROGRESS_SET:   TC_POP(vm); TC_POP(vm); break;
+    case SYS_UI_GAUGE:          for (int i = 0; i < 7; i++) TC_POP(vm); break;
+    case SYS_UI_ICON:           for (int i = 0; i < 4; i++) TC_POP(vm); break;
+    case SYS_UI_BUTTON:         for (int i = 0; i < 6; i++) TC_POP(vm); break;
+    // NOTE: Canvas stubs (SYS_IMG_CREATE..SYS_IMG_FLUSH) intentionally NOT
+    // duplicated here. They are provided by the earlier
+    //   #if defined(USE_DISPLAY) && defined(ESP32) && defined(JPEG_PICTS)
+    //   #else
+    // block (~line 8015), which fires whenever *any* of those three macros
+    // is undefined — including the !USE_DISPLAY case this #else covers.
+    // Adding them here would produce duplicate-case-value errors.
 #endif // USE_DISPLAY
 
     // ── Audio ──────────────────────────────────────────
@@ -7616,6 +10388,194 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     }
 #endif
 
+    // ── Minimal I2S output (standalone, no USE_I2S_AUDIO needed) ──
+#ifdef ESP32
+    case SYS_I2S_BEGIN: {
+      // i2sBegin(bclk, lrclk, dout, sampleRate) -> 0=ok, -1=error
+      int32_t sample_rate = TC_POP(vm);
+      int32_t dout_pin    = TC_POP(vm);
+      int32_t lrclk_pin   = TC_POP(vm);
+      int32_t bclk_pin    = TC_POP(vm);
+
+      // Stop any previous I2S session
+      if (Tinyc->i2s_tx_handle) {
+        i2s_channel_disable(Tinyc->i2s_tx_handle);
+        i2s_del_channel(Tinyc->i2s_tx_handle);
+        Tinyc->i2s_tx_handle = nullptr;
+      }
+      if (Tinyc->i2s_pcm_buf) {
+        free(Tinyc->i2s_pcm_buf);
+        Tinyc->i2s_pcm_buf = nullptr;
+      }
+
+      if (sample_rate < 8000) sample_rate = 8000;
+      if (sample_rate > 48000) sample_rate = 48000;
+
+      i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+      chan_cfg.dma_desc_num = 8;
+      chan_cfg.dma_frame_num = 512;
+
+      esp_err_t err = i2s_new_channel(&chan_cfg, &Tinyc->i2s_tx_handle, NULL);
+      if (err != ESP_OK) {
+        Tinyc->i2s_tx_handle = nullptr;
+        TC_PUSH(vm, -1);
+        break;
+      }
+
+      i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,
+          .bclk = (gpio_num_t)bclk_pin,
+          .ws   = (gpio_num_t)lrclk_pin,
+          .dout = (gpio_num_t)dout_pin,
+          .din  = I2S_GPIO_UNUSED,
+          .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+      };
+
+      err = i2s_channel_init_std_mode(Tinyc->i2s_tx_handle, &std_cfg);
+      if (err != ESP_OK) {
+        i2s_del_channel(Tinyc->i2s_tx_handle);
+        Tinyc->i2s_tx_handle = nullptr;
+        TC_PUSH(vm, -1);
+        break;
+      }
+
+      i2s_channel_enable(Tinyc->i2s_tx_handle);
+      Tinyc->i2s_sample_rate = sample_rate;
+      // Allocate stereo PCM buffer: 512 mono samples → 1024 stereo int16
+      if (Tinyc->i2s_pcm_buf) free(Tinyc->i2s_pcm_buf);
+      Tinyc->i2s_pcm_buf = (int16_t *)malloc(1024 * sizeof(int16_t));
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: I2S TX started bclk=%d lrclk=%d dout=%d rate=%d"),
+             bclk_pin, lrclk_pin, dout_pin, sample_rate);
+      TC_PUSH(vm, 0);
+      break;
+    }
+
+    case SYS_I2S_WRITE: {
+      // i2sWrite(buf, len) -> samples_written
+      // buf is int[] with 16-bit signed mono PCM samples
+      // Output is stereo: each mono sample is duplicated to L+R channels
+      // Uses static buffer to avoid malloc/free per call
+      int32_t len     = TC_POP(vm);
+      int32_t arr_ref = TC_POP(vm);
+
+      if (!Tinyc->i2s_tx_handle || !Tinyc->i2s_pcm_buf) {
+        TC_PUSH(vm, -1);
+        break;
+      }
+
+      int32_t *arr = tc_resolve_ref(vm, arr_ref);
+      int32_t maxLen = tc_ref_maxlen(vm, arr_ref);
+      if (!arr || len <= 0) { TC_PUSH(vm, 0); break; }
+      if (len > maxLen) len = maxLen;
+      if (len > 512) len = 512;  // cap to buffer size
+
+      int16_t *i2s_pcm_buf = Tinyc->i2s_pcm_buf;
+
+      for (int32_t i = 0; i < len; i++) {
+        int32_t s = arr[i];
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+        i2s_pcm_buf[i * 2]     = (int16_t)s;  // left
+        i2s_pcm_buf[i * 2 + 1] = (int16_t)s;  // right
+      }
+
+      size_t bytes_written = 0;
+      i2s_channel_write(Tinyc->i2s_tx_handle, i2s_pcm_buf, len * 2 * sizeof(int16_t),
+                        &bytes_written, portMAX_DELAY);
+      TC_PUSH(vm, (int32_t)(bytes_written / (2 * sizeof(int16_t))));
+      break;
+    }
+
+    case SYS_I2S_STOP: {
+      // i2sStop() -> void
+      if (Tinyc->i2s_tx_handle) {
+        i2s_channel_disable(Tinyc->i2s_tx_handle);
+        i2s_del_channel(Tinyc->i2s_tx_handle);
+        Tinyc->i2s_tx_handle = nullptr;
+      }
+      if (Tinyc->i2s_pcm_buf) {
+        free(Tinyc->i2s_pcm_buf);
+        Tinyc->i2s_pcm_buf = nullptr;
+      }
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: I2S TX stopped"));
+      break;
+    }
+#else
+    // ESP8266: no I2S support
+    case SYS_I2S_BEGIN: { TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, -1); break; }
+    case SYS_I2S_WRITE: { TC_POP(vm); TC_POP(vm); TC_PUSH(vm, -1); break; }
+    case SYS_I2S_STOP:  { break; }
+#endif
+
+    // ── fileReadPCM16: read 16-bit LE PCM from file into int[] (native speed) ──
+    case SYS_FILE_READ_PCM16: {
+#ifdef USE_UFILESYS
+      // fileReadPCM16(handle, arr, max_samples, channels) -> samples_read
+      // channels: 1=mono, 2=stereo (downmixed to mono)
+      // Reads raw bytes from file, converts int16 LE to int32 in arr[]
+      int32_t channels    = TC_POP(vm);
+      int32_t max_samples = TC_POP(vm);
+      int32_t ref         = TC_POP(vm);
+      int32_t handle      = TC_POP(vm);
+
+      if (handle < 0 || handle >= TC_MAX_FILE_HANDLES || !Tinyc->file_used[handle]) {
+        TC_PUSH(vm, -1); break;
+      }
+      int32_t *arr = tc_resolve_ref(vm, ref);
+      int32_t arr_len = tc_ref_maxlen(vm, ref);
+      if (!arr || max_samples <= 0) { TC_PUSH(vm, 0); break; }
+      if (max_samples > arr_len) max_samples = arr_len;
+
+      File &f = tc_file_handles[handle];
+      int bytes_per_frame = (channels == 2) ? 4 : 2;
+      int32_t read_bytes = max_samples * bytes_per_frame;
+      // Use a temp buffer on stack (max 2048 bytes = 512 stereo frames or 1024 mono frames)
+      if (read_bytes > 2048) { max_samples = 2048 / bytes_per_frame; read_bytes = max_samples * bytes_per_frame; }
+      uint8_t tmpbuf[2048];
+      int32_t got = f.read(tmpbuf, read_bytes);
+      if (got <= 0) { TC_PUSH(vm, 0); break; }
+      int32_t frames = got / bytes_per_frame;
+
+      if (channels == 2) {
+        // Stereo: average L+R to mono
+        for (int32_t i = 0; i < frames; i++) {
+          int32_t lo = tmpbuf[i * 4];
+          int32_t hi = tmpbuf[i * 4 + 1];
+          int32_t left = (int16_t)((hi << 8) | lo);
+          lo = tmpbuf[i * 4 + 2];
+          hi = tmpbuf[i * 4 + 3];
+          int32_t right = (int16_t)((hi << 8) | lo);
+          arr[i] = (left + right) / 2;
+        }
+      } else {
+        // Mono
+        for (int32_t i = 0; i < frames; i++) {
+          int32_t lo = tmpbuf[i * 2];
+          int32_t hi = tmpbuf[i * 2 + 1];
+          arr[i] = (int16_t)((hi << 8) | lo);
+        }
+      }
+      TC_PUSH(vm, frames);
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    // ── TCP: server-accepted or outgoing client (selected via tcpSelect) ──
+    // Outgoing client is selected via tcp_cli_slot (0..TC_TCP_CLI_SLOTS-1).
+    // Slot 0 additionally falls back to server-accepted client for backward
+    // compat with the Scripter ws* server-only API.
+    #define TC_TCP_OUT_CLIENT() (&Tinyc->tcp_cli_clients[Tinyc->tcp_cli_slot])
+    #define TC_TCP_ACTIVE_CLIENT() \
+      (TC_TCP_OUT_CLIENT()->connected() ? TC_TCP_OUT_CLIENT() : \
+       (Tinyc->tcp_cli_slot == 0 && Tinyc->tcp_server && Tinyc->tcp_client.connected()) ? &Tinyc->tcp_client : nullptr)
+
     // ── TCP server (Scripter-compatible ws* functions) ──
     case SYS_TCP_OPEN: {  // wso(port)
       int32_t port = TC_POP(vm);
@@ -7651,27 +10611,27 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     }
     case SYS_TCP_AVAILABLE: {  // wsa()
       int32_t avail = 0;
-      if (Tinyc->tcp_server) {
-        if (Tinyc->tcp_server->hasClient()) {
-          Tinyc->tcp_client = Tinyc->tcp_server->available();
-        }
-        if (Tinyc->tcp_client && Tinyc->tcp_client.connected()) {
-          avail = Tinyc->tcp_client.available();
-        }
+      // Server mode: accept new clients into tcp_client
+      if (Tinyc->tcp_server && Tinyc->tcp_server->hasClient()) {
+        Tinyc->tcp_client = Tinyc->tcp_server->available();
       }
+      // Check active client (outgoing has priority over server-accepted)
+      WiFiClient *_tc = TC_TCP_ACTIVE_CLIENT();
+      if (_tc) avail = _tc->available();
       TC_PUSH(vm, avail);
       break;
     }
     case SYS_TCP_READ_STR: {  // wsrs(buf)
       int32_t ref = TC_POP(vm);
       int32_t count = 0;
-      if (Tinyc->tcp_server && Tinyc->tcp_client.connected()) {
+      WiFiClient *_tc = TC_TCP_ACTIVE_CLIENT();
+      if (_tc) {
         int32_t *base = tc_resolve_ref(vm, ref);
         if (base) {
-          uint16_t slen = Tinyc->tcp_client.available();
+          uint16_t slen = _tc->available();
           if (slen > 254) slen = 254;  // cap to reasonable char[] size
           for (uint16_t i = 0; i < slen; i++) {
-            base[i] = Tinyc->tcp_client.read();
+            base[i] = _tc->read();
           }
           base[slen] = 0;  // null terminate
           count = slen;
@@ -7682,22 +10642,24 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     }
     case SYS_TCP_WRITE_STR: {  // wsws(str)
       int32_t ref = TC_POP(vm);
-      if (Tinyc->tcp_server && Tinyc->tcp_client.connected()) {
+      WiFiClient *_tc = TC_TCP_ACTIVE_CLIENT();
+      if (_tc) {
         char buf[256];
         tc_ref_to_cstr(vm, ref, buf, sizeof(buf));
-        Tinyc->tcp_client.write(buf, strlen(buf));
+        _tc->write(buf, strlen(buf));
       }
       break;
     }
     case SYS_TCP_READ_ARR: {  // wsra(arr)
       int32_t ref = TC_POP(vm);
       int32_t count = 0;
-      if (Tinyc->tcp_server && Tinyc->tcp_client.connected()) {
+      WiFiClient *_tc = TC_TCP_ACTIVE_CLIENT();
+      if (_tc) {
         int32_t *base = tc_resolve_ref(vm, ref);
         if (base) {
-          uint16_t slen = Tinyc->tcp_client.available();
+          uint16_t slen = _tc->available();
           for (uint16_t i = 0; i < slen; i++) {
-            base[i] = Tinyc->tcp_client.read();
+            base[i] = _tc->read();
           }
           count = slen;
         }
@@ -7709,7 +10671,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t type = TC_POP(vm);
       int32_t num  = TC_POP(vm);
       int32_t ref  = TC_POP(vm);
-      if (Tinyc->tcp_server && Tinyc->tcp_client.connected()) {
+      WiFiClient *_tc = TC_TCP_ACTIVE_CLIENT();
+      if (_tc) {
         int32_t *base = tc_resolve_ref(vm, ref);
         if (base) {
           uint8_t *abf = (uint8_t*)malloc(num * 4);
@@ -7748,13 +10711,166 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
                 }
               }
             }
-            Tinyc->tcp_client.write(abf, dlen);
+            _tc->write(abf, dlen);
             free(abf);
           }
         }
       }
       break;
     }
+
+    // ── TCP client (outgoing connections) ──────────────
+    case SYS_TCP_CONNECT: {  // tcpConnect("ip", port) -> int (operates on currently selected slot)
+      int32_t port = TC_POP(vm);
+      int32_t ci   = TC_POP(vm);
+      if (TasmotaGlobal.global_state.network_down) {
+        TC_PUSH(vm, -2);
+      } else {
+        const char *ip = (ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1)
+                         ? vm->constants[ci].str.ptr : nullptr;
+        if (!ip) {
+          TC_PUSH(vm, -1);
+        } else {
+          WiFiClient *_oc = TC_TCP_OUT_CLIENT();
+          _oc->stop();  // close any previous connection on this slot
+          if (_oc->connect(ip, port)) {
+            _oc->setNoDelay(true);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip, port);
+            TC_PUSH(vm, 0);
+          } else {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), Tinyc->tcp_cli_slot, ip, port);
+            TC_PUSH(vm, -1);
+          }
+        }
+      }
+      break;
+    }
+    case SYS_TCP_CONNECT_REF: {  // tcpConnect(ip_char_array, port) -> int
+      // _REF variant: IP string from runtime char array rather than literal.
+      // Enables dynamic IP configuration from e.g. persist int[4] + sprintf.
+      int32_t port = TC_POP(vm);
+      int32_t ref  = TC_POP(vm);
+      if (TasmotaGlobal.global_state.network_down) {
+        TC_PUSH(vm, -2);
+      } else {
+        char ip_tmp[48];
+        if (tc_ref_to_cstr(vm, ref, ip_tmp, sizeof(ip_tmp)) <= 0) {
+          TC_PUSH(vm, -1);
+        } else {
+          WiFiClient *_oc = TC_TCP_OUT_CLIENT();
+          _oc->stop();
+          if (_oc->connect(ip_tmp, port)) {
+            _oc->setNoDelay(true);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip_tmp, port);
+            TC_PUSH(vm, 0);
+          } else {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), Tinyc->tcp_cli_slot, ip_tmp, port);
+            TC_PUSH(vm, -1);
+          }
+        }
+      }
+      break;
+    }
+    case SYS_TCP_DISCONNECT: {  // tcpDisconnect()
+      WiFiClient *_oc = TC_TCP_OUT_CLIENT();
+      if (_oc->connected()) {
+        _oc->stop();
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] disconnected"), Tinyc->tcp_cli_slot);
+      }
+      break;
+    }
+    case SYS_TCP_CONNECTED: {  // tcpConnected() -> int
+      TC_PUSH(vm, TC_TCP_OUT_CLIENT()->connected() ? 1 : 0);
+      break;
+    }
+    case SYS_TCP_SELECT: {  // tcpSelect(slot) — select outgoing TCP client slot
+      int32_t slot = TC_POP(vm);
+      if (slot < 0) slot = 0;
+      if (slot >= TC_TCP_CLI_SLOTS) slot = TC_TCP_CLI_SLOTS - 1;
+      Tinyc->tcp_cli_slot = (uint8_t)slot;
+      break;
+    }
+
+    // ── MQTT Subscribe/Publish ────────────────────────
+#ifdef USE_MQTT
+    case SYS_MQTT_SUBSCRIBE: {  // mqttSubscribe("topic") -> int slot or -1
+      int32_t ci = TC_POP(vm);
+      const char *topic = tc_get_const_str(vm, ci);
+      TC_PUSH(vm, topic ? tc_mqtt_subscribe(topic) : -1);
+      break;
+    }
+    case SYS_MQTT_UNSUBSCRIBE: {  // mqttUnsubscribe("topic") -> int 0=ok or -1
+      int32_t ci = TC_POP(vm);
+      const char *topic = tc_get_const_str(vm, ci);
+      TC_PUSH(vm, topic ? tc_mqtt_unsubscribe(topic) : -1);
+      break;
+    }
+    case SYS_MQTT_PUBLISH_TO: {  // mqttPublish("topic", "payload") -> int 0=ok or -1
+      int32_t pci = TC_POP(vm);   // payload const index
+      int32_t tci = TC_POP(vm);   // topic const index
+      const char *topic = tc_get_const_str(vm, tci);
+      const char *payload = tc_get_const_str(vm, pci);
+      if (topic && payload) {
+        MqttPublishPayload(topic, payload);
+        TC_PUSH(vm, 0);
+      } else {
+        TC_PUSH(vm, -1);
+      }
+      break;
+    }
+#else
+    case SYS_MQTT_SUBSCRIBE:
+    case SYS_MQTT_UNSUBSCRIBE:
+    case SYS_MQTT_PUBLISH_TO:
+      TC_POP(vm);
+      if (id == SYS_MQTT_PUBLISH_TO) TC_POP(vm);
+      TC_PUSH(vm, -1);
+      break;
+#endif  // USE_MQTT
+
+    // ── Dynamic task spawn (ESP32 only) ───────────────
+#ifdef ESP32
+    case SYS_SPAWN_TASK: {  // spawnTask("name") -> int
+      int32_t ci = TC_POP(vm);
+      const char *name = tc_get_const_str(vm, ci);
+      TC_PUSH(vm, name ? tc_spawn_task_create(name, 0) : -1);
+      break;
+    }
+    case SYS_SPAWN_TASK_STACK: {  // spawnTask("name", stack_kb) -> int
+      int32_t kb = TC_POP(vm);
+      int32_t ci = TC_POP(vm);
+      const char *name = tc_get_const_str(vm, ci);
+      // 3 KB minimum (even simpler workers using AddLog need this much)
+      // 16 KB upper clamp — plenty for HTTP/TLS clients.
+      if (kb < 3)  kb = 3;
+      if (kb > 16) kb = 16;
+      TC_PUSH(vm, name ? tc_spawn_task_create(name, (uint16_t)kb) : -1);
+      break;
+    }
+    case SYS_KILL_TASK: {  // killTask("name") -> int (0=signaled, -1=not running)
+      int32_t ci = TC_POP(vm);
+      const char *name = tc_get_const_str(vm, ci);
+      TC_PUSH(vm, name ? tc_spawn_task_kill(name) : -1);
+      break;
+    }
+    case SYS_TASK_RUNNING: {  // taskRunning("name") -> int (0/1)
+      int32_t ci = TC_POP(vm);
+      const char *name = tc_get_const_str(vm, ci);
+      TC_PUSH(vm, name ? tc_spawn_task_running(name) : 0);
+      break;
+    }
+#else
+    case SYS_SPAWN_TASK:
+    case SYS_KILL_TASK:
+    case SYS_TASK_RUNNING:
+      TC_POP(vm);
+      TC_PUSH(vm, -1);
+      break;
+    case SYS_SPAWN_TASK_STACK:
+      TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, -1);
+      break;
+#endif  // ESP32
 
     // ── Persist variables ─────────────────────────────
     case SYS_PERSIST_SAVE:
@@ -8272,6 +11388,382 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       break;
 #endif  // USE_LIGHT && USE_WS2812
 
+    // ── Cross-VM shared key/value store ───────────────
+    // All handlers: pop key as a const-pool index, look up key string, do
+    // mutex-protected table op, push result if any. Missing-key reads return
+    // 0 / 0.0 / "" so polling loops stay simple. See section header above.
+    case SYS_SHARE_SET_INT: {
+      int32_t val = TC_POP(vm);
+      int32_t ki  = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      if (!key) break;
+      tc_share_lock();
+      int idx = tc_share_find_or_alloc(key);
+      if (idx >= 0) { tc_share_table[idx].type = TC_SHARE_TYPE_INT; tc_share_table[idx].v.i = val; }
+      tc_share_unlock();
+      break;
+    }
+    case SYS_SHARE_GET_INT: {
+      int32_t ki = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      int32_t out = 0;
+      if (key) {
+        tc_share_lock();
+        int idx = tc_share_find(key);
+        if (idx >= 0) {
+          if      (tc_share_table[idx].type == TC_SHARE_TYPE_INT) out = tc_share_table[idx].v.i;
+          else if (tc_share_table[idx].type == TC_SHARE_TYPE_FLT) out = (int32_t)tc_share_table[idx].v.f;
+          // STR → leave 0 (caller used wrong getter)
+        }
+        tc_share_unlock();
+      }
+      TC_PUSH(vm, out);
+      break;
+    }
+    case SYS_SHARE_SET_FLT: {
+      float val   = TC_POPF(vm);
+      int32_t ki  = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      if (!key) break;
+      tc_share_lock();
+      int idx = tc_share_find_or_alloc(key);
+      if (idx >= 0) { tc_share_table[idx].type = TC_SHARE_TYPE_FLT; tc_share_table[idx].v.f = val; }
+      tc_share_unlock();
+      break;
+    }
+    case SYS_SHARE_GET_FLT: {
+      int32_t ki = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      float out = 0.0f;
+      if (key) {
+        tc_share_lock();
+        int idx = tc_share_find(key);
+        if (idx >= 0) {
+          if      (tc_share_table[idx].type == TC_SHARE_TYPE_FLT) out = tc_share_table[idx].v.f;
+          else if (tc_share_table[idx].type == TC_SHARE_TYPE_INT) out = (float)tc_share_table[idx].v.i;
+        }
+        tc_share_unlock();
+      }
+      TC_PUSHF(vm, out);
+      break;
+    }
+    case SYS_SHARE_SET_STR: {
+      int32_t src_ref = TC_POP(vm);
+      int32_t ki      = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      int32_t *src = tc_resolve_ref(vm, src_ref);
+      if (!key || !src) break;
+      // Pull source bytes out of the int32 array into a local buffer.
+      int32_t srcMax = tc_ref_maxlen(vm, src_ref);
+      char buf[TC_SHARE_STR_LEN + 1];
+      int32_t si = 0;
+      while (src[si] != 0 && si < srcMax && si < (int32_t)sizeof(buf) - 1) {
+        buf[si] = (char)(src[si] & 0xFF);
+        si++;
+      }
+      buf[si] = '\0';
+      tc_share_lock();
+      int idx = tc_share_find_or_alloc(key);
+      if (idx >= 0) {
+        tc_share_table[idx].type = TC_SHARE_TYPE_STR;
+        strlcpy(tc_share_table[idx].s, buf, sizeof(tc_share_table[idx].s));
+      }
+      tc_share_unlock();
+      break;
+    }
+    case SYS_SHARE_GET_STR: {
+      int32_t dst_ref = TC_POP(vm);
+      int32_t ki      = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      int32_t *dst = tc_resolve_ref(vm, dst_ref);
+      int32_t copied = 0;
+      if (key && dst) {
+        int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
+        char buf[TC_SHARE_STR_LEN + 1];
+        buf[0] = '\0';
+        tc_share_lock();
+        int idx = tc_share_find(key);
+        if (idx >= 0 && tc_share_table[idx].type == TC_SHARE_TYPE_STR) {
+          strlcpy(buf, tc_share_table[idx].s, sizeof(buf));
+        }
+        tc_share_unlock();
+        copied = tc_sprintf_to_ref(dst, maxSlots, buf);
+      }
+      TC_PUSH(vm, copied);
+      break;
+    }
+    case SYS_SHARE_HAS: {
+      int32_t ki = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      int32_t hit = 0;
+      if (key) {
+        tc_share_lock();
+        hit = (tc_share_find(key) >= 0) ? 1 : 0;
+        tc_share_unlock();
+      }
+      TC_PUSH(vm, hit);
+      break;
+    }
+    case SYS_SHARE_DELETE: {
+      int32_t ki = TC_POP(vm);
+      const char *key = tc_get_const_str(vm, ki);
+      int32_t removed = 0;
+      if (key) {
+        tc_share_lock();
+        int idx = tc_share_find(key);
+        if (idx >= 0) {
+          tc_share_table[idx].type = TC_SHARE_TYPE_NONE;
+          tc_share_table[idx].key[0] = '\0';
+          tc_share_table[idx].s[0] = '\0';
+          removed = 1;
+        }
+        tc_share_unlock();
+      }
+      TC_PUSH(vm, removed);
+      break;
+    }
+
+    // ── Crypto: AES-128 / SHA-256 / HMAC-SHA256 ──────
+    // Helper lambda-style macros local to this block. Pull a TinyC char[] ref
+    // off the stack and copy to a stack-local C byte buffer. Returns 0 if the
+    // ref is bogus or capacity is exceeded. Caller checks with `if (!_ok) ...`.
+    case SYS_AES_ECB: {
+#ifdef ESP32
+      int32_t enc_flag  = TC_POP(vm);
+      int32_t data_ref  = TC_POP(vm);
+      int32_t key_ref   = TC_POP(vm);
+      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
+      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
+      if (!key_arr || !data_arr ||
+          tc_ref_maxlen(vm, key_ref) < 16 || tc_ref_maxlen(vm, data_ref) < 16) {
+        TC_PUSH(vm, 0); break;
+      }
+      uint8_t k[16], in[16], out[16];
+      for (int i = 0; i < 16; i++) { k[i]  = (uint8_t)(key_arr[i]  & 0xFF); }
+      for (int i = 0; i < 16; i++) { in[i] = (uint8_t)(data_arr[i] & 0xFF); }
+      mbedtls_aes_context ctx;
+      mbedtls_aes_init(&ctx);
+      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, k, 128)
+                        : mbedtls_aes_setkey_dec(&ctx, k, 128);
+      if (rc == 0) {
+        rc = mbedtls_aes_crypt_ecb(&ctx,
+              enc_flag ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT,
+              in, out);
+      }
+      mbedtls_aes_free(&ctx);
+      if (rc == 0) {
+        for (int i = 0; i < 16; i++) data_arr[i] = (int32_t)out[i];
+        TC_PUSH(vm, 1);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_AES_CBC: {
+#ifdef ESP32
+      int32_t enc_flag = TC_POP(vm);
+      int32_t len      = TC_POP(vm);
+      int32_t data_ref = TC_POP(vm);
+      int32_t iv_ref   = TC_POP(vm);
+      int32_t key_ref  = TC_POP(vm);
+      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
+      int32_t *iv_arr   = tc_resolve_ref(vm, iv_ref);
+      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
+      if (!key_arr || !iv_arr || !data_arr ||
+          (len & 15) != 0 || len <= 0 ||
+          tc_ref_maxlen(vm, key_ref) < 16 ||
+          tc_ref_maxlen(vm, iv_ref)  < 16 ||
+          tc_ref_maxlen(vm, data_ref) < len) {
+        TC_PUSH(vm, 0); break;
+      }
+      // Copy in. Stack alloc is fine for small TinyC payloads — the script
+      // task has 5 KB+ stack and CBC operates a chunk at a time. For very
+      // large payloads (> 4 KB) we malloc instead.
+      uint8_t k[16], iv[16];
+      uint8_t *buf = nullptr;
+      bool heap = (len > 4096);
+      uint8_t  stackbuf[4096];
+      buf = heap ? (uint8_t*)malloc(len) : stackbuf;
+      if (!buf) { TC_PUSH(vm, 0); break; }
+      for (int i = 0; i < 16;  i++) k[i]  = (uint8_t)(key_arr[i] & 0xFF);
+      for (int i = 0; i < 16;  i++) iv[i] = (uint8_t)(iv_arr[i]  & 0xFF);
+      for (int i = 0; i < len; i++) buf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      mbedtls_aes_context ctx;
+      mbedtls_aes_init(&ctx);
+      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, k, 128)
+                        : mbedtls_aes_setkey_dec(&ctx, k, 128);
+      if (rc == 0) {
+        rc = mbedtls_aes_crypt_cbc(&ctx,
+              enc_flag ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT,
+              len, iv, buf, buf);
+      }
+      mbedtls_aes_free(&ctx);
+      if (rc == 0) {
+        for (int i = 0; i < len; i++) data_arr[i] = (int32_t)buf[i];
+        for (int i = 0; i < 16;  i++) iv_arr[i]   = (int32_t)iv[i];   // updated IV
+        TC_PUSH(vm, 1);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+      if (heap) free(buf);
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_HMAC_SHA256: {
+#ifdef ESP32
+      int32_t out_ref  = TC_POP(vm);
+      int32_t dlen     = TC_POP(vm);
+      int32_t data_ref = TC_POP(vm);
+      int32_t klen     = TC_POP(vm);
+      int32_t key_ref  = TC_POP(vm);
+      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
+      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
+      int32_t *out_arr  = tc_resolve_ref(vm, out_ref);
+      if (!key_arr || !data_arr || !out_arr ||
+          klen <= 0 || dlen < 0 ||
+          tc_ref_maxlen(vm, key_ref) < klen ||
+          tc_ref_maxlen(vm, data_ref) < dlen ||
+          tc_ref_maxlen(vm, out_ref) < 32) {
+        TC_PUSH(vm, 0); break;
+      }
+      // Stack-local copies; HMAC keys/data are usually small. For pathological
+      // multi-KB key/data, callers can compute SHA-256 over chunks externally
+      // — for now require sane sizes (≤ 1024 each).
+      if (klen > 1024 || dlen > 4096) { TC_PUSH(vm, 0); break; }
+      uint8_t kbuf[1024], dbuf[4096], out[32];
+      for (int i = 0; i < klen; i++) kbuf[i] = (uint8_t)(key_arr[i]  & 0xFF);
+      for (int i = 0; i < dlen; i++) dbuf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+      int rc = mbedtls_md_hmac(info, kbuf, klen, dbuf, dlen, out);
+      if (rc == 0) {
+        for (int i = 0; i < 32; i++) out_arr[i] = (int32_t)out[i];
+        TC_PUSH(vm, 1);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_SHA256: {
+#ifdef ESP32
+      int32_t out_ref  = TC_POP(vm);
+      int32_t dlen     = TC_POP(vm);
+      int32_t data_ref = TC_POP(vm);
+      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
+      int32_t *out_arr  = tc_resolve_ref(vm, out_ref);
+      if (!data_arr || !out_arr || dlen < 0 ||
+          tc_ref_maxlen(vm, data_ref) < dlen ||
+          tc_ref_maxlen(vm, out_ref) < 32 ||
+          dlen > 4096) {
+        TC_PUSH(vm, 0); break;
+      }
+      uint8_t dbuf[4096], out[32];
+      for (int i = 0; i < dlen; i++) dbuf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      // mbedtls_sha256(buf, len, out, is_sha224=0) — return 0 on success.
+      int rc = mbedtls_sha256(dbuf, dlen, out, 0);
+      if (rc == 0) {
+        for (int i = 0; i < 32; i++) out_arr[i] = (int32_t)out[i];
+        TC_PUSH(vm, 1);
+      } else {
+        TC_PUSH(vm, 0);
+      }
+#else
+      TC_POP(vm); TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_HEX2BIN: {
+      // (hex_ref_or_const, hex_len, out_ref) → int bytes written (hex_len/2),
+      // or -1 on bad input. Whitespace in hex is silently skipped.
+      int32_t out_ref = TC_POP(vm);
+      int32_t hex_len = TC_POP(vm);
+      int32_t hex_ref = TC_POP(vm);
+      int32_t *out_arr = tc_resolve_ref(vm, out_ref);
+      if (!out_arr || hex_len < 0) { TC_PUSH(vm, -1); break; }
+      // Accept either a const string (when caller passed a literal) or a TinyC
+      // char[] ref. Copy hex chars into a local buffer first.
+      char src[1024];
+      int32_t src_len = 0;
+      if (tc_is_const_ref(hex_ref)) {
+        const char *cs = tc_get_const_str(vm, hex_ref);
+        if (!cs) { TC_PUSH(vm, -1); break; }
+        while (cs[src_len] && src_len < (int32_t)sizeof(src) - 1) {
+          src[src_len] = cs[src_len]; src_len++;
+        }
+        if (hex_len > 0 && hex_len < src_len) src_len = hex_len;
+      } else {
+        int32_t *hex_arr = tc_resolve_ref(vm, hex_ref);
+        if (!hex_arr) { TC_PUSH(vm, -1); break; }
+        int32_t cap = tc_ref_maxlen(vm, hex_ref);
+        if (hex_len > cap) hex_len = cap;
+        if (hex_len > (int32_t)sizeof(src)) hex_len = sizeof(src);
+        for (int i = 0; i < hex_len; i++) src[i] = (char)(hex_arr[i] & 0xFF);
+        src_len = hex_len;
+      }
+      // Parse pairs of nibbles, skipping whitespace. Bail on malformed.
+      int32_t out_cap = tc_ref_maxlen(vm, out_ref);
+      int32_t written = 0;
+      uint8_t hi = 0; int have_hi = 0;
+      for (int i = 0; i < src_len; i++) {
+        char c = src[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == '-') continue;
+        uint8_t v;
+        if      (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else { TC_PUSH(vm, -1); break; }
+        if (!have_hi) { hi = v; have_hi = 1; }
+        else {
+          if (written >= out_cap) break;
+          out_arr[written++] = (int32_t)((hi << 4) | v);
+          have_hi = 0;
+        }
+      }
+      // If we broke from the loop with `-1` already pushed, we'd have consumed
+      // the stack — but since `break` only exits the for-loop here, push now.
+      TC_PUSH(vm, written);
+      break;
+    }
+
+    case SYS_BIN2HEX: {
+      // (bin_ref, bin_len, out_ref) → int chars written (bin_len*2). Lowercase.
+      int32_t out_ref = TC_POP(vm);
+      int32_t bin_len = TC_POP(vm);
+      int32_t bin_ref = TC_POP(vm);
+      int32_t *bin_arr = tc_resolve_ref(vm, bin_ref);
+      int32_t *out_arr = tc_resolve_ref(vm, out_ref);
+      if (!bin_arr || !out_arr || bin_len < 0) { TC_PUSH(vm, 0); break; }
+      int32_t bin_cap = tc_ref_maxlen(vm, bin_ref);
+      int32_t out_cap = tc_ref_maxlen(vm, out_ref);
+      if (bin_len > bin_cap) bin_len = bin_cap;
+      if (bin_len * 2 + 1 > out_cap) bin_len = (out_cap - 1) / 2;
+      static const char hex[] = "0123456789abcdef";
+      int32_t w = 0;
+      for (int i = 0; i < bin_len; i++) {
+        uint8_t b = (uint8_t)(bin_arr[i] & 0xFF);
+        out_arr[w++] = (int32_t)hex[b >> 4];
+        out_arr[w++] = (int32_t)hex[b & 0x0F];
+      }
+      if (w < out_cap) out_arr[w] = 0;  // NUL-terminate when room
+      TC_PUSH(vm, w);
+      break;
+    }
+
     // ── Debug ─────────────────────────────────────────
     case SYS_DEBUG_PRINT:
       a = TC_POP(vm);
@@ -8299,23 +11791,53 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
 
 /*********************************************************************************************\
  * Persist variables: save/load binary file
- * Format: ['P','V'] [count u8] [index u16 LE, slotCount u16 LE, data: slotCount×4 bytes LE]
+ * Format v2: ['P','V','H'] [layout_hash u32 LE] [count u8]
+ *            [index u16 LE, slotCount u16 LE, data: slotCount×4 bytes LE]
+ * Legacy v1: ['P','V'] [count u8] ... — discarded on load because raw indexes
+ *            cannot be safely mapped to a new binary's persist table.
+ * The layout hash fingerprints (persist_count, [(index, slotCount)]). A layout
+ * change (add/remove/reorder/resize persist vars) changes the hash → old file
+ * auto-discarded → no more manual `UfsDelete /tinyc_pvars.bin` after edits.
 \*********************************************************************************************/
+
+// FNV-1a 32-bit hash over the persist table shape. Must produce the same value
+// on save and on load for an unchanged layout.
+static uint32_t tc_persist_layout_hash(TcVM *vm) {
+  uint32_t h = 0x811c9dc5u;
+  #define TC_FNV_BYTE(b) do { h ^= (uint8_t)(b); h *= 0x01000193u; } while(0)
+  TC_FNV_BYTE(vm->persist_count);
+  for (uint8_t i = 0; i < vm->persist_count; i++) {
+    uint16_t idx = vm->persist[i].index;
+    uint16_t cnt = vm->persist[i].count;
+    TC_FNV_BYTE(idx & 0xff);
+    TC_FNV_BYTE((idx >> 8) & 0xff);
+    TC_FNV_BYTE(cnt & 0xff);
+    TC_FNV_BYTE((cnt >> 8) & 0xff);
+  }
+  #undef TC_FNV_BYTE
+  return h;
+}
 
 static void tc_persist_save(TcVM *vm) {
   if (vm->persist_count == 0 || vm->persist_file[0] == '\0') return;
 #ifdef USE_UFILESYS
-  // Calculate total size: 2 (magic) + 1 (count) + entries
-  uint16_t total = 3;
+  // Calculate total size: 3 (magic 'P','V','H') + 4 (layout hash u32) + 1 (count) + entries
+  uint16_t total = 8;
   for (uint8_t i = 0; i < vm->persist_count; i++) {
     total += 4 + vm->persist[i].count * 4;  // index(2) + slotCount(2) + data
   }
   uint8_t *buf = (uint8_t *)malloc(total);
   if (!buf) return;
 
+  uint32_t hash = tc_persist_layout_hash(vm);
   uint16_t pos = 0;
   buf[pos++] = 'P';
   buf[pos++] = 'V';
+  buf[pos++] = 'H';  // v2 magic — layout-fingerprinted
+  buf[pos++] = hash & 0xFF;
+  buf[pos++] = (hash >> 8) & 0xFF;
+  buf[pos++] = (hash >> 16) & 0xFF;
+  buf[pos++] = (hash >> 24) & 0xFF;
   buf[pos++] = vm->persist_count;
 
   for (uint8_t i = 0; i < vm->persist_count; i++) {
@@ -8371,7 +11893,7 @@ static void tc_persist_load(TcVM *vm) {
   if (!f) return;
 
   uint16_t fsize = f.size();
-  if (fsize < 3) { f.close(); return; }
+  if (fsize < 8) { f.close(); return; }  // min = 'P' 'V' 'H' hash[4] count
 
   uint8_t *buf = (uint8_t *)malloc(fsize);
   if (!buf) { f.close(); return; }
@@ -8379,8 +11901,26 @@ static void tc_persist_load(TcVM *vm) {
   f.close();
 
   if (buf[0] != 'P' || buf[1] != 'V') { free(buf); return; }
-  uint8_t count = buf[2];
-  uint16_t pos = 3;
+  if (buf[2] != 'H') {
+    // Legacy format (pre-layout-hash) — raw indexes can't be safely mapped
+    // across layout changes. Discard rather than risk corrupting state.
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: legacy persist file — resetting %s"), vm->persist_file);
+    free(buf);
+    if (ufsp) ufsp->remove(vm->persist_file);
+    return;
+  }
+  uint32_t stored_hash = (uint32_t)buf[3] | ((uint32_t)buf[4] << 8)
+                       | ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 24);
+  uint32_t expected_hash = tc_persist_layout_hash(vm);
+  if (stored_hash != expected_hash) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist layout changed (%08X->%08X) — resetting %s"),
+           stored_hash, expected_hash, vm->persist_file);
+    free(buf);
+    if (ufsp) ufsp->remove(vm->persist_file);
+    return;
+  }
+  uint8_t count = buf[7];
+  uint16_t pos = 8;
 
   for (uint8_t i = 0; i < count && pos < fsize; i++) {
     if (pos + 4 > fsize) break;
@@ -8437,6 +11977,10 @@ static void tc_persist_load(TcVM *vm) {
 static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
   // All binary[] reads use TC_READ_BYTE() for flash-safe access
   #define B(i) TC_READ_BYTE(&binary[i])
+
+  // Reset hot-path dispatch cache first thing — ensures no stale indices
+  // from a previous load survive if we early-return on a bad header.
+  for (int k = 0; k < TC_CB_COUNT; k++) vm->cb_index[k] = -1;
 
   if (size < 14) return TC_ERR_BAD_BINARY;  // minimum header size
 
@@ -8509,9 +12053,16 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
   if (!vm->constants) return TC_ERR_STACK_OVERFLOW;  // OOM
   vm->const_capacity = alloc_consts;
 
-  // Allocate const_data buffer based on pre-scan (minimum 64 bytes)
+  // Allocate const_data buffer based on pre-scan (minimum 64 bytes).
+  // Internal DRAM first; PSRAM only as fallback so small scripts stay fast.
   uint16_t alloc_cdata = prescan_data < 64 ? 64 : prescan_data;
   vm->const_data = (char *)calloc(alloc_cdata, 1);
+#ifdef ESP32
+  if (!vm->const_data) {
+    vm->const_data = (char *)heap_caps_malloc(alloc_cdata, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (vm->const_data) memset(vm->const_data, 0, alloc_cdata);
+  }
+#endif
   if (!vm->const_data) return TC_ERR_STACK_OVERFLOW;  // OOM
   vm->const_data_size = alloc_cdata;
 
@@ -8542,6 +12093,11 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
     }
     vm->const_count++;
   }
+  // Problem #1: warn if constant pool was truncated (more entries in binary than TC_MAX_CONSTANTS)
+  if (offset < const_end) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: constant pool truncated — loaded %d/%d entries (max %d). Recompile with fewer string literals."),
+           vm->const_count, prescan_count, TC_MAX_CONSTANTS);
+  }
 
   // Parse heap declarations and pre-allocate blocks
   uint16_t heap_end = const_end + heap_decl_size;
@@ -8555,8 +12111,18 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
       total_heap += sz;
     }
     if (total_heap > 0) {
+      // Problem #2: log descriptive error before OOM return
+      if (total_heap > TC_MAX_HEAP) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap OOM — need %u slots (%u KB), max %u (%u KB). Reduce array sizes."),
+               total_heap, (unsigned)(total_heap * 4 / 1024), (unsigned)TC_MAX_HEAP, (unsigned)(TC_MAX_HEAP * 4 / 1024));
+        return TC_ERR_STACK_OVERFLOW;
+      }
       vm->heap_data = (int32_t *)special_calloc(total_heap, sizeof(int32_t));
-      if (!vm->heap_data) return TC_ERR_STACK_OVERFLOW;  // OOM
+      if (!vm->heap_data) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: heap alloc failed (%u slots, %u KB) — not enough free heap."),
+               total_heap, (unsigned)(total_heap * 4 / 1024));
+        return TC_ERR_STACK_OVERFLOW;
+      }
       vm->heap_capacity = total_heap;
       vm->heap_handles = (TcHeapHandle *)calloc(TC_MAX_HEAP_HANDLES, sizeof(TcHeapHandle));
       if (!vm->heap_handles) { free(vm->heap_data); vm->heap_data = nullptr; return TC_ERR_STACK_OVERFLOW; }
@@ -8594,6 +12160,27 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
       pos += 2;
       vm->callback_count++;
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: callback '%s' @%d"), vm->callbacks[i].name, vm->callbacks[i].address);
+    }
+    // Warn if the bytecode declares more callbacks than we can hold.
+    // Previously silent truncation caused callbacks past index 10 to never
+    // fire (e.g. EverySecond if it came after 10 other well-known callbacks).
+    if (count > TC_MAX_CALLBACKS) {
+      AddLog(LOG_LEVEL_ERROR,
+        PSTR("TCC: bytecode has %d callbacks but TC_MAX_CALLBACKS=%d — %d dropped"),
+        count, TC_MAX_CALLBACKS, count - TC_MAX_CALLBACKS);
+    }
+  }
+
+  // Build hot-path callback cache (one strcmp pass, replaces per-tick strcmps).
+  // After this, dispatch from FUNC_LOOP / FUNC_EVERY_*_MSECOND / FUNC_EVERY_SECOND
+  // is a direct array index instead of a linear strcmp scan.
+  for (int k = 0; k < TC_CB_COUNT; k++) {
+    vm->cb_index[k] = -1;
+    for (uint8_t i = 0; i < vm->callback_count; i++) {
+      if (strcmp(vm->callbacks[i].name, TC_CB_NAME[k]) == 0) {
+        vm->cb_index[k] = (int8_t)i;
+        break;
+      }
     }
   }
 
@@ -8695,28 +12282,33 @@ static int tc_vm_step(TcVM *vm);
  *   concurrent access to the VM state.
 \*********************************************************************************************/
 
-static int tc_vm_call_callback(TcVM *vm, const char *name) {
-  // Find callback by name
-  int idx = -1;
-  for (int i = 0; i < vm->callback_count; i++) {
-    if (strcmp(vm->callbacks[i].name, name) == 0) { idx = i; break; }
-  }
-  if (idx < 0) return TC_OK;  // callback not defined, silently skip
-
-  // VM must be halted (main returned) with no error
-  if (!vm->halted || vm->error != TC_OK) return vm->error;
-
+// Internal: invoke callback at known index. Caller must have already validated
+// that idx is in range and that vm is halted/error-free. `name` is used only
+// for log/crash messages.
+// The full PAUSED handler MUST stay in this body — see project_tinyc notes.
+static int tc_vm_call_callback_idx(TcVM *vm, int idx, const char *name) {
   // Save state
   uint8_t saved_frame_count = vm->frame_count;
   uint16_t saved_pc = vm->pc;
   uint16_t saved_sp = vm->sp;
+  // Bug #2 fix: reclaim any heap allocations made during the callback
+  // (bump allocator doesn't rewind heap_used even on tc_heap_free_handle).
+  // Snapshot heap position + handle count; restore on exit.
+  uint16_t saved_heap_used = vm->heap_used;
+  uint8_t  saved_heap_handle_count = vm->heap_handle_count;
 
   // Temporarily un-halt and set up callback frame
   vm->halted = false;
   vm->running = true;
-  if (vm->frame_count >= TC_MAX_FRAMES) return TC_ERR_FRAME_OVERFLOW;
+  if (vm->frame_count >= TC_MAX_FRAMES) {
+    // Keep VM in a consistent halted state on frame overflow
+    vm->halted = true;
+    vm->running = false;
+    return TC_ERR_FRAME_OVERFLOW;
+  }
   TcFrame *frame = &vm->frames[vm->frame_count];
   frame->return_pc = 0;  // detect return by frame_count drop
+  frame->saved_sp = vm->sp;  // host-pushed args live on top; must balance at RET
   if (!tc_frame_alloc(frame)) {
     vm->halted = true;
     vm->running = false;
@@ -8755,10 +12347,14 @@ static int tc_vm_call_callback(TcVM *vm, const char *name) {
     }
   }
 
-  // Restore halted state (globals & heap persist)
+  // Restore halted state (globals persist)
   vm->halted = true;
   vm->running = false;
   vm->pc = saved_pc;
+  // Bug #1 fix: restore SP. Without this, every callback that left anything on
+  // the stack (args not consumed, RET_VAL's return value, partial push on error)
+  // leaks a slot per call → SP drifts → stack corruption after hours/days.
+  vm->sp = saved_sp;
 
   // Clean up any leftover frames from the callback
   while (vm->frame_count > saved_frame_count) {
@@ -8766,10 +12362,50 @@ static int tc_vm_call_callback(TcVM *vm, const char *name) {
   }
   vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
 
+  // Bug #2 fix: reclaim heap allocations made during the callback.
+  // Mark handles created during the callback as dead so the handle table
+  // doesn't grow unbounded, then rewind the bump pointer.
+  if (vm->heap_handles && vm->heap_handle_count > saved_heap_handle_count) {
+    for (uint8_t i = saved_heap_handle_count; i < vm->heap_handle_count; i++) {
+      vm->heap_handles[i].alive = false;
+    }
+    vm->heap_handle_count = saved_heap_handle_count;
+  }
+  vm->heap_used = saved_heap_used;
+
   // Flush output to Tasmota
   tc_output_flush();
 
   return vm->error;
+}
+
+// Public: name-based dispatch (legacy, still used for non-hot-path callbacks
+// like "JsonCall", "WebUI", "WebCall", "TouchButton", "HomeKitWrite", "WebOn",
+// "UdpCall", "WebPage", "Command", etc.). Does one strcmp scan.
+static int tc_vm_call_callback(TcVM *vm, const char *name) {
+  int idx = -1;
+  for (int i = 0; i < vm->callback_count; i++) {
+    if (strcmp(vm->callbacks[i].name, name) == 0) { idx = i; break; }
+  }
+  if (idx < 0) return TC_OK;  // callback not defined, silently skip
+  if (!vm->halted || vm->error != TC_OK) return vm->error;
+  return tc_vm_call_callback_idx(vm, idx, name);
+}
+
+// Public: ID-based dispatch for hot-path callbacks. Zero strcmp — the cache
+// was populated once at tc_vm_load(). If the callback isn't defined, returns
+// immediately without even checking halted/error state (saves a memory read).
+//
+// The idx < callback_count check is belt-and-suspenders: a freshly-calloc'd
+// slot has cb_index all zeros (valid-looking indices) but callback_count == 0.
+// TinyCStopVM fires OnExit via this path on never-loaded slots, which without
+// this guard would jump to callbacks[0].address == 0 → bounds error at PC=0.
+static int tc_vm_call_callback_id(TcVM *vm, TcCallbackId cid) {
+  if ((unsigned)cid >= TC_CB_COUNT) return TC_OK;
+  int8_t idx = vm->cb_index[cid];
+  if (idx < 0 || (uint8_t)idx >= vm->callback_count) return TC_OK;
+  if (!vm->halted || vm->error != TC_OK) return vm->error;
+  return tc_vm_call_callback_idx(vm, idx, TC_CB_NAME[cid]);
 }
 
 // Call a callback with a C string argument (e.g. Event(char json[]))
@@ -8787,6 +12423,11 @@ static int tc_vm_call_callback_str(TcVM *vm, const char *name, const char *str) 
   int32_t slots = slen + 1;  // include null terminator
   if (slots > 512) slots = 512;  // cap at 512 chars
 
+  // Save heap position so we can reclaim the temp buffer after the callback.
+  // tc_heap_free_handle() only marks alive=false but never rewinds heap_used
+  // (bump allocator), so without this every Command call leaks 'slots' permanently.
+  uint16_t saved_heap_used = vm->heap_used;
+
   // Allocate temporary heap buffer
   int handle = tc_heap_alloc(vm, slots);
   if (handle < 0) {
@@ -8801,15 +12442,78 @@ static int tc_vm_call_callback_str(TcVM *vm, const char *name, const char *str) 
   }
   buf[slots - 1] = 0;
 
-  // Push heap ref onto stack for the callback parameter
+  // Push heap ref onto stack for the callback parameter.
+  // Capture SP *before* the push: tc_vm_call_callback_idx captures its own
+  // saved_sp at entry (= post-push) and restores to it on exit, which would
+  // re-materialise the arg the callback already consumed via STORE_LOCAL.
+  // Pin vm->sp back to pre-push here so the net effect across the call is 0.
+  uint16_t pre_push_sp = vm->sp;
   int32_t ref = 0xC0000000 | handle;
   TC_PUSH(vm, ref);
 
   // Call the callback (it will pop the ref as its parameter)
   int err = tc_vm_call_callback(vm, name);
 
-  // Free temp buffer
+  // Balance the pre-call push (covers both the success path — idx restored
+  // to post-push — and the early-return path where the arg was never consumed).
+  vm->sp = pre_push_sp;
+
+  // Free temp buffer and rewind bump allocator to reclaim the space
   tc_heap_free_handle(vm, handle);
+  vm->heap_used = saved_heap_used;
+
+  return err;
+}
+
+// Call a callback with TWO char-array string args: cb(char a[], char b[]).
+// Used for OnMqttData(topic, payload). Both strings copied into temp heap
+// buffers, refs pushed left-to-right (first param bottom of stack), then
+// temp buffers freed and heap bump rewound.
+static int tc_vm_call_callback_str2(TcVM *vm, const char *name,
+                                     const char *str1, const char *str2) {
+  int idx = -1;
+  for (int i = 0; i < vm->callback_count; i++) {
+    if (strcmp(vm->callbacks[i].name, name) == 0) { idx = i; break; }
+  }
+  if (idx < 0) return TC_OK;
+  if (!vm->halted || vm->error != TC_OK) return vm->error;
+
+  int32_t len1 = str1 ? strlen(str1) : 0;
+  int32_t len2 = str2 ? strlen(str2) : 0;
+  int32_t slots1 = (len1 < 511 ? len1 : 511) + 1;
+  int32_t slots2 = (len2 < 511 ? len2 : 511) + 1;
+
+  uint16_t saved_heap_used = vm->heap_used;
+
+  int h1 = tc_heap_alloc(vm, slots1);
+  int h2 = tc_heap_alloc(vm, slots2);
+  if (h1 < 0 || h2 < 0) {
+    vm->heap_used = saved_heap_used;
+    return TC_OK;
+  }
+
+  int32_t *buf1 = &vm->heap_data[vm->heap_handles[h1].offset];
+  for (int32_t i = 0; i < slots1 - 1; i++) buf1[i] = (int32_t)(uint8_t)str1[i];
+  buf1[slots1 - 1] = 0;
+
+  int32_t *buf2 = &vm->heap_data[vm->heap_handles[h2].offset];
+  for (int32_t i = 0; i < slots2 - 1; i++) buf2[i] = (int32_t)(uint8_t)str2[i];
+  buf2[slots2 - 1] = 0;
+
+  // Push in declaration order: topic first (bottom), payload second (top).
+  // TinyC frame builder reads params left-to-right from the pushed stack.
+  // Pin pre-push SP so tc_vm_call_callback_idx's saved_sp restore doesn't
+  // re-materialise the 2 args the callback consumed (see _str variant).
+  uint16_t pre_push_sp = vm->sp;
+  TC_PUSH(vm, (int32_t)(0xC0000000 | h1));  // first  param: topic
+  TC_PUSH(vm, (int32_t)(0xC0000000 | h2));  // second param: payload
+
+  int err = tc_vm_call_callback(vm, name);
+  vm->sp = pre_push_sp;   // balance the 2 pushes
+
+  tc_heap_free_handle(vm, h2);
+  tc_heap_free_handle(vm, h1);
+  vm->heap_used = saved_heap_used;
 
   return err;
 }
@@ -8911,6 +12615,7 @@ static int tc_vm_step(TcVM *vm) {
       {
         TcFrame *frame = &vm->frames[vm->frame_count];
         frame->return_pc = vm->pc;
+        frame->saved_sp = vm->sp;       // caller's SP (with args on top)
         if (!tc_frame_alloc(frame)) {
           return TC_ERR_STACK_OVERFLOW;  // OOM
         }
@@ -8923,6 +12628,14 @@ static int tc_vm_step(TcVM *vm) {
     case OP_RET:
       if (vm->frame_count == 0) { tc_frame_free(&vm->frames[0]); vm->halted = true; vm->running = false; break; }
       { TcFrame *f = &vm->frames[--vm->frame_count];
+        // Post-RET SP should be ≤ caller-at-CALL SP (callee consumed its args,
+        // may or may not have left them unused). Higher SP means the callee
+        // pushed something it never popped — an unbounded leak over many calls.
+        if (vm->sp > f->saved_sp) {
+          AddLog(LOG_LEVEL_ERROR,
+                 PSTR("TCC: SP leak at void return: sp=%u expected<=%u ret_pc=%u"),
+                 (unsigned)vm->sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
+        }
         vm->pc = f->return_pc;
         tc_frame_free(f);  // free returning frame's locals
         vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0; }
@@ -8932,6 +12645,13 @@ static int tc_vm_step(TcVM *vm) {
       a = TC_POP(vm);
       if (vm->frame_count == 0) { tc_frame_free(&vm->frames[0]); TC_PUSH(vm, a); vm->halted = true; vm->running = false; break; }
       { TcFrame *f = &vm->frames[--vm->frame_count];
+        // Same leak check as void RET — return value is already popped into `a`,
+        // so the remaining stack must not have grown past the CALL-time SP.
+        if (vm->sp > f->saved_sp) {
+          AddLog(LOG_LEVEL_ERROR,
+                 PSTR("TCC: SP leak at value return: sp=%u expected<=%u ret_pc=%u"),
+                 (unsigned)vm->sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
+        }
         vm->pc = f->return_pc;
         tc_frame_free(f);  // free returning frame's locals
         vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
@@ -8982,19 +12702,31 @@ static int tc_vm_step(TcVM *vm) {
     // ── Arrays (with bounds checks) ────────
     case OP_LOAD_LOCAL_ARR:
       idx=tc_read_u8(vm); a=TC_POP(vm);
-      if ((uint32_t)(idx+a) >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if ((uint32_t)(idx+a) >= TC_MAX_LOCALS) {
+        tc_log_bounds("local[]", idx+a, TC_MAX_LOCALS, vm->pc);
+        return TC_ERR_BOUNDS;
+      }
       TC_PUSH(vm, vm->frames[vm->fp].locals[idx+a]); break;
     case OP_STORE_LOCAL_ARR:
       idx=tc_read_u8(vm); b=TC_POP(vm); a=TC_POP(vm);
-      if ((uint32_t)(idx+a) >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if ((uint32_t)(idx+a) >= TC_MAX_LOCALS) {
+        tc_log_bounds("local[]", idx+a, TC_MAX_LOCALS, vm->pc);
+        return TC_ERR_BOUNDS;
+      }
       vm->frames[vm->fp].locals[idx+a]=b; break;
     case OP_LOAD_GLOBAL_ARR:
       addr=tc_read_u16(vm); a=TC_POP(vm);
-      if ((uint32_t)(addr+a) >= vm->globals_size) return TC_ERR_BOUNDS;
+      if ((uint32_t)(addr+a) >= vm->globals_size) {
+        tc_log_bounds("global[]", addr+a, vm->globals_size, vm->pc);
+        return TC_ERR_BOUNDS;
+      }
       TC_PUSH(vm, vm->globals[addr+a]); break;
     case OP_STORE_GLOBAL_ARR:
       addr=tc_read_u16(vm); b=TC_POP(vm); a=TC_POP(vm);
-      if ((uint32_t)(addr+a) >= vm->globals_size) return TC_ERR_BOUNDS;
+      if ((uint32_t)(addr+a) >= vm->globals_size) {
+        tc_log_bounds("global[]", addr+a, vm->globals_size, vm->pc);
+        return TC_ERR_BOUNDS;
+      }
       vm->globals[addr+a]=b; break;
 
     // ── Type conversion ────────────────────
@@ -9019,6 +12751,10 @@ static int tc_vm_step(TcVM *vm) {
       if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
           !vm->heap_handles[handle].alive ||
           a < 0 || (uint16_t)a >= vm->heap_handles[handle].size) {
+        uint32_t sz = (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive)
+                      ? vm->heap_handles[handle].size : 0;
+        char kind[16]; snprintf(kind, sizeof(kind), "heap[%u]", (unsigned)handle);
+        tc_log_bounds(kind, a, sz, vm->pc);
         return TC_ERR_BOUNDS;
       }
       TC_PUSH(vm, vm->heap_data[vm->heap_handles[handle].offset + a]);
@@ -9031,6 +12767,10 @@ static int tc_vm_step(TcVM *vm) {
       if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
           !vm->heap_handles[handle].alive ||
           a < 0 || (uint16_t)a >= vm->heap_handles[handle].size) {
+        uint32_t sz = (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive)
+                      ? vm->heap_handles[handle].size : 0;
+        char kind[16]; snprintf(kind, sizeof(kind), "heap[%u]", (unsigned)handle);
+        tc_log_bounds(kind, a, sz, vm->pc);
         return TC_ERR_BOUNDS;
       }
       vm->heap_data[vm->heap_handles[handle].offset + a] = b;
@@ -9038,8 +12778,43 @@ static int tc_vm_step(TcVM *vm) {
     }
     case OP_ADDR_HEAP: {
       uint8_t handle = tc_read_u8(vm);
-      // Pack: 0xC0000000 | handle
-      TC_PUSH(vm, (int32_t)(0xC0000000U | handle));
+      // Pack: 0xC0000000 | handle (offset = 0)
+      TC_PUSH(vm, tc_make_heap_ref(handle, 0));
+      break;
+    }
+    case OP_ADDR_HEAP_OFF: {
+      uint8_t handle = tc_read_u8(vm);
+      int32_t off = TC_POP(vm);   // slot offset (int32, treated unsigned 14-bit)
+      if (off < 0) off = 0;
+      if (off > 0x3FFF) off = 0x3FFF;
+      TC_PUSH(vm, tc_make_heap_ref(handle, (uint16_t)off));
+      break;
+    }
+
+    // ── Runtime array ref (ref params) ──
+    case OP_LOAD_REF_ARR: {
+      idx = tc_read_u8(vm);
+      a = TC_POP(vm);  // index
+      if ((uint32_t)idx >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[idx];
+      int32_t *buf = tc_resolve_ref(vm, ref);
+      if (!buf) return TC_ERR_BOUNDS;
+      int32_t maxLen = tc_ref_maxlen(vm, ref);
+      if (a < 0 || a >= maxLen) return TC_ERR_BOUNDS;
+      TC_PUSH(vm, buf[a]);
+      break;
+    }
+    case OP_STORE_REF_ARR: {
+      idx = tc_read_u8(vm);
+      b = TC_POP(vm);  // value
+      a = TC_POP(vm);  // index
+      if ((uint32_t)idx >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[idx];
+      int32_t *buf = tc_resolve_ref(vm, ref);
+      if (!buf) return TC_ERR_BOUNDS;
+      int32_t maxLen = tc_ref_maxlen(vm, ref);
+      if (a < 0 || a >= maxLen) return TC_ERR_BOUNDS;
+      buf[a] = b;
       break;
     }
 
@@ -9149,6 +12924,8 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     _dispatch[0xA2] = &&_op_addr_heap;
     // Watch
     _dispatch[0xA5] = &&_op_store_watch;
+    // Heap address with offset
+    _dispatch[0xA6] = &&_op_addr_heap_off;
     _dispatch_init = true;
   }
 
@@ -9271,6 +13048,7 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
       vm->sp = _sp; vm->pc = _pc;
       TcFrame *frame = &vm->frames[vm->frame_count];
       frame->return_pc = _pc;
+      frame->saved_sp = _sp;                        // caller SP w/ args on top
       if (!tc_frame_alloc(frame)) { _err = TC_ERR_STACK_OVERFLOW; goto _vm_exit; }
       vm->fp = vm->frame_count;
       vm->frame_count++;
@@ -9285,6 +13063,11 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     }
     {
       TcFrame *f = &vm->frames[--vm->frame_count];
+      if (_sp > f->saved_sp) {                      // SP-leak detection (see switch)
+        AddLog(LOG_LEVEL_ERROR,
+               PSTR("TCC: SP leak at void return: sp=%u expected<=%u ret_pc=%u"),
+               (unsigned)_sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
+      }
       _pc = f->return_pc;
       tc_frame_free(f);
       vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
@@ -9300,6 +13083,11 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     }
     {
       TcFrame *f = &vm->frames[--vm->frame_count];
+      if (_sp > f->saved_sp) {                      // SP-leak detection (see switch)
+        AddLog(LOG_LEVEL_ERROR,
+               PSTR("TCC: SP leak at value return: sp=%u expected<=%u ret_pc=%u"),
+               (unsigned)_sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
+      }
       _pc = f->return_pc;
       tc_frame_free(f);
       vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
@@ -9357,22 +13145,34 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   // Arrays
   _op_load_local_arr:
     _idx = _RD_U8(); _a = TC_IPOP();
-    if ((uint32_t)(_idx+_a) >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if ((uint32_t)(_idx+_a) >= TC_MAX_LOCALS) {
+      tc_log_bounds("local[]", _idx+_a, TC_MAX_LOCALS, _pc);
+      _err = TC_ERR_BOUNDS; goto _vm_exit;
+    }
     TC_IPUSH(vm->frames[vm->fp].locals[_idx+_a]);
     NEXT();
   _op_store_local_arr:
     _idx = _RD_U8(); _b = TC_IPOP(); _a = TC_IPOP();
-    if ((uint32_t)(_idx+_a) >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if ((uint32_t)(_idx+_a) >= TC_MAX_LOCALS) {
+      tc_log_bounds("local[]", _idx+_a, TC_MAX_LOCALS, _pc);
+      _err = TC_ERR_BOUNDS; goto _vm_exit;
+    }
     vm->frames[vm->fp].locals[_idx+_a] = _b;
     NEXT();
   _op_load_global_arr:
     _addr = _RD_U16(); _a = TC_IPOP();
-    if ((uint32_t)(_addr+_a) >= _gsz) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if ((uint32_t)(_addr+_a) >= _gsz) {
+      tc_log_bounds("global[]", _addr+_a, _gsz, _pc);
+      _err = TC_ERR_BOUNDS; goto _vm_exit;
+    }
     TC_IPUSH(vm->globals[_addr+_a]);
     NEXT();
   _op_store_global_arr:
     _addr = _RD_U16(); _b = TC_IPOP(); _a = TC_IPOP();
-    if ((uint32_t)(_addr+_a) >= _gsz) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if ((uint32_t)(_addr+_a) >= _gsz) {
+      tc_log_bounds("global[]", _addr+_a, _gsz, _pc);
+      _err = TC_ERR_BOUNDS; goto _vm_exit;
+    }
     vm->globals[_addr+_a] = _b;
     NEXT();
 
@@ -9407,6 +13207,10 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
         !vm->heap_handles[handle].alive ||
         _a < 0 || (uint16_t)_a >= vm->heap_handles[handle].size) {
+      uint32_t sz = (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive)
+                    ? vm->heap_handles[handle].size : 0;
+      char kind[16]; snprintf(kind, sizeof(kind), "heap[%u]", (unsigned)handle);
+      tc_log_bounds(kind, _a, sz, _pc);
       _err = TC_ERR_BOUNDS; goto _vm_exit;
     }
     TC_IPUSH(vm->heap_data[vm->heap_handles[handle].offset + _a]);
@@ -9418,6 +13222,10 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
         !vm->heap_handles[handle].alive ||
         _a < 0 || (uint16_t)_a >= vm->heap_handles[handle].size) {
+      uint32_t sz = (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive)
+                    ? vm->heap_handles[handle].size : 0;
+      char kind[16]; snprintf(kind, sizeof(kind), "heap[%u]", (unsigned)handle);
+      tc_log_bounds(kind, _a, sz, _pc);
       _err = TC_ERR_BOUNDS; goto _vm_exit;
     }
     vm->heap_data[vm->heap_handles[handle].offset + _a] = _b;
@@ -9425,7 +13233,15 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   }
   _op_addr_heap: {
     uint8_t handle = _RD_U8();
-    TC_IPUSH((int32_t)(0xC0000000U | handle));
+    TC_IPUSH(tc_make_heap_ref(handle, 0));
+    NEXT();
+  }
+  _op_addr_heap_off: {
+    uint8_t handle = _RD_U8();
+    int32_t off = TC_IPOP();
+    if (off < 0) off = 0;
+    if (off > 0x3FFF) off = 0x3FFF;
+    TC_IPUSH(tc_make_heap_ref(handle, (uint16_t)off));
     NEXT();
   }
 
@@ -9542,11 +13358,9 @@ static void tc_vm_task(void *param) {
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Halted after %u instr, %d callbacks"),
       vm->instruction_count, vm->callback_count);
 
-    // Phase 2: If TaskLoop callback exists, loop calling it in this task
-    int tl_idx = -1;
-    for (int i = 0; i < vm->callback_count; i++) {
-      if (strcmp(vm->callbacks[i].name, "TaskLoop") == 0) { tl_idx = i; break; }
-    }
+    // Phase 2: If TaskLoop callback exists, loop calling it in this task.
+    // Use the load-time cache — no strcmp needed.
+    int tl_idx = vm->cb_index[TC_CB_TASK_LOOP];
     if (tl_idx >= 0) {
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: TaskLoop running in task"));
       uint16_t tl_addr = vm->callbacks[tl_idx].address;
@@ -9562,6 +13376,7 @@ static void tc_vm_task(void *param) {
         if (vm->frame_count < TC_MAX_FRAMES) {
           TcFrame *frame = &vm->frames[vm->frame_count];
           frame->return_pc = 0;
+          frame->saved_sp = vm->sp;   // see tc_vm_call_callback_idx — needed for RET leak check
           if (tc_frame_alloc(frame)) {
             vm->fp = vm->frame_count;
             vm->frame_count++;
@@ -9661,17 +13476,74 @@ static void tc_vm_task(void *param) {
 \*********************************************************************************************/
 
 // Call a named callback on a single slot, with mutex protection and tc_current_slot set
+// Bug #1 fix: mutex-first. Checking halted/error without the mutex is a TOCTOU race
+// on dual-core ESP32 — Core 1's TaskLoop can flip halted=false between our check and
+// the mutex take, causing concurrent VM execution (PC=0 crash, frame corruption).
 static void tc_slot_callback(TcSlot *s, const char *name) {
-  if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) return;
-  tc_current_slot = s;
+  if (!s || !s->loaded) return;
 #ifdef ESP32
   if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
 #endif
+  if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+    return;
+  }
+  tc_current_slot = s;
   tc_vm_call_callback(&s->vm, name);
+  tc_current_slot = nullptr;
 #ifdef ESP32
   if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
 #endif
+}
+
+// Forward decl — defined further below after Tinyc state struct is in scope.
+// Kept in vm.h because TcCallbackId argument confuses Arduino auto-prototyper.
+static void tc_all_callbacks_id(TcCallbackId cid);
+
+// ID-based variant for hot-path well-known callbacks (EverySecond, EveryLoop, ...).
+// Fast-exit without taking the mutex if the callback isn't defined — this is the
+// common case (most scripts use 1-2 of the 13 well-known callbacks), so 50-ms-tick
+// sweeps across all slots avoid per-slot mutex churn entirely.
+static void tc_slot_callback_id(TcSlot *s, TcCallbackId cid) {
+  if (!s || !s->loaded) return;
+  if ((unsigned)cid >= TC_CB_COUNT) return;
+  // Fast path: script doesn't define this callback — skip mutex + VM state read.
+  // cb_index is populated once at load and never mutated at runtime, so this
+  // read is race-free (a concurrent tc_vm_load would imply the slot isn't
+  // "loaded" yet, which we already gated above).
+  if (s->vm.cb_index[cid] < 0) return;
+#ifdef ESP32
+  if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+  if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+    return;
+  }
+  tc_current_slot = s;
+  tc_vm_call_callback_id(&s->vm, cid);
   tc_current_slot = nullptr;
+#ifdef ESP32
+  if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+}
+
+// Sweep all slots, calling the ID'd callback on each. Zero strcmps.
+// Defined here (not in .ino) because TcCallbackId param confuses Arduino's
+// auto-prototyper (same reason tc_slot_callback* lives in vm.h).
+static void tc_all_callbacks_id(TcCallbackId cid) {
+  // Mini-Scripter ticks first (cheap, no slot lookup needed). Bytecode is
+  // populated only after a successful smlScripterLoad() — otherwise no-op.
+  if (cid == TC_CB_EVERY_100_MSECOND) tc_mscr_tick_f();
+  else if (cid == TC_CB_EVERY_SECOND) tc_mscr_tick_s();
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (s) tc_slot_callback_id(s, cid);
+  }
 }
 
 // Helper: derive .pvs persist filename from .tcb filename
@@ -9699,6 +13571,19 @@ static void TinyCStopVM(TcSlot *s) {
   if (!Tinyc || !s) return;
 
 #ifdef ESP32
+  // Kill any spawned (shared-VM) tasks FIRST so they stop touching the VM
+  // before the main task is torn down and the heap is freed. Tasks observe
+  // their stop_requested flag at the next instruction boundary or delay.
+  {
+    uint8_t sidx = 0xFF;
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      if (Tinyc->slots[i] == s) { sidx = i; break; }
+    }
+    if (sidx != 0xFF) {
+      tc_spawn_task_cleanup_slot(sidx);
+    }
+  }
+
   if (s->task_handle) {
     // Signal task to stop via both flags -- vm.error causes tc_vm_step to exit
     s->task_stop = true;
@@ -9722,7 +13607,7 @@ static void TinyCStopVM(TcSlot *s) {
   s->vm.running = false;
   s->vm.halted = true;
   tc_current_slot = s;
-  tc_vm_call_callback(&s->vm, "OnExit");
+  tc_vm_call_callback_id(&s->vm, TC_CB_ON_EXIT);
   tc_output_flush();
   tc_current_slot = nullptr;
 
@@ -9733,6 +13618,7 @@ static void TinyCStopVM(TcSlot *s) {
   s->vm.running = false;
   tc_free_all_frames(&s->vm);
   tc_heap_free_all(&s->vm);
+  s->vm.halted = false;  // Problem 12: prevent callbacks from firing on freed heap
   // Only stop UDP if no other slot still needs it
   {
     bool udp_still_needed = false;
@@ -9747,8 +13633,26 @@ static void TinyCStopVM(TcSlot *s) {
     }
   }
   tc_spi_cleanup();
-  tc_serial_close();
+  tc_serial_close_all();
   tc_img_store_free();
+  // Clear mini-scripter state — otherwise the >F/>S bytecode from the previous
+  // .tcb keeps firing on EverySecond/Every100ms ticks and (e.g.) re-emits the
+  // IEC 62056-21 wake-up handshake even after the script that loaded it is
+  // gone. Next smlScripterLoad() in a new .tcb repopulates; scripts that
+  // don't call it get a silent mscr (loaded=0 → tick no-ops).
+  memset(&tc_mscr, 0, sizeof(tc_mscr));
+#ifdef ESP32
+  // Stop I2S output if active
+  if (Tinyc->i2s_tx_handle) {
+    i2s_channel_disable(Tinyc->i2s_tx_handle);
+    i2s_del_channel(Tinyc->i2s_tx_handle);
+    Tinyc->i2s_tx_handle = nullptr;
+  }
+  if (Tinyc->i2s_pcm_buf) {
+    free(Tinyc->i2s_pcm_buf);
+    Tinyc->i2s_pcm_buf = nullptr;
+  }
+#endif
   // Free OneWire bus
   if (s->vm.ow_bus) { delete s->vm.ow_bus; s->vm.ow_bus = nullptr; s->vm.ow_pin = -1; }
   // Free HTTP header arrays

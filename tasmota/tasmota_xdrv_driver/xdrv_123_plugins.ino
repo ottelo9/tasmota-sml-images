@@ -37,6 +37,11 @@ to doo:
 #include "./Plugins/modules_def.h"
 #include <TasmotaSerial.h>
 #include "TimeLib.h"
+#ifdef ESP32
+// for `struct linger` / SOL_SOCKET / SO_LINGER used by jt[171] op 103
+// (client_setLinger). ESP8266 path doesn't expose setSocketOption().
+#include <lwip/sockets.h>
+#endif
 
 // minimal plugin rev
 #define MINREV 0x00010004
@@ -1031,6 +1036,19 @@ uint32_t tmod_wifi(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t
 #endif
       }
       break;
+#ifdef ESP32
+    case 103:
+      // setLinger(on, seconds): sends TCP RST instead of FIN when on=1, time=0,
+      // freeing the peer's session slot immediately. Routed through here so PIC
+      // plugins (e.g. xsns_53_sml) don't need to call WiFiClient::setSocketOption
+      // directly — that would be an unrouted external symbol.
+      // p2 = on flag (0|1), p3 = linger time in seconds.
+      {
+        struct linger sl = { (int)p2, (int)p3 };
+        client->setSocketOption(SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+      }
+      break;
+#endif
 
 #if defined(ESP32) && defined(USE_TLS)
     case 10:
@@ -1588,7 +1606,9 @@ uint32_t tmod_jpeg_picture(uint32_t mem, uint32_t jpgsize, uint32_t xp, uint32_t
   return 0;
 }
 
-#ifdef USE_SHINE
+// layer3.h only exists in lib/lib_audio/mp3_shine_esp32 (ESP32-only).
+// ESP8266 builds that still define USE_SHINE via user_config_override.h must not pull it in.
+#if defined(USE_SHINE) && defined(ESP32)
 #include <layer3.h>
 #endif
 
@@ -1600,7 +1620,7 @@ float tmod_sqrtf(float a) { return sqrtf(a); }
 
 // shine mpeg3 encoder about 31kB code
 uint32_t tmod_shine(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3) {
-#ifdef USE_SHINE
+#if defined(USE_SHINE) && defined(ESP32)
   switch (sel) {
     case 0:
       return (uint32_t)shine_initialise((shine_config_t*)p1);

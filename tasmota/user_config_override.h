@@ -131,9 +131,11 @@
 #undef GV_USE_ESPINFO //ESP8266 info (+2k1 code) ab 15.2.0
 //ESP32 only features
 #undef USE_GPIO_VIEWER
-#undef USE_ADC
+#if ( !defined(TASMOTA32_OTTELO) && !defined(TASMOTA32BERRY_OTTELO) )
+  #undef USE_ADC
+#endif
 #undef USE_NETWORK_LIGHT_SCHEMES
-#if ( !defined(TASMOTA32_BERRY_OTTELO) )
+#if ( !defined(TASMOTA32BERRY_OTTELO) )
   #undef USE_BERRY          //https://tasmota.github.io/docs/Berry/
 #endif
 #undef USE_AUTOCONF       //https://tasmota.github.io/docs/ESP32/#autoconf
@@ -162,6 +164,7 @@
 #endif
 
 //-- Skriptgröße (max Anzahl an Zeichen) https://tasmota.github.io/docs/Scripting-Language/#script-buffer-size
+//-- Via Console Command "scriptsize N" in Tasmota änderbar. N = 1000 -UFSYS_SIZE.
 //-- ESP8266 1M Flash
 #if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_EEPROM
@@ -198,6 +201,9 @@
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_ANGLE_FUNC //~2KB
   #define USE_FEXTRACT //~8KB cts()
+  //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc Nur für ESPs mit FileSystem
+  #define USE_TINYC           // Enable TinyC VM (XDRV_124)
+  #define USE_TINYC_IDE       // Enable self-hosted browser IDE (requires USE_UFILESYS)
 #endif
 
 //-- enables authentication, this is not needed by most energy meters. M,=so5
@@ -254,6 +260,7 @@
 //-- Weiteres optionales
 //#define USE_DISPLAY_TM1621_SONOFF //4KB
 //#define USE_SENDMAIL
+
 
 //-- OTA Urls
 #undef OTA_URL
