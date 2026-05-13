@@ -112,9 +112,11 @@ In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#defi
 Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben).
 - TasmotaProjekt/`tasmota/user_config_override.h`
 - TasmotaProjekt/`platformio_tasmota_cenv.ini`
+- TasmotaProjekt/`ccache_wrapper.py` <- siehe ccache (unten)
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino)
 - TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xsns_sensor/xsns_53_sml.ino)
 - TasmotaProjekt/boards/`esp32s3-qio.json` <- (optional) für ESP32-S3 Image (siehe `platformio_tasmota_cenv.ini`) ohne PSRAM Support, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32)
+- ggf. noch weitere Dateien, je nach Release...
 
 Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
@@ -122,41 +124,41 @@ Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details find
 ### Kompilieren
 Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben: 
 
-Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `platformio run -e tasmota32-safeboot`.  
+Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `pio run -e tasmota32-safeboot`.  
 
 Um alle gleichzeitig zu erstellen:  
-`platformio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot`
+`pio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot`
 
 Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
 
 ESP32 (Scripter-Variante `_tas`):  
-`platformio run -e tasmota32_ottelo_tas`        (Generic ESP32)  
-`platformio run -e tasmota32berry_ottelo_tas`   (Generic ESP32 + Berry, nur Scripter)  
-`platformio run -e tasmota32s2_ottelo_tas`  
-`platformio run -e tasmota32s3_ottelo_tas`  
-`platformio run -e tasmota32c3_ottelo_tas`  
-`platformio run -e tasmota32c6_ottelo_tas`  
-`platformio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
-`platformio run -e tasmota32p4_ottelo_tas`  
+`pio run -e tasmota32_ottelo_tas`        (Generic ESP32)  
+`pio run -e tasmota32berry_ottelo_tas`   (Generic ESP32 + Berry, nur Scripter)  
+`pio run -e tasmota32s2_ottelo_tas`  
+`pio run -e tasmota32s3_ottelo_tas`  
+`pio run -e tasmota32c3_ottelo_tas`  
+`pio run -e tasmota32c6_ottelo_tas`  
+`pio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
+`pio run -e tasmota32p4_ottelo_tas`  
 
 ESP32 (TinyC-Variante `_tc`, kein Berry):  
-`platformio run -e tasmota32_ottelo_tc`  
-`platformio run -e tasmota32s2_ottelo_tc`  
-`platformio run -e tasmota32s3_ottelo_tc`  
-`platformio run -e tasmota32c3_ottelo_tc`  
-`platformio run -e tasmota32c6_ottelo_tc`  
-`platformio run -e tasmota32solo1_ottelo_tc`  
-`platformio run -e tasmota32p4_ottelo_tc`  
+`pio run -e tasmota32_ottelo_tc`  
+`pio run -e tasmota32s2_ottelo_tc`  
+`pio run -e tasmota32s3_ottelo_tc`  
+`pio run -e tasmota32c3_ottelo_tc`  
+`pio run -e tasmota32c6_ottelo_tc`  
+`pio run -e tasmota32solo1_ottelo_tc`  
+`pio run -e tasmota32p4_ottelo_tc`  
 
 ESP8266:  
-`platformio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
-`platformio run -e tasmota1m_energy_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)  
-`platformio run -e tasmota1m_shelly_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
-`platformio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, Scripter)  
-`platformio run -e tasmota4m_ottelo_tc`         (>= 4M Flash, TinyC)  
+`pio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
+`pio run -e tasmota1m_energy_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)  
+`pio run -e tasmota1m_shelly_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
+`pio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, Scripter)  
+`pio run -e tasmota4m_ottelo_tc`         (>= 4M Flash, TinyC)  
 
 Um alle gleichzeitig zu erstellen (Bash + jq):  
-`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')`
+`pio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')`
 
 PowerShell:  
 ```powershell
@@ -245,8 +247,31 @@ Im Build-Output erscheint außerdem direkt am Anfang:
 
 Tasmota's `platformio.ini` setzt `build_cache_dir = .cache` — das ist PIO's eigener Object-Cache (Stufe 1), unabhängig von ccache (Stufe 2). PIO-Cache greift bei **gleicher Env** (z.B. zweiter Build derselben `_tc`-Variante), ccache zusätzlich bei **Env-Wechsel** (`_tas` ↔ `_tc`). Beide aktiv lassen — sie ergänzen sich.
 
-Linux Script um danach alle Images in zip-Archive zu packen:
-[make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)
+### Release-ZIPs erstellen mit `make_tasmota_zips_extended.sh`
+
+Nach dem Bauen aller Envs liegen die Firmware-Dateien (`*.bin`, `*.factory.bin`, `*.bin.gz`) in `Tasmota-xxx/build_output/firmware/`. Das mitgelieferte [`make_tasmota_zips_extended.sh`](make_tasmota_zips_extended.sh) erstellt daraus die Release-ZIPs pro Plattform und Variante.
+
+**Verwendung:**
+
+1. Script in das Firmware-Output-Verzeichnis kopieren:
+   ```bash
+   cp /pfad/zu/tasmota-sml-images/make_tasmota_zips_extended.sh \
+      ~/Tasmota-15.4.0/build_output/firmware/
+   ```
+
+2. Ins Verzeichnis wechseln und ausführen:
+   ```bash
+   cd ~/Tasmota-15.4.0/build_output/firmware
+   chmod +x make_tasmota_zips_extended.sh
+   ./make_tasmota_zips_extended.sh
+   ```
+
+3. Die ZIPs landen im Unterordner `tasmota_zips/`:
+   - `tasmota8266_bundle_ottelo.zip` — alle ESP8266-Builds gebündelt + tasmota-minimal
+   - `tasmota32berry_ottelo_tas.zip` — ESP32 + Berry (nur Scripter)
+   - `tasmota32<board>_ottelo_tas.zip` / `_tc.zip` — pro ESP32-Plattform jeweils zwei ZIPs (Scripter / TinyC), insgesamt 14 Stück
+
+**Verhalten bei fehlenden Builds:** Wenn eine erwartete Datei fehlt (z.B. C6 oder P4 nicht gebaut), meldet das Script `FEHLER: Datei fehlt: …` und überspringt nur dieses eine ZIP — die anderen werden weiterhin erstellt.
 
 ### FAQ
 - Beim Übertragen eines Images (z.B. tasmota1m_shelly_ottelo) für ESP8266 via OTA (Use file upload) bekomme ich folgenden Fehler:

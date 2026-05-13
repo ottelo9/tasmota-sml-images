@@ -64,7 +64,12 @@ void tc_spawn_task_cleanup_slot(uint8_t slot_idx);
 // delivering packets to ANY socket bound to the port. Required for
 // Andreas's clean A/B test where Tinyc->udp + Tinyc->udp_port share a
 // port and stopping one doesn't drop the shared multicast membership.
+// ESP8266-Guard: dortiges LwIP exportiert igmp_leavegroup nicht in den
+// öffentlichen Include-Pfad — auf ESP8266 fällt udp(10,...) deshalb auf
+// einen No-Op zurück (siehe Syscall-Implementierung unten).
+#ifdef ESP32
 #include <lwip/igmp.h>
+#endif
 // Native TWAI (CAN-bus) driver for the SYS_TWAI_* syscalls (380..386).
 // Same header xsns_53_sml.ino uses; provides twai_message_t, the timing
 // preset macros TWAI_TIMING_CONFIG_*, twai_general_config_t, and the
@@ -6989,6 +6994,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           // membership. Use case (Andreas's A/B test): cleanly stop receiving a
           // multicast stream without tearing down the underlying UDP socket.
           // Returns 1 on success, 0 on bad-IP or LwIP error.
+#ifdef ESP32
           int32_t ip_ref = TC_POP(vm);
           char ip_str[32];
           tc_ref_to_cstr(vm, ip_ref, ip_str, sizeof(ip_str));
@@ -7010,6 +7016,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             Tinyc->udp_port_mcast = IPAddress(0,0,0,0);
           }
           TC_PUSH(vm, rc == ERR_OK ? 1 : 0);
+#else
+          // ESP8266: igmp_leavegroup nicht exportiert — Argument konsumieren,
+          // 0 zurückgeben (siehe Include-Guard oben). Wenn jemand auf ESP8266
+          // ein TC-Programm mit udp(10,...) flasht, läuft's durch, der Aufruf
+          // ist aber wirkungslos.
+          (void)TC_POP(vm);
+          TC_PUSH(vm, 0);
+#endif
           break;
         }
         default:
