@@ -61,6 +61,12 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 // UriGlob for port 82 download server wildcard routes
 #include <uri/UriGlob.h>
 
+// Raw socket API for SO_LINGER setsockopt() in HandleTinyCDisplayRaw —
+// pulls in struct linger, SOL_SOCKET, SO_LINGER on ESP32's lwIP.
+#ifdef ESP32
+  #include <lwip/sockets.h>
+#endif
+
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
 #include "include/xdrv_124_tinyc_vm.h"
 
@@ -256,6 +262,23 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
 
 #define TC_CFG_FILE "/tinyc.cfg"
 
+// Filesystem boot-loop marker. Created right before autoexec slots
+// start; deleted after `TC_BOOT_STABLE_S` seconds of uptime. If the
+// marker is still present at the start of the next boot, the previous
+// boot crashed before reaching steady state — autoexec is wiped.
+//
+// More robust than relying on `RtcReboot.fast_reboot_count`, which
+// Tasmota itself resets at uptime==BOOT_LOOP_TIME (10 s) via
+// RtcRebootReset() in support_tasmota.ino:1134. That makes the RTC
+// counter useless for any crash that happens >10 s into boot — the
+// counter is gone before the crash, so it never accumulates across
+// reboots and Tasmota's no_autoexec never fires.
+#define TC_BOOT_MARKER "/tinyc.boot.lock"
+#ifndef TC_BOOT_STABLE_S
+#define TC_BOOT_STABLE_S 30   // uptime at which boot is considered "succeeded"
+#endif
+static bool tc_boot_marker_cleared = false;
+
 #ifdef USE_UFILESYS
 // Save current slot configuration to /tinyc.cfg
 static void TinyCSaveSettings(void) {
@@ -273,11 +296,160 @@ static void TinyCSaveSettings(void) {
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Settings saved"));
 }
 
+// Boot-loop detector — primary signal is filesystem-only.
+//
+// Three independent signals OR'd together:
+//
+//   1. **Marker file** (`TC_BOOT_MARKER`) — primary mechanism.
+//      Written right before autoexec slots start; deleted after
+//      `TC_BOOT_STABLE_S` seconds of stable uptime. Marker present
+//      at next boot ⇒ previous boot crashed before reaching steady
+//      state ⇒ disable autoexec. Independent of RtcReboot, SetOption36,
+//      and Tasmota's no_autoexec — works for crashes at ANY time
+//      within the protection window, including delayed callbacks
+//      (WebCall, EverySecond) that fire well after Tasmota's own
+//      RtcRebootReset() at uptime==BOOT_LOOP_TIME (10 s) zeroes the
+//      RTC counter.
+//
+//   2. **Tasmota's `no_autoexec`** — fallback for legacy boot-loop
+//      detection. Only fires when SetOption36 ≠ 0 AND fast_reboot_count
+//      exceeds the threshold (offset+2). Useful only for
+//      crashes-within-10-s-of-boot.
+//
+//   3. **Direct `RtcReboot.fast_reboot_count >= TC_BOOTLOOP_THRESHOLD`**
+//      (default 4) — bypasses SetOption36. Same crashes-within-10-s
+//      limitation as #2, but works even with SetOption36=0.
+//
+// All three return TRUE-on-trip; #1 is the only one that catches the
+// common case of "crash during WebCall / EverySecond several seconds
+// into the run".
+#ifndef TC_BOOTLOOP_THRESHOLD
+#define TC_BOOTLOOP_THRESHOLD 4
+#endif
+static bool tc_bootloop_marker_present(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return false;
+  return fs->exists(TC_BOOT_MARKER);
+}
+
+// QPC (Quick Power Cycle) counter — orthogonal to RtcReboot.
+// QPC is persisted in flash (not RTC) so it survives true power
+// cycles, including those that fully drain the RTC capacitor.
+// Tasmota itself increments this counter on each boot before
+// uptime==POWER_CYCLE_TIME (8 s); at counter==7 it does
+// SettingsErase(3) — which wipes Tasmota Settings but NOT the
+// LittleFS filesystem, so /tinyc.cfg with autoexec=1 stays put
+// even after Tasmota's "reset everything" trigger fires.
+//
+// We piggy-back on the same counter: at TC_BOOTLOOP_QPC_THRESHOLD
+// power cycles (default 4, well before Tasmota's wipe at 7),
+// rewrite /tinyc.cfg with autoexec=0 so the user has a clean,
+// recoverable device while keeping their WiFi/module config intact.
+//
+// ESP32-only — ESP8266 uses a different storage mechanism for QPC
+// (sector-level flashRead/Write, see UpdateQuickPowerCycle).
+#ifndef TC_BOOTLOOP_QPC_THRESHOLD
+#define TC_BOOTLOOP_QPC_THRESHOLD 4
+#endif
+static uint8_t tc_qpc_counter(void) {
+#ifdef ESP32
+  uint32_t pc_register = 0;
+  QPCRead(&pc_register, sizeof(pc_register));
+  // Format per UpdateQuickPowerCycle: 0xFFA55AF0 | (counter & 0xF).
+  // 0xFFFFFFFF = uninitialised flash → counter 0xF, treated as "no
+  // power-cycle activity yet". Anything else with the right top bits
+  // gives a valid counter.
+  if ((pc_register & 0xFFFFFFF0) != 0xFFA55AF0) return 0;
+  uint8_t counter = pc_register & 0xF;
+  if (counter == 0xF) return 0;  // uninitialised counter slot
+  return counter;
+#else
+  return 0;
+#endif
+}
+
+static bool tc_bootloop_detected(void) {
+  if (tc_bootloop_marker_present()) return true;       // primary: filesystem marker
+  if (tc_qpc_counter() >= TC_BOOTLOOP_QPC_THRESHOLD) return true; // QPC: power-cycle storm
+  if (TasmotaGlobal.no_autoexec) return true;          // fallback: Tasmota's gate
+  if (RtcReboot.fast_reboot_count >= TC_BOOTLOOP_THRESHOLD) return true;
+  return false;
+}
+static void tc_bootloop_marker_write(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+  File f = fs->open(TC_BOOT_MARKER, "w");
+  if (f) {
+    // 0-byte sentinel is enough; we only check for existence
+    f.close();
+  }
+}
+static void tc_bootloop_marker_delete(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+  if (fs->exists(TC_BOOT_MARKER)) {
+    fs->remove(TC_BOOT_MARKER);
+  }
+}
+
 // Load slot configuration from /tinyc.cfg, load files, auto-run marked slots
 static void TinyCLoadSettings(void) {
   if (!Tinyc) return;
   FS *fs = ufsp ? ufsp : ffsp;
   if (!fs) return;
+
+  // EARLY boot-loop guard: if we've already crashed several times in a
+  // row, force-clear /tinyc.cfg's autoexec flags BEFORE we even parse
+  // them into slot_config[]. The fix used to live in TinyCStartAutoexec
+  // (FUNC_LOOP path) but if Tasmota's own boot-loop wipe never fires
+  // (e.g. SetOption36=0), or the crash happens before FUNC_LOOP gets
+  // a chance to call us, autoexec=1 stays in /tinyc.cfg forever and
+  // the loop is permanent.
+  //
+  // Walk the file once, write a sanitised copy (autoexec=0 on every
+  // line that had it), then continue with normal parsing of the
+  // sanitised file. User regains control via /tc_api?cmd=autoexec
+  // or the IDE.
+  if (tc_bootloop_detected()) {
+    File rf = fs->open(TC_CFG_FILE, "r");
+    if (rf) {
+      String content = rf.readString();
+      rf.close();
+      if (content.indexOf(",1") >= 0) {  // any line with autoexec=1?
+        // Replace ",1\n" with ",0\n" and ",1$" (last line) with ",0".
+        // Conservative — only touches the trailing flag, leaves
+        // filename and any other commas alone.
+        String cleaned;
+        cleaned.reserve(content.length());
+        int from = 0;
+        while (from < (int)content.length()) {
+          int eol = content.indexOf('\n', from);
+          if (eol < 0) eol = content.length();
+          String line = content.substring(from, eol);
+          int comma = line.indexOf(',');
+          if (comma >= 0) {
+            String fname = line.substring(0, comma);
+            // Force the autoexec flag to 0 regardless of original value.
+            cleaned += fname;
+            cleaned += ",0";
+          } else {
+            cleaned += line;  // empty / malformed — keep as-is
+          }
+          if (eol < (int)content.length()) cleaned += '\n';
+          from = eol + 1;
+        }
+        File wf = fs->open(TC_CFG_FILE, "w");
+        if (wf) {
+          wf.print(cleaned);
+          wf.close();
+        }
+        AddLog(LOG_LEVEL_ERROR,
+               PSTR("TCC: Boot loop (count=%d) — %s rewritten with autoexec=0 for all slots"),
+               RtcReboot.fast_reboot_count, TC_CFG_FILE);
+      }
+    }
+  }
+
   File f = fs->open(TC_CFG_FILE, "r");
   if (!f) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: No " TC_CFG_FILE " found"));
@@ -312,23 +484,92 @@ static void TinyCLoadSettings(void) {
     slot++;
   }
   f.close();
+  // NOTE: autoexec slots are NOT started here. They're started later
+  // from the first FUNC_LOOP via TinyCStartAutoexec() — see comment
+  // in the FUNC_LOOP handler. Doing it here (during FUNC_INIT) caused
+  // a race against the rest of Tasmota's driver-init chain: main()
+  // runs in its own FreeRTOS task, gets scheduled when loopTask
+  // yields, and ends up executing serialBegin (etc.) concurrently
+  // with other drivers' FUNC_INIT and the Wi-Fi/RF coex init. UART
+  // claim "succeeds" but the GPIO matrix routing gets clobbered →
+  // no bytes ever arrive. By deferring to first FUNC_LOOP, all
+  // FUNC_INITs are done before tc_vm_task even spawns.
+}
+#endif  // USE_UFILESYS
 
-  // Auto-run slots with autoexec flag — lazy-load + start
-  if (TasmotaGlobal.no_autoexec) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Boot loop detected — autoexec disabled"));
-  } else {
-    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-      if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
-        if (TinyCLoadFile(Tinyc->slot_config[i].filename, i)) {
-          TinyCStartVM(Tinyc->slots[i]);
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: Auto-started slot %d"), i);
-          delay(100);  // stagger VM starts to avoid heap/stack exhaustion
-        }
+// ── Deferred autoexec starter ──────────────────────────────────
+// Called once on the first non-paused FUNC_LOOP. By this point
+// every other driver's FUNC_INIT has run and hardware is settled,
+// so user `serialBegin`/`i2cBegin`/`spiBegin` calls inside the
+// script's main() can't race Tasmota's own peripheral setup.
+//
+// Keeps the original 100 ms stagger between successive slot starts
+// (prevents heap/stack exhaustion from spawning multiple VM tasks
+// back-to-back). Honors TasmotaGlobal.no_autoexec for boot-loop
+// recovery, same as before.
+static void TinyCStartAutoexec(void) {
+  if (!Tinyc) return;
+#ifdef USE_UFILESYS
+  // Belt-and-braces: TinyCLoadSettings() already rewrote /tinyc.cfg
+  // with autoexec=0 if a boot-loop was detected, so slot_config[i]
+  // .autoexec is already false. But re-check here so any signal that
+  // becomes true between FUNC_INIT and FUNC_LOOP (notably the marker
+  // file written by US a moment ago — but the early-rewrite already
+  // consumed it) still produces a clear log line.
+  if (tc_bootloop_detected()) {
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("TCC: Boot loop (qpc=%d rtc=%d no_autoexec=%d marker=%d) — autoexec skipped"),
+           tc_qpc_counter(), RtcReboot.fast_reboot_count,
+           TasmotaGlobal.no_autoexec ? 1 : 0,
+           tc_bootloop_marker_present() ? 1 : 0);
+    return;
+  }
+
+  // Has any slot got autoexec to run? If so, drop the boot-marker file
+  // BEFORE starting any VM. Marker is deleted later in FUNC_LOOP once
+  // uptime crosses TC_BOOT_STABLE_S without a crash. If we crash before
+  // that — even at uptime=60s during the first WebCall — the marker
+  // stays and the next boot's tc_bootloop_detected() trips on it.
+  bool any_autoexec = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
+      any_autoexec = true;
+      break;
+    }
+  }
+  if (any_autoexec) {
+    tc_bootloop_marker_write();
+  }
+
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
+      if (TinyCLoadFile(Tinyc->slot_config[i].filename, i)) {
+        TinyCStartVM(Tinyc->slots[i]);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Auto-started slot %d (deferred from FUNC_INIT)"), i);
+        delay(100);  // stagger VM starts to avoid heap/stack exhaustion
       }
     }
   }
+#endif
 }
-#endif  // USE_UFILESYS
+
+// Periodic check: once the device has been up for TC_BOOT_STABLE_S
+// seconds, we declare this boot "succeeded" and remove the marker
+// file. From this point on, any future crash starts a fresh count.
+//
+// Called from FUNC_EVERY_SECOND. tc_boot_marker_cleared is the
+// one-shot guard — file deletion is idempotent, but skipping the
+// existence check after the first successful clear saves a flash op
+// every second.
+static void TinyCCheckBootStable(void) {
+#ifdef USE_UFILESYS
+  if (tc_boot_marker_cleared) return;
+  if (TasmotaGlobal.uptime < TC_BOOT_STABLE_S) return;
+  tc_bootloop_marker_delete();
+  tc_boot_marker_cleared = true;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Boot marker cleared (uptime=%lu s)"), TasmotaGlobal.uptime);
+#endif
+}
 
 /*********************************************************************************************\
  * Tasmota: Init
@@ -357,6 +598,15 @@ static void TinyCInit(void) {
   for (uint8_t s = 0; s < TC_TCP_CLI_SLOTS; s++) {
     new (&Tinyc->tcp_cli_clients[s]) WiFiClient();
   }
+  // Single tcp_client used for accept() in server-mode tcpServer/tcpAvailable
+  // — same calloc-zero trap as the array above. Without this placement-new,
+  // calling tcp_client.connected() (which TC_TCP_ACTIVE_CLIENT does on every
+  // tcpAvailable poll) crashes at NetworkClient::connected vtable+offset 0x54
+  // because the C++ vtable pointer is NULL. Took a 5-line minimal repro
+  // ([tcpServer + EverySecond polling tcpAvailable]) on a fresh-booted .143
+  // ESP32-C3 to find — see MEMORY.md "tcpAvailable() crashes when polled
+  // from a periodic callback" entry for the diagnostic walk.
+  new (&Tinyc->tcp_client) WiFiClient();
   Tinyc->tcp_cli_slot = 0;
   Tinyc->instr_per_tick = TC_INSTR_PER_TICK;
   // Init SPI CS pins to -1 (unused)
@@ -866,8 +1116,10 @@ static const char TC_CORS_ORIGIN[] PROGMEM = "Access-Control-Allow-Origin";
 static const char TC_CORS_METHODS[] PROGMEM = "Access-Control-Allow-Methods";
 static const char TC_CORS_HEADERS[] PROGMEM = "Access-Control-Allow-Headers";
 
-// Send CORS headers from PROGMEM (saves ~180 bytes RAM on ESP8266)
-static void TCSendCORS(const char *methods_ram) {
+// Send CORS headers from PROGMEM (saves ~180 bytes RAM on ESP8266).
+// Non-static so the lazy WSContentBegin path in xdrv_124_tinyc_vm.h's
+// SYS_WEB_SEND* dispatchers can reuse it from inside the VM TU.
+void TCSendCORS(const char *methods_ram) {
   char hdr[40], val[16];
   strncpy_P(hdr, TC_CORS_ORIGIN, sizeof(hdr)); Webserver->sendHeader(hdr, "*");
   strncpy_P(hdr, TC_CORS_METHODS, sizeof(hdr)); Webserver->sendHeader(hdr, methods_ram);
@@ -1234,7 +1486,36 @@ static void HandleTinyCPage(void) {
         "</div></form></p></fieldset>"));
 
       // --- Remote repository selector ---
-      // Read repo URL from /tinyc_repo.cfg, fall back to default repo
+      // Read repo URL from /tinyc_repo.cfg, fall back to default repo.
+      //
+      // The HTTPS GET to fetch index.txt runs synchronously on the loop
+      // task — on weak WiFi (RSSI worse than ~-75 dBm) it has been
+      // observed to take 50+ seconds, starving Tasmota's main loop and
+      // crashing the device via the RTC watchdog. Two safeguards:
+      //
+      //   1. Cache the index across visits (TC_REPO_CACHE_MS, default
+      //      60 s). Re-rendering from cache is instant; only the first
+      //      visit per minute hits the network. Force a refresh by
+      //      adding ?refresh=1 to /tc.
+      //   2. Cap any single fetch at TC_REPO_FETCH_MS (default 2000 ms).
+      //      `setTimeout()` is interpreted differently across
+      //      Arduino-ESP32 versions (sometimes seconds, sometimes ms);
+      //      `setConnectTimeout()` is the unambiguous one. We set both,
+      //      narrow, so the worst-case loop-task block is bounded.
+      //
+      // Override at build time: -DTC_REPO_CACHE_MS=N -DTC_REPO_FETCH_MS=N
+      #ifndef TC_REPO_CACHE_MS
+      #define TC_REPO_CACHE_MS  60000
+      #endif
+      #ifndef TC_REPO_FETCH_MS
+      // 2026-05-07: bumped 2000 → 5000. The 2 s cap was too tight for github's
+      // TLS handshake from devices with moderate WiFi (RSSI ~-66 dBm) — fetch
+      // silently timed out, repo section vanished from /tc. 5 s is still well
+      // under the ESP32 task watchdog (which is 5 s by default but bumpable).
+      #define TC_REPO_FETCH_MS   5000
+      #endif
+      static String   tc_repo_index;        // last successful index.txt body
+      static uint32_t tc_repo_index_ms = 0; // millis() of last successful fetch
       {
         char repo_url[200] = {};
         File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
@@ -1247,59 +1528,110 @@ static void HandleTinyCPage(void) {
           strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
         }
         if (repo_url[0]) {
-          // Fetch index.txt from repo
-          String idx_url = String(repo_url);
-          if (!idx_url.endsWith("/")) idx_url += "/";
-          idx_url += "index.txt";
+          bool cache_fresh = tc_repo_index.length() > 0 &&
+                             (millis() - tc_repo_index_ms) < TC_REPO_CACHE_MS;
+          bool force_refresh = Webserver->hasArg(F("refresh"));
+          if (!cache_fresh || force_refresh) {
+            // Fetch index.txt from repo (bounded by TC_REPO_FETCH_MS)
+            String idx_url = String(repo_url);
+            if (!idx_url.endsWith("/")) idx_url += "/";
+            idx_url += "index.txt";
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-          HTTPClientLight http;
+            HTTPClientLight http;
 #else
-          WiFiClient http_client;
-          HTTPClient http;
+            WiFiClient http_client;
+            HTTPClient http;
 #endif
-          http.setTimeout(5000);
+#ifdef ESP32
+            // ESP32 HTTPClient + HTTPClientLight both expose setConnectTimeout
+            // (bounds the TCP connect + TLS handshake phase). ESP8266's
+            // ESP8266HTTPClient class doesn't have it, so we rely on
+            // setTimeout alone there — sufficient since ESP8266 builds
+            // generally use plain HTTP (no TLS handshake to bound).
+            http.setConnectTimeout(TC_REPO_FETCH_MS);
+#endif
+            http.setTimeout(TC_REPO_FETCH_MS);
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-          bool begun = http.begin(idx_url);
+            bool begun = http.begin(idx_url);
 #else
-          bool begun = http.begin(http_client, idx_url);
+            bool begun = http.begin(http_client, idx_url);
 #endif
-          if (begun) {
-            int httpCode = http.GET();
-            if (httpCode == HTTP_CODE_OK) {
-              String body = http.getString();
-              if (body.length() > 0) {
-                WSContentSend_P(PSTR(
-                  "<fieldset><legend><b> Repository </b></legend>"
-                  "<p><form action='/tc' method='get'>"
-                  "<div style='display:flex;gap:8px;align-items:center'>"
-                  "<select name='rfile' style='flex:1'>"));
-                // Parse index.txt: one filename per line
-                int pos = 0;
-                while (pos < (int)body.length()) {
-                  int nl = body.indexOf('\n', pos);
-                  if (nl < 0) nl = body.length();
-                  String line = body.substring(pos, nl);
-                  line.trim();
-                  if (line.length() > 0 && line.endsWith(".tcb")) {
-                    WSContentSend_P(PSTR("<option value='%s'>%s</option>"),
-                      line.c_str(), line.c_str());
-                  }
-                  pos = nl + 1;
+            uint32_t fetch_t0 = millis();
+            int httpCode = -1;
+            int body_len = 0;
+            if (begun) {
+              httpCode = http.GET();
+              if (httpCode == HTTP_CODE_OK) {
+                String body = http.getString();
+                body_len = body.length();
+                if (body_len > 0) {
+                  tc_repo_index    = body;
+                  tc_repo_index_ms = millis();
                 }
-                WSContentSend_P(PSTR(
-                  "</select>"
-                  "<select name='slot' style='width:auto'>"));
-                for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-                  WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
-                }
-                WSContentSend_P(PSTR(
-                  "</select></div>"
-                  "<br><button name='cmd' value='download' class='button bgrn'>"
-                  "Download &amp; Load</button>"
-                  "</form></p></fieldset>"));
               }
+              http.end();
             }
-            http.end();
+            uint32_t fetch_dt = millis() - fetch_t0;
+            // Log whenever the fetch fails OR took longer than the cap +
+            // some slack — so silent "Repository section disappeared from
+            // /tc" cases are diagnosable from the serial log.
+            if (!begun) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — http.begin() failed for %s"),
+                idx_url.c_str());
+            } else if (httpCode != HTTP_CODE_OK) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — HTTP %d after %u ms (cap %u, %s)"),
+                httpCode, (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS,
+                (httpCode < 0) ? "timeout/conn err" : "non-200");
+            } else if (body_len == 0) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — empty body after %u ms"),
+                (unsigned)fetch_dt);
+            } else if (fetch_dt > TC_REPO_FETCH_MS + 500) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch took %u ms (cap %u) — slow link?"),
+                (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS);
+            }
+          }
+          // Render from cache (whether just-fetched or older). If empty
+          // (first-ever visit failed), the section is silently omitted —
+          // a subsequent visit will retry and populate it.
+          if (tc_repo_index.length() > 0) {
+            WSContentSend_P(PSTR(
+              "<fieldset><legend><b> Repository </b></legend>"
+              "<p><form action='/tc' method='get'>"
+              "<div style='display:flex;gap:8px;align-items:center'>"
+              "<select name='rfile' style='flex:1'>"));
+            // Parse index.txt: one filename per line
+            int pos = 0;
+            while (pos < (int)tc_repo_index.length()) {
+              int nl = tc_repo_index.indexOf('\n', pos);
+              if (nl < 0) nl = tc_repo_index.length();
+              String line = tc_repo_index.substring(pos, nl);
+              line.trim();
+              if (line.length() > 0 && line.endsWith(".tcb")) {
+                WSContentSend_P(PSTR("<option value='%s'>%s</option>"),
+                  line.c_str(), line.c_str());
+              }
+              pos = nl + 1;
+            }
+            WSContentSend_P(PSTR(
+              "</select>"
+              "<select name='slot' style='width:auto'>"));
+            for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+              WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
+            }
+            // Include a "Refresh" button so the user can force a fresh
+            // GET when they've added a new .tcb to the repo.
+            uint32_t age_s = (millis() - tc_repo_index_ms) / 1000;
+            WSContentSend_P(PSTR(
+              "</select></div>"
+              "<br><button name='cmd' value='download' class='button bgrn'>"
+              "Download &amp; Load</button>"
+              " <a href='/tc?refresh=1' class='button' style='background:#888;padding:4px 10px'>"
+              "&#x21bb; Refresh list (cached %us)</a>"
+              "</form></p></fieldset>"), (unsigned)age_s);
           }
         }
       }
@@ -1331,11 +1663,27 @@ static void HandleTinyCPage(void) {
   // --- IDE Section ---
   WSContentSend_P(PSTR("<fieldset><legend><b> TinyC IDE </b></legend>"));
 #if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
+  // Open the IDE via the current-port `/ide` URL and let the server
+  // decide whether to redirect to the port-82 background download
+  // task. This works in both common scenarios:
+  //
+  //   * Real ESP32 on a normal LAN — `Tinyc->dl_server` is up,
+  //     `/ide` issues a 302 to `:82/ide`, the IDE loads via the
+  //     dedicated FreeRTOS task and the main HTTP loop stays free
+  //     for other work (the original benefit of the port-82 split).
+  //   * VBox / firewalled / port-blocked setups — `/ide` falls
+  //     through to a synchronous serve from port 80 (slower under
+  //     contention, but functional everywhere).
+  //
+  // The previous version hardcoded `:82/ide` in the button JS, which
+  // produced an unreachable URL on networks where port 82 isn't
+  // exposed (Andreas's VBox setup at 192.168.56.107).
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
-    "<button onclick=\"window.open('/ide','tinyc_ide')\" class='button bgrn'>Open IDE</button>"
+    "<button onclick=\"window.open('/ide','tinyc_ide')\" "
+    "class='button bgrn'>Open IDE</button>"
     "</p>"
-    "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem</p>"));
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem (port 82 background task on real hw, port 80 fallback otherwise)</p>"));
 #else
   WSContentSend_P(PSTR(
     "<div class='tc-ide-url'>"
@@ -2074,7 +2422,15 @@ static void HandleHomeKitQR(void) {
 #endif  // USE_HOMEKIT
 
 // ---- Self-hosted IDE (optional -- #define USE_TINYC_IDE) ----
-// Serves /tinyc_ide.html (or .gz) from filesystem at /ide
+// Port 80 /ide handler: on ESP32 with port-82 download server up, issues a
+// 302 redirect to port 82 /ide so the actual 150 KB streaming happens in a
+// dedicated FreeRTOS task (see tc_ide_serve_task) and doesn't block the main
+// HTTP loop. This eliminates the multi-second device stalls that occur when
+// loading the IDE while a TinyC script is running (file-I/O contention).
+//
+// Falls back to synchronous serving when port 82 isn't up yet (early boot
+// before WiFi connects) or on ESP8266 where the port-82 task pattern isn't
+// available.
 #ifdef USE_TINYC_IDE
 #ifdef USE_UFILESYS
 static void HandleTinyCIde(void) {
@@ -2083,8 +2439,35 @@ static void HandleTinyCIde(void) {
     return;
   }
 
-  // Try SD (ufsp) first, then Flash (ffsp) — lets users drop a newer
-  // tinyc_ide.html.gz on SD and have it take precedence without a reflash.
+#ifdef ESP32
+  // Fast path: redirect to port 82 background-task server. Returns
+  // immediately; main loop is freed for other work.
+  // Escape hatch: `/ide?direct=1` forces the synchronous fallback
+  // below even when dl_server is up. Useful when port 82 is blocked
+  // (VBox / corporate firewall / partial port-forward setups) and
+  // also for debugging the synchronous code path on real hardware.
+  bool skip_redirect = (Webserver->hasArg(F("direct")) &&
+                        Webserver->arg(F("direct")) != F("0"));
+  if (Tinyc && Tinyc->dl_server && !skip_redirect) {
+    // Format the IP manually — `%_I` is a Tasmota-custom format
+    // specifier that snprintf_P here doesn't expand (the override only
+    // applies in some translation units), so it leaked through as
+    // literal "_I" with a junk port. Use portable %u.%u.%u.%u
+    // instead. Bug: gemu's setup AND Andreas's VBox setup both saw
+    // `Location: http://_I:-1883461440/ide` with the regression
+    // introduced by commit bb72b46f7.
+    IPAddress ip = WiFi.localIP();
+    char loc[80];
+    snprintf_P(loc, sizeof(loc), PSTR("http://%u.%u.%u.%u:%d/ide"),
+               ip[0], ip[1], ip[2], ip[3], TC_DLPORT);
+    Webserver->sendHeader(F("Location"), loc);
+    WSSend_P(302, PSTR("text/plain"), PSTR("Redirecting to background IDE server"));
+    return;
+  }
+#endif
+
+  // Fallback: synchronous serve (used before port-82 server starts, or on
+  // ESP8266). Blocks the main loop for the duration of the file read.
   bool gzipped = false;
   File f;
   if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
@@ -2114,7 +2497,6 @@ static void HandleTinyCIde(void) {
   Webserver->setContentLength(fsize);
   WSSend_P(200, PSTR("text/html"), PSTR(""));
 
-  // Stream file in chunks (smaller buffer on ESP8266 to save stack)
   uint8_t buf[256];
   while (f.available()) {
     int n = f.read(buf, sizeof(buf));
@@ -2164,7 +2546,11 @@ static void TinyC_WebSetVar(void) {
       } else {
         int32_t newval = val.toInt();
         int32_t oldval = s->vm.globals[gidx];
-        s->vm.globals[gidx] = newval;
+        // Watch-aware write: if `gidx` is a `watch` global, also bumps
+        // shadow (gidx+1 = oldval) and written-flag (gidx+2 = 1) so that
+        // EverySecond's `written(var)` / `changed(var)` intrinsics see the
+        // external write. Plain (non-watch) globals: same as a raw write.
+        tc_global_write_with_watch(&s->vm, (uint16_t)gidx, newval, oldval);
         // Dispatch TouchButton callback when a webButton value changes
         if (newval != oldval) {
           tinyc_touch_button((uint8_t)gidx, (int16_t)newval);
@@ -2503,11 +2889,39 @@ static void HandleTinyCWebOn(uint8_t handler_num) {
     return;
   }
   Tinyc->current_web_handler = handler_num;
-  // CORS + chunked response -- callback uses webSend() to emit content
-  TCSendCORS("GET, POST, OPTIONS");
-  WSContentBegin(200, CT_HTML);
+  Tinyc->web_content_begun   = 0;
+  Tinyc->web_raw_active      = 0;
+#ifdef USE_HTTP_KEEPALIVE
+  // Per-request opt-in: handler must call webKeepAlive() each iteration
+  // to keep the TCP socket open. Reset here so a previously kept-alive
+  // request doesn't carry its flag into the next request handler.
+  if (Webserver) Webserver->setKeepAlive(false);
+#endif
+
+  // WSContentBegin + CORS are now LAZY: triggered on the first webSend()
+  // call inside the callback (see SYS_WEB_SEND / SYS_WEB_SEND_STR). This
+  // lets raw-mode handlers — those that call webRawMode() and write the
+  // full HTTP response via webRawWrite() — bypass Tasmota's chunked
+  // text/html wrapping entirely. Motivating use case: emulating storage
+  // devices whose firmware expects an exact 3-header EcoTracker response
+  // (HTTP/1.1 200 OK + Content-Type + Content-Length, nothing else) plus
+  // a kept-alive TCP socket — Jackery Homepower 2000 Ultra and friends.
+  // Existing webOn scripts that just call webSend() see byte-identical
+  // wire format vs. the old eager-WSContentBegin path.
   tc_slot_callback(s, "WebOn");
-  WSContentEnd();
+
+  if (Tinyc->web_content_begun) {
+    WSContentEnd();
+  } else if (!Tinyc->web_raw_active) {
+    // Handler called neither webSend() nor webRaw*() — preserve the
+    // pre-lazy-begin behaviour of emitting an empty-body chunked
+    // response so scripts that register an endpoint without producing
+    // content (rare but legitimate, e.g. side-effect-only triggers)
+    // don't regress to "client gets nothing on the wire".
+    TCSendCORS("GET, POST, OPTIONS");
+    WSContentBegin(200, CT_HTML);
+    WSContentEnd();
+  }
   Tinyc->current_web_handler = 0;
 }
 
@@ -2817,7 +3231,19 @@ static void TinyCShow(bool json) {
           s->program_size,
           s->vm.instruction_count);
       }
-      // Call user's JsonCall() on this slot (skip the slot that triggered sensorGet)
+      // Call user's JsonCall() on this slot (skip the slot that triggered sensorGet).
+      // Restored 2026-05-07: `s->loaded && s->vm.halted && error == TC_OK` pre-check.
+      // It was removed in 7be97b97b to fix a UI-disappear case (spawnTask worker
+      // mid-syscall has halted=false, the pre-check would skip its JsonCall and
+      // sensor rows would vanish from the /?m=1 poll). But removing it caused a
+      // reproducible HANG of the entire device when running multi-slot configs:
+      // sensorGet on slot 0 → MqttShowSensor → fan-out JsonCall to slot 5
+      // unconditionally takes slot 5's mutex with portMAX_DELAY. Bisected
+      // against the C3 baseline (commit 63a7e6535, Apr 20) which ran the same
+      // pattern stably for weeks. Multi-slot stability is more important than
+      // the cosmetic spawnTask UI-disappear case; if that case becomes a real
+      // problem, address it via xSemaphoreTake-with-timeout in tc_slot_callback
+      // rather than by removing the pre-check.
       if (s->loaded && s->vm.halted && s->vm.error == TC_OK && s != tc_sensor_get_slot) {
         tc_slot_callback(s, "JsonCall");
       }
@@ -2843,7 +3269,9 @@ static void TinyCShow(bool json) {
             i, status, s->program_size);
         }
       }
-      // Call user's WebCall() on this slot (always active)
+      // Call user's WebCall() on this slot — pre-check restored 2026-05-07,
+      // see JsonCall comment above. The /?m=1 polling path is the primary
+      // trigger for the multi-slot hang regression introduced by 7be97b97b.
       if (s->loaded && s->vm.halted && s->vm.error == TC_OK) {
         tc_slot_callback(s, "WebCall");
       }
@@ -3103,12 +3531,117 @@ static void TC_DLRoot(void) {
   Tinyc->dl_server->send(200, F("text/plain"), F("TinyC File Server"));
 }
 
+/*-------------------------------------------------------------------------------------------*\
+ * IDE serving via background task (port 82 /ide)
+ *
+ * The IDE file (~150 KB gzipped) was previously streamed synchronously by the
+ * main HTTP loop (port 80 /ide handler), holding the main loop for the whole
+ * 600+ chunk read+write cycle. Under script contention (LittleFS single-threaded
+ * + scripts doing their own file I/O for .pvs persist + sensor logs), this would
+ * block the whole device for 1-3 s per IDE load — even on dual-core ESP32.
+ *
+ * Now: port 80 /ide issues a 302 redirect to port 82 /ide, which spawns a
+ * dedicated FreeRTOS task that streams the file. Main loop unaffected; the
+ * task uses larger 1 KB chunks for fewer yields and sends Connection: close
+ * for clean teardown.
+\*-------------------------------------------------------------------------------------------*/
+static bool tc_ide_busy = false;
+
+static void tc_ide_serve_task(void *param) {
+  // Match the tc_download_task pattern: take the client from the dl_server
+  // INSIDE the task, not before spawning. This is what the existing /ufs/*
+  // path does and is known to work — the framework keeps the client alive
+  // after the handler returns since no send() was called.
+  WiFiClient client = Tinyc->dl_server->client();
+
+  // Locate the file: try ufsp (SD/user) first then ffsp (flash). Prefer .gz.
+  bool gzipped = false;
+  File f;
+  if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
+  if (f) {
+    gzipped = true;
+  } else {
+    if (ufsp) f = ufsp->open("/tinyc_ide.html", "r");
+    if (!f && ffsp && ffsp != ufsp) {
+      f = ffsp->open("/tinyc_ide.html.gz", "r");
+      if (f) gzipped = true;
+      else   f = ffsp->open("/tinyc_ide.html", "r");
+    }
+  }
+
+  if (!f) {
+    client.print(F("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Connection: close\r\n\r\nIDE not found on filesystem."));
+    delay(50);
+    client.stop();
+    tc_ide_busy = false;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE task: file not found"));
+    vTaskDelete(NULL);
+    return;
+  }
+
+  uint32_t fsize = f.size();
+  // Write status + headers in one printf call. Order: status, type,
+  // optional Content-Encoding, length, cache, connection.
+  if (gzipped) {
+    client.printf_P(PSTR(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Encoding: gzip\r\n"
+        "Content-Length: %u\r\n"
+        "Cache-Control: max-age=600\r\n"
+        "Connection: close\r\n\r\n"), fsize);
+  } else {
+    client.printf_P(PSTR(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %u\r\n"
+        "Cache-Control: max-age=600\r\n"
+        "Connection: close\r\n\r\n"), fsize);
+  }
+
+  // 1 KB chunks — fewer LittleFS reads + fewer client.write() calls than
+  // the old 256-byte loop.
+  uint8_t buf[1024];
+  while (f.available() && client.connected()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    int written = client.write(buf, n);
+    if (written < n) break;   // client gone
+  }
+  f.close();
+  delay(80);  // let last write drain
+  client.stop();
+
+  tc_ide_busy = false;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: IDE task done (%u bytes)"), fsize);
+  vTaskDelete(NULL);
+}
+
+static void TC_DLServeIDE(void) {
+  if (tc_ide_busy) {
+    Tinyc->dl_server->send(503, F("text/plain"), F("IDE serve busy"));
+    return;
+  }
+  tc_ide_busy = true;
+  BaseType_t rc = xTaskCreatePinnedToCore(
+      tc_ide_serve_task, "TCIDE", 4096, NULL, 3, NULL, 1);
+  if (rc != pdPASS) {
+    tc_ide_busy = false;
+    Tinyc->dl_server->send(500, F("text/plain"), F("Task spawn failed"));
+    return;
+  }
+  // Note: NOT calling send() — the task writes its own response directly
+  // to the client. This matches the existing tc_download_task pattern.
+}
+
 // Initialize port 82 download server
 static void TC_DLServerInit(void) {
   if (!Tinyc || Tinyc->dl_server) return;  // already initialized
   Tinyc->dl_server = new ESP8266WebServer(TC_DLPORT);
   if (Tinyc->dl_server) {
     Tinyc->dl_server->on(UriGlob("/ufs/*"), HTTP_GET, TC_DLServeFile);
+    Tinyc->dl_server->on("/ide", HTTP_GET, TC_DLServeIDE);
     Tinyc->dl_server->on("/", HTTP_GET, TC_DLRoot);
     Tinyc->dl_server->begin();
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Download server started on port %d"), TC_DLPORT);
@@ -3622,6 +4155,17 @@ void tc_spawn_task_cleanup_slot(uint8_t slot_idx) {
 // Event callback edge-detection flags
 static bool tc_init_done = false;
 static bool tc_wifi_up = false;
+// One-shot for the deferred autoexec spawner. Fires on the first
+// non-paused FUNC_LOOP — at that point every other Tasmota driver's
+// FUNC_INIT has run and peripherals are settled, so user main()
+// (which spawns in tc_vm_task) doesn't race the platform's own
+// init. See TinyCStartAutoexec().
+static bool tc_autoexec_started = false;
+// BootInit() fires per-slot, gated by s->boot_init_pending (set in
+// TinyCStartVM, cleared after dispatch). Scanned in FUNC_LOOP. Kept
+// as an opt-in convenience for users who want hardware init separate
+// from main() — but with the deferred autoexec above, plain main()
+// works without any BootInit/delay workarounds.
 
 bool Xdrv124(uint32_t function) {
   bool result = false;
@@ -3640,9 +4184,86 @@ bool Xdrv124(uint32_t function) {
                    Tinyc->upload_active ||
                    tc_global_pause;
 
+  // Auto-STOP all slots on OTA start — the tc_paused flag above only
+  // suppresses callbacks, but tc_vm_task keeps running main()/TaskLoop()
+  // which hammers SPI/network/heap and frequently hangs the firmware
+  // upload. Detect the 0→active transition for ota_state_flag and call
+  // TinyCStopVM on every loaded slot once, so the OTA writer has full
+  // exclusive access to flash. (We deliberately don't trigger on
+  // restart_flag — normal restarts go through FUNC_SAVE_BEFORE_RESTART
+  // which handles cleanup properly. We also don't trigger on
+  // upload_active — that's our own .tcb upload path, which manages
+  // slot state internally.)
+  static bool tc_ota_was_active = false;
+  bool tc_ota_now = (TasmotaGlobal.ota_state_flag != 0);
+  if (tc_ota_now && !tc_ota_was_active) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: OTA detected — stopping all VM slots"));
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->loaded) {
+        TinyCStopVM(s);
+      }
+    }
+  }
+  tc_ota_was_active = tc_ota_now;
+
   switch (function) {
     case FUNC_LOOP:
       if (tc_paused) { break; }
+      // Deferred autoexec start — one-shot, gated on uptime so we
+      // wait through Wi-Fi/RF coex bring-up. Spawning tc_vm_task at
+      // FUNC_INIT (the historical timing) raced Tasmota's own driver
+      // init AND the Wi-Fi/RF coex phase. main() runs in its own
+      // FreeRTOS task so its serialBegin / i2cBegin / spiBegin would
+      // execute concurrently with platform peripheral init — UART
+      // claim "succeeds" but the GPIO matrix routing gets clobbered,
+      // 0 bytes ever arrive on RX. Same root cause as the historical
+      // 15-second delay() workaround at the top of main().
+      //
+      // Two-stage fix:
+      //   (a) Defer the spawn from FUNC_INIT to FUNC_LOOP — by then
+      //       every other driver's FUNC_INIT is done.
+      //   (b) Additionally wait for `TasmotaGlobal.uptime >=
+      //       TC_AUTOEXEC_MIN_UPTIME` so Wi-Fi/RF coex has had time
+      //       to stabilize. Without (b), main() runs at uptime
+      //       ~250 ms — still within the Wi-Fi bring-up window —
+      //       and serialBegin still silently fails to receive bytes.
+      //       3 s covers a typical Wi-Fi-up window. Override via
+      //       `-DTC_AUTOEXEC_MIN_UPTIME=N` for slow networks.
+      if (!tc_autoexec_started &&
+          TasmotaGlobal.uptime >= TC_AUTOEXEC_MIN_UPTIME) {
+        tc_autoexec_started = true;
+        TinyCStartAutoexec();
+      }
+      // Per-slot BootInit dispatch. `boot_init_pending` is set in
+      // TinyCStartVM and cleared after dispatch. Mutex held across
+      // {check vm.halted, fire callback, clear flag} to serialize
+      // against TaskLoop callbacks running concurrently in the slot's
+      // task (TaskLoop momentarily sets halted=false per iteration).
+      // Note: with the deferred autoexec above, main() itself is the
+      // natural place for hardware init — BootInit is now an opt-in
+      // convenience for users who want to separate it out, not a
+      // workaround for a timing bug.
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TcSlot *s = Tinyc->slots[i];
+        if (!s || !s->loaded || !s->boot_init_pending) continue;
+        if (s->vm.cb_index[TC_CB_BOOT_INIT] < 0) {
+          s->boot_init_pending = false;
+          continue;
+        }
+#ifdef ESP32
+        if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+        if (s->vm.halted && s->vm.error == TC_OK) {
+          tc_current_slot = s;
+          tc_vm_call_callback_id(&s->vm, TC_CB_BOOT_INIT);
+          tc_current_slot = nullptr;
+          s->boot_init_pending = false;
+        }
+#ifdef ESP32
+        if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+      }
       // Poll UDP multicast for incoming variables
       tc_udp_poll();
 #ifdef ESP32
@@ -3675,6 +4296,11 @@ bool Xdrv124(uint32_t function) {
       tc_all_callbacks_id(TC_CB_EVERY_100_MSECOND);
       break;
     case FUNC_EVERY_SECOND:
+      // Boot-loop marker cleanup runs even when paused — the device
+      // is healthy enough to dispatch FUNC_EVERY_SECOND, so we want
+      // to declare the boot a success and clear the marker so future
+      // recovery cycles work.
+      TinyCCheckBootStable();
       if (tc_paused) { break; }
       // Call user's EverySecond() callback on all active slots
       tc_all_callbacks_id(TC_CB_EVERY_SECOND);
@@ -3854,8 +4480,17 @@ bool Xdrv124(uint32_t function) {
       WebServer_on(PSTR("/tc"), HandleTinyCPage);
       Webserver->on("/tc_upload", HTTP_POST, HandleTinyCUploadDone, HandleTinyCUpload);
       Webserver->on("/tc_upload", HTTP_OPTIONS, HandleTinyCUploadCORS);
-      WebServer_on(PSTR("/tc_api"), HandleTinyCApi);
+      // CORS preflight handler MUST be registered BEFORE the HTTP_ANY catch-all
+      // (HandleTinyCApi defaults to HTTP_ANY = 255 which matches every method
+      // including OPTIONS). Arduino-ESP32 WebServer iterates handlers in
+      // registration order, first-match-wins. Without this swap, OPTIONS
+      // preflight requests for /tc_api flow into HandleTinyCApi which then
+      // tries to execute the `cmd=readfile` etc. and returns the file body
+      // — Safari sees a non-empty preflight response and rejects the
+      // subsequent GET as a CORS failure, surfacing in the IDE as
+      // "Error: Load failed" on the "Load from Device" button.
       Webserver->on("/tc_api", HTTP_OPTIONS, HandleTinyCApiCORS);
+      WebServer_on(PSTR("/tc_api"), HandleTinyCApi);
       WebServer_on(PSTR("/tc_ui"), HandleTinyCUI);
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
       WebServer_on(PSTR("/tc_cam"), HandleTinyCCam);

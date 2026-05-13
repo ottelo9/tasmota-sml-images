@@ -1775,7 +1775,33 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
       }
 
       if (mp->spos >= 3) {
-        uint32_t mlen = mp->sbuff[2] + 5;
+        // Modbus RTU response framing — the on-wire length depends on FC:
+        //   FC01/02/03/04 (reads):       addr fc bc data..  crcL crcH  → bc + 5
+        //   FC05/06       (write single): addr fc reg×2 val×2 crcL crcH → 8 fixed
+        //   FC15/16       (write multi echo): addr fc reg×2 qty×2 crcL crcH → 8 fixed
+        //   exception     (FC | 0x80, ec): addr (fc|0x80) ec crcL crcH    → 5 fixed
+        //
+        // Older code used `bc + 5` for ALL responses, treating sbuff[2] as a
+        // byte count. For FC03/04 reads that's correct; for write-FC echoes
+        // it interprets the high byte of the echoed register/coil address as
+        // a byte count, computes the wrong frame length, and either flushes
+        // 5 bytes early (leaving 3 bytes of next frame's prefix in the
+        // receive buffer = misaligned subsequent decode) or waits forever
+        // for bytes that never arrive (when reg_hi >= 4 → mlen ≥ 9).
+        //
+        // Without this special case writes worked only by accident — the
+        // post-write read happened to recover after a few cycles when the
+        // stale bytes finally got walked past. With coil/discrete-input
+        // FC01/FC02 reads coexisting with FC05 writes it broke loudly.
+        uint8_t fc = mp->sbuff[1];
+        uint32_t mlen;
+        if (fc & 0x80) {
+          mlen = 5;             // exception response (any FC|0x80)
+        } else if (fc == 0x05 || fc == 0x06 || fc == 0x0F || fc == 0x10) {
+          mlen = 8;             // write-FC echoes: fixed length, no byte_count
+        } else {
+          mlen = mp->sbuff[2] + 5;  // FC01-04 reads: byte_count is sbuff[2]
+        }
         if (mlen > mp->sbsiz) mlen = mp->sbsiz;
         if (mp->spos >= mlen) {
 #ifdef MODBUS_DEBUG
@@ -2648,6 +2674,15 @@ void SML_Decode(uint8_t index) {
               uint8_t shift = *mp&7;
               ebus_dval = (uint32_t)ebus_dval >> shift;
               ebus_dval = (uint32_t)ebus_dval & 1;
+              // Keep mbus_dval in sync so the @i-index path (line below) also
+              // sees the bit-extracted value. Without this, descriptors that
+              // combine bit-extract with mbus index filter, e.g.
+              // `010101uu@b0:i6:1` for FC01 coil reads, take dval=mbus_dval
+              // = the raw response byte (0x11 for "coils 0+4 set"), not the
+              // single bit. The @i path is the only way to dispatch reads
+              // across multiple coil/discrete-input requests in the same
+              // descriptor, so this combination matters.
+              mbus_dval = ebus_dval;
               mp+=2;
             }
             if (*mp == 'i') {
@@ -2721,7 +2756,22 @@ nextsect:
 
 //"1-0:1.8.0*255(@1," D_TPWRIN ",kWh," DJ_TPWRIN ",4|"
 void SML_Immediate_MQTT(const char *mp,uint8_t index,uint8_t mindex) {
-  if (!sml_globs.dvalid[index]) return;
+  // NOTE: SML_Immediate_MQTT is by definition called immediately after a
+  // fresh value has just been parsed and stored in meter_vars[index].
+  // The "dvalid" flag is for the *periodic* TelePeriod path (SML_Show)
+  // which needs to suppress slots that haven't seen any data yet — not
+  // here. PR #24587 added an early-bail `if (!dvalid) return;` here
+  // which was wrong:
+  //   • the math `@`-chain branch (2094) sets dvalid AFTER calling
+  //     this function → first emission lost on every meter
+  //   • the Modbus/eBus/PZEM/VBus/raw value branch never sets dvalid
+  //     in this code path at all → those meters lost ALL immediate-MQTT
+  //     emissions
+  //   • encrypted SML decoders feed SML_Decode → match fires →
+  //     SML_Immediate_MQTT, but encrypted descriptors may not hit the
+  //     same dvalid-set sites that PR #24587 assumed
+  // SML_Show (TelePeriod JSON) keeps its dvalid gate — that's correct
+  // since it fires regardless of whether new data arrived in this cycle.
 
   char tpowstr[32];
   char jname[24];
@@ -3368,6 +3418,15 @@ void SML_Init(void) {
   sml_globs.ready = false;
 
   if (!bitRead(Settings->rule_enabled, 0)) {
+    // Long-standing guard from the Scripter-era SML driver: meter setup
+    // only runs when Rule1 is enabled. With USE_UFILESYS-only builds
+    // there's no semantic reason for the gate, but the check is still
+    // here. Silent return was the historical behaviour and confused
+    // users when /sml_meter.def was on disk but the driver never loaded
+    // it (no log line, no error in `sensor53 r` reply — just nothing).
+    // Surface the cause so a fresh device (Rule1 = 0 after factory
+    // reset / reflash) gives a clear diagnostic instead.
+    AddLog(LOG_LEVEL_INFO, PSTR("SML: init skipped - because disabled (Settings->rule_enabled bit 0 == 0)"));
     return;
   }
 

@@ -6,23 +6,28 @@ Die fertigen Images findet ihr im Release Bereich. Einfach das korrekte Image f�
 Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/). Welche Tasmota Features aktiviert/deaktiviert sind findet ihr im Release.  
   
 [Download Statistik](https://tooomm.github.io/github-release-stats/?username=ottelo9&repository=tasmota-sml-images)  
-[ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
+[ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
 ### Welches Image (Firmware Binary) für welchen ESP?
+
+**Wichtig — Varianten-Suffix:** Jedes Image gibt es (bis auf Berry und ESP8266 1M) in zwei Varianten:
+- `_tas` → klassischer **Tasmota-Scripter** + Google Charts (wie bisher)
+- `_tc`  → **TinyC VM** + Browser-IDE (kein Scripter, Meter-Descriptor unter `/sml_meter.def`, SML wird im TinyC-Programm mit `tasm_rule = 1;` aktiviert)
+
 | Imagename | Beschreibung |
 | ------------- | ------------- |
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
-| tasmota32_ottelo       | Generic ESP32, keine Variante, mit Ethernet Support |
-| tasmota32berry_ottelo  | Generic ESP32, wie tasmota32_ottelo aber mit Berry Scripting Support |
-| tasmota32x_ottelo      | ESP32 Variante z.B. c3, s3 (solo1, s3 mit Ethernet Support) |
+| tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
+| tasmota32berry_ottelo_tas        | Generic ESP32 mit Berry Scripting Support (nur Scripter-Variante, kein TinyC) |
+| tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4 (solo1, s3 mit Ethernet Support) |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! In den entsprechenden komprimiert Ordnern sind die Scripte ohne Kommentare, sie können 1:1 kopiert werden. |
-| tasmota1m_ottelo         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf |
-| tasmota4m_ottelo         | ESP mit 4M+ Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter) und für Steckdosen mit Energiemessung (mit 4M Speicher). |
-| tasmota1m_energy_ottelo  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Web-Upgrade nur über tasmota-minimal! |
-| tasmota1m_shelly_ottelo  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Für Scripte siehe, [ESP8266 Scripte - Ordner komprimiert](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
-| tasmota-minimal          | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
+| tasmota1m_ottelo_tas         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf). Nur Scripter (kein UFILESYS → kein TinyC). |
+| tasmota4m_ottelo_tas / _tc   | ESP mit 4M+ Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter) und für Steckdosen mit Energiemessung (mit 4M Speicher). |
+| tasmota1m_energy_ottelo_tas  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Nur Scripter. Web-Upgrade nur über tasmota-minimal! |
+| tasmota1m_shelly_ottelo_tas  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Nur Scripter. Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Für Scripte siehe, [ESP8266 Scripte - Ordner komprimiert](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
+| tasmota-minimal              | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
 Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. Im ZIP-Archiv für den ESP8266 befinden sich alle Varianten gesammelt im bin.gz Format. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden. Zum erstmaligen Flashen via USB-Flasher muss die .gz entpackt werden.  
 
@@ -38,14 +43,70 @@ Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas). Das alles haben wir dem Tasmota Script Entwickler [gemu2015](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/scripting/shelly_emu_script.tas) zu verdanken, der es zusammen mit Kalle entwickelt und getestet hat! Siehe auch [im Forum](https://forum.creationx.de/forum/index.php?thread/1095-d0-z%C3%A4hler-sml-auslesen-mit-tasmota/&pageNo=110). Gemu2015 hat ein Testscript zusammen mit Kalle erstellt. Ich habe die Teile aus dem Script entnommen, optimiert und eigene Scripte entworfen [siehe hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
 ## TinyC - Alternative zum Scripting/Berry (ESP32 / ESP8266 4M+)
-- **NEU: TinyC** von [gemu2015](https://github.com/gemu2015) hinzugefügt (Script ist weiterhin mit drin) !! Eine sehr gute und schnelle Alternative zum Scripting/Berry. Ich könnt nun eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
+- **TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry. Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
+
+**Image-Variante wählen:** Ab dieser Release gibt es pro Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. Berry und ESP8266 1M gibt es weiterhin nur als `_tas`.
+
+**SML in `_tc`-Builds aktivieren:** Im TinyC-Programm einmalig `tasm_rule = 1;` setzen (in `main()` oder `BootInit()`). Das öffnet den SML-Init-Gate (`Settings->rule_enabled` Bit 0), der Treiber lädt dann den Meter-Descriptor aus `/sml_meter.def`. Boot-festes Pattern siehe [`marstek_emu.tc`](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/examples/marstek_emu.tc):
+```c
+persist watch int sml_activ;   // Checkbox in der WebUI
+
+int main() {
+    if (sml_activ != tasm_rule) {
+        tasm_rule = sml_activ;   // Sync beim Boot
+    }
+    return 0;
+}
+```
+
 => hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
 => Damit die IDE funktioniert müsst ihr die [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tasmota/tinyc/tinyc_ide.html.gz) via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
 <img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
 <img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
 
+### Partitionslayout für TinyC-Images (4 MB ESP32)
+TinyC speichert IDE (~150 KB), Source (`.tc`), Bytecode (`.tcb`), persist-Daten (`.pvs`) und ggf. `/sml_meter.def` im Filesystem. Default-Layout (`app2880k_fs320k`) hat nur 320 KB FS — bei TinyC wird's schnell eng. Gleichzeitig ist die TinyC-Firmware ~120 KB schlanker als Scripter+Charts, der App-Bereich kann also kleiner sein.
+
+Deswegen nutzen die `_tc`-Images auf 4 MB-Boards das Layout [`esp32_partition_app1856k_fs1344k.csv`](https://github.com/arendst/Tasmota/blob/development/partitions/esp32_partition_app1856k_fs1344k.csv): 1856 KB app0 + 1344 KB FS (statt 2880 KB / 320 KB). Siehe auch [Discussion #37](https://github.com/ottelo9/tasmota-sml-images/discussions/37) und [Tasmota Safeboot-Doku](https://tasmota.github.io/docs/Safeboot/).
+
+| Image | Partition |
+|---|---|
+| `tasmota32_ottelo_tc`, `tasmota32c3_ottelo_tc`, `tasmota32c6_ottelo_tc`, `tasmota32s2_ottelo_tc`, `tasmota32solo1_ottelo_tc` | `app1856k_fs1344k` (1024 KB mehr FS) |
+| `tasmota32s3_ottelo_tc` | Default (16 MB Flash: `app3904k_fs11584k`) |
+| `tasmota32p4_ottelo_tc` | Default (boardabhängig) |
+| `tasmota4m_ottelo_tc` (ESP8266) | eigenes Schema |
+| alle `_tas` | Default belassen — Scripter+Charts+HA+InfluxDB+MQTT-TLS würde 1856 KB sprengen |
+
+#### Partitionen ohne Factory-Flash umstellen — `chkpt`
+Der **gemu-Fork** (auf dem die ottelo-Images basieren) hat einen Laufzeit-Partition-Manager eingebaut — du brauchst kein USB-Kabel und keinen Factory-Flash, um das Layout zu ändern. Im TinyC-Build heißt der Befehl `TinyCChkpt`, in Builds ohne TinyC `chkpt`.
+
+**Befehle:**
+| Befehl | Wirkung |
+|---|---|
+| `TinyCChkpt` | Aktuelles Partition-Layout anzeigen |
+| `TinyCChkpt p` | Auto-Pack: app0 auf Firmware-Größe + ~200 KB Overhead schrumpfen, Rest an FS |
+| `TinyCChkpt p 1856` | app0 explizit auf 1856 KB setzen, Rest an FS (FS wird formatiert!) |
+| `TinyCChkpt p 2880` | Zurück zum Default-Layout (wenn die laufende Firmware reinpasst) |
+
+**Praktischer Workflow** (Lesegerät im Einsatz, kein Aufschrauben):
+1. Files via WebUI → "Manage File System" sichern (Settings.json, Skripte, `/sml_meter.def`, `tinyc_ide.html.gz`).
+2. OTA-Upgrade auf das neue `_tc`-Image (`.bin.gz` über "Firmware Upgrade → Use file upload"). Das überschreibt nur app0, Partitionen bleiben unverändert.
+3. Nach dem Reboot in der Konsole: `TinyCChkpt p 1856` → packt um, formatiert FS, rebootet automatisch.
+4. Files wieder hochladen.
+
+**Voraussetzungen / Stolperfallen:**
+- **Safeboot-Partition muss existieren** (Recovery-Pfad). Ohne Safeboot lehnt `chkpt p` ab. Bei allen ottelo-ESP32-Builds ist Safeboot dabei.
+- **Neue app0 ≥ laufende Firmware.** Sonst meldet der Befehl `requested size too small for current firmware!` und macht nichts.
+- **FS wird IMMER formatiert** bei `chkpt p`, auch wenn die Tabelle sich nicht ändert ("nothing to do" → trotzdem `LittleFS.format()`). Backup vorher ist Pflicht.
+- Nach `chkpt p` ist ein **Reboot** nötig, sonst zeigt die Info-Seite noch den alten FS-Wert (Tasmota cached `LittleFS.totalBytes()` beim Boot).
+
+**Factory-Flash** brauchst du nur noch, wenn:
+- Das Image zu groß für die aktuell konfigurierte app0 ist,
+- Kein Safeboot vorhanden ist,
+- Du das Layout sauber neu aufsetzen willst (z.B. nach einem unsauberen `chkpt`-Abbruch).
+
 ## Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266
-In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdo.de zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
+In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdofree.com zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
 Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben).
@@ -56,7 +117,7 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/boards/`esp32s3-qio.json` <- (optional) für ESP32-S3 Image (siehe `platformio_tasmota_cenv.ini`) ohne PSRAM Support, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32)
 
 Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
-[https://ottelo.jimdo.de](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
+[https://ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
 ### Kompilieren
 Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben: 
@@ -66,25 +127,123 @@ Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die wer
 Um alle gleichzeitig zu erstellen:  
 `platformio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot`
 
-Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output):  
+Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
 
-ESP32:  
-`platformio run -e tasmota32_ottelo`      (Generic ESP32)  
-`platformio run -e tasmota32berry_ottelo`      (Generic ESP32 + Berry)  
-`platformio run -e tasmota32s2_ottelo`  
-`platformio run -e tasmota32s3_ottelo`  
-`platformio run -e tasmota32c3_ottelo`  
-`platformio run -e tasmota32c6_ottelo`  
-`platformio run -e tasmota32solo1_ottelo` (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
+ESP32 (Scripter-Variante `_tas`):  
+`platformio run -e tasmota32_ottelo_tas`        (Generic ESP32)  
+`platformio run -e tasmota32berry_ottelo_tas`   (Generic ESP32 + Berry, nur Scripter)  
+`platformio run -e tasmota32s2_ottelo_tas`  
+`platformio run -e tasmota32s3_ottelo_tas`  
+`platformio run -e tasmota32c3_ottelo_tas`  
+`platformio run -e tasmota32c6_ottelo_tas`  
+`platformio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
+`platformio run -e tasmota32p4_ottelo_tas`  
+
+ESP32 (TinyC-Variante `_tc`, kein Berry):  
+`platformio run -e tasmota32_ottelo_tc`  
+`platformio run -e tasmota32s2_ottelo_tc`  
+`platformio run -e tasmota32s3_ottelo_tc`  
+`platformio run -e tasmota32c3_ottelo_tc`  
+`platformio run -e tasmota32c6_ottelo_tc`  
+`platformio run -e tasmota32solo1_ottelo_tc`  
+`platformio run -e tasmota32p4_ottelo_tc`  
 
 ESP8266:  
-`platformio run -e tasmota1m_ottelo`        ( = 1M Flash)  
-`platformio run -e tasmota1m_energy_ottelo` ( = 1M Flash, Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)  
-`platformio run -e tasmota1m_shelly_ottelo` ( = 1M Flash, Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
-`platformio run -e tasmota4m_ottelo`        (>= 4M Flash)  
+`platformio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
+`platformio run -e tasmota1m_energy_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)  
+`platformio run -e tasmota1m_shelly_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
+`platformio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, Scripter)  
+`platformio run -e tasmota4m_ottelo_tc`         (>= 4M Flash, TinyC)  
 
-Um alle gleichzeitig zu erstellen:  
-`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("ottelo")) | select(test("ottelo_base") | not) | sub("env:"; "-e ")')`
+Um alle gleichzeitig zu erstellen (Bash + jq):  
+`platformio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')`
+
+PowerShell:  
+```powershell
+$envs = pio project config --json-output | jq -r '.[][0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")'
+pio run ($envs -split "`n")
+```
+
+### Compile-Zeit reduzieren mit ccache (optional, aber sehr empfohlen)
+Wenn ihr mehrere Varianten hintereinander baut (`_tas` + `_tc`, oder mehrere Plattformen), kompiliert PlatformIO jede env komplett neu — der eingebaute `build_cache_dir` (PIO's eigener Object-Cache) greift nur innerhalb derselben env, weil andere `-D`-Flags andere Object-Hashes erzeugen.
+
+**ccache** ergänzt das als zweite Stufe im **Preprocessor-Mode**: Files wie lwip/freertos/lvgl/esp32-arduino-core, die `OTTELO_VARIANT_*` gar nicht sehen, haben in beiden Builds identischen Preprocessor-Output → Cache-Hit. Bei einem Build-Paar `_tas` + `_tc` derselben Plattform werden typisch ~95 % der Files aus dem ccache wiederverwendet. Spart bei kompletten Multi-Variant-Builds 60–75 % Wallclock-Zeit.
+
+**Setup (einmalig):**
+
+1. ccache installieren:
+   - Linux/Gitpod/VMware-Ubuntu: `sudo apt-get install ccache`
+   - macOS: `brew install ccache`
+   - Windows: `choco install ccache` (alternativ Scoop/MSYS2)
+
+2. Cache-Größe und sloppiness konfigurieren — **ohne diese Settings bleibt die Hit-Rate bei 0 %**, weil Tasmota `__DATE__` / `__TIME__` / Build-Counter in den Sources hat:
+   ```bash
+   ccache -M 4G
+   ccache --set-config sloppiness=time_macros,pch_defines,include_file_mtime,include_file_ctime,locale,system_headers
+   ccache --set-config hash_dir=false
+   ccache --set-config compiler_check=content
+   ```
+   Was die einzeln machen:
+   - `time_macros` → `__DATE__`/`__TIME__` werden beim Hashing ignoriert
+   - `pch_defines` → Header-Defines beeinflussen Hash nicht künstlich
+   - `include_file_mtime,include_file_ctime` → Header-Zeitstempel werden ignoriert
+   - `hash_dir=false` → Build-Verzeichnis-Pfad geht nicht in den Hash (essenziell für `_tas`/`_tc`-Cross-Hits)
+   - `compiler_check=content` → Compiler-Binary-Hash statt mtime (kein Miss nach PIO-Update)
+
+3. Settings verifizieren:
+   ```bash
+   ccache --get-config sloppiness
+   ccache --get-config hash_dir
+   ccache --get-config compiler_check
+   ```
+
+4. Die [`ccache_wrapper.py`](ccache_wrapper.py) aus diesem Repo mit ins Tasmota-Root kopieren (neben `platformio.ini`).
+
+5. In `platformio_tasmota_cenv.ini` ist das Script im `[env:tasmota_ottelo_base]` als Pre-Hook eingetragen und wird von allen `_ottelo_tas`/`_tc`-Envs geerbt — also nichts mehr zu tun.
+
+**Funktionscheck nach einem Build:**
+
+```bash
+ccache -s
+```
+
+Erwartete Zeilen nach dem ersten Build:
+```
+Cacheable calls: 384 / 384 (100 %)
+Hits:              0 / 384 (0 %)
+Misses:          384 / 384 (100 %)
+```
+
+Erwartete Zeilen nach einem zweiten Build (andere Variante derselben Plattform, z.B. `_tc` nach `_tas`):
+```
+Cacheable calls: 764 / 764 (100 %)
+Hits:            380 / 764 (~50 %)       ← die ~95% Cache-Hits aus dem TC-Build
+  Preprocessed:  380 / 380 (100 %)
+Misses:          384 / 764
+```
+
+Im Build-Output erscheint außerdem direkt am Anfang:
+```
+[ccache_wrapper] aktiv: /usr/bin/ccache
+[ccache_wrapper] patched: CCCOM, CXXCOM, SHCCCOM, SHCXXCOM
+```
+
+**Wenn der Cache leer bleibt / 0 % Hits:**
+
+- Im Output `[ccache_wrapper]`-Zeile checken — wenn die fehlt, läuft das Pre-Script nicht (Pfad/extra_scripts-Vererbung prüfen).
+- `ccache --get-config sloppiness` zeigen lassen — wenn `time_macros` fehlt, alle Misses durch `__DATE__`/`__TIME__`.
+- Für einen sauberen Cross-Env-Test (PIO-Cache stört sonst):
+  ```bash
+  rm -rf .cache .pio/build
+  ccache -C && ccache -z
+  pio run -e tasmota32c3_ottelo_tas       # Build #1: füllt ccache
+  pio run -e tasmota32c3_ottelo_tc        # Build #2: zieht aus ccache
+  ccache -s
+  ```
+
+**Hinweis zu PIO's eigenem Cache (`.cache/` im Tasmota-Root):**
+
+Tasmota's `platformio.ini` setzt `build_cache_dir = .cache` — das ist PIO's eigener Object-Cache (Stufe 1), unabhängig von ccache (Stufe 2). PIO-Cache greift bei **gleicher Env** (z.B. zweiter Build derselben `_tc`-Variante), ccache zusätzlich bei **Env-Wechsel** (`_tas` ↔ `_tc`). Beide aktiv lassen — sie ergänzen sich.
 
 Linux Script um danach alle Images in zip-Archive zu packen:
 [make_images_zip.zip](https://github.com/user-attachments/files/24106037/make_images_zip.zip)

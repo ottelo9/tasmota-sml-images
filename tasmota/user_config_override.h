@@ -39,30 +39,39 @@
  ******************************************************************************************************
  * Diese Features/Treiber (defines) habe ich für meine ESP32 / ESP8266 Tasmota Images/Firmware verwendet, die
  * ich auf ottelo.jimdo.de zum Download anbiete. Diese Datei kann euch auch dabei helfen ein eigenes
- * angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP 
+ * angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP
  * ein Stromzähler mit einem Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion
  * (SonOff, Gosund, Shelly) habt und ihr Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt.
- * Andernfalls verwendet einfach die originalen Images. Diese Datei in euer Tasmota Verzeichnis 
+ * Andernfalls verwendet einfach die originalen Images. Diese Datei in euer Tasmota Verzeichnis
  * "tasmota\user_config_override.h" kopieren. Die andere Datei "platformio_tasmota_cenv.ini" mit meinen
  * Varianten kommt ins Hauptverzeichnis von Tasmota. Eine detaillierte Anleitung findet ihr auf github.
  *
+ * Es gibt für jede Plattform (außer Berry und ESP8266-1M) zwei Varianten:
+ *   _tas  → klassischer Tasmota-Scripter (Tasmota Scripting Language, Google Charts)
+ *   _tc   → TinyC VM + Browser-IDE (https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc)
+ *
  * Zum Kompilieren unter Gitpod den passenden Befehl in die Console eingeben:
- * ESP32:
- * platformio run -e tasmota32_ottelo      (Generic ESP32)
- * platformio run -e tasmota32berry_ottelo (Generic ESP32 mit Berry Support)
- * platformio run -e tasmota32s2_ottelo
- * platformio run -e tasmota32s3_ottelo
- * platformio run -e tasmota32c3_ottelo
- * platformio run -e tasmota32c6_ottelo
- * platformio run -e tasmota32solo1_ottelo (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)
+ * ESP32 (jeweils _tas oder _tc):
+ * platformio run -e tasmota32_ottelo_tas        (Generic ESP32, Scripter)
+ * platformio run -e tasmota32_ottelo_tc         (Generic ESP32, TinyC)
+ * platformio run -e tasmota32berry_ottelo_tas   (ESP32 mit Berry, nur Scripter)
+ * platformio run -e tasmota32s2_ottelo_tas / _tc
+ * platformio run -e tasmota32s3_ottelo_tas / _tc
+ * platformio run -e tasmota32c3_ottelo_tas / _tc
+ * platformio run -e tasmota32c6_ottelo_tas / _tc
+ * platformio run -e tasmota32solo1_ottelo_tas / _tc   (ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)
+ * platformio run -e tasmota32p4_ottelo_tas / _tc
  * Mehr Infos bzgl. ESP32 Versionen: https://tasmota.github.io/docs/ESP32/#esp32_1
- * 
+ *
  * ESP8266:
- * platformio run -e tasmota1m_ottelo        ( = 1M Flash)
- * platformio run -e tasmota1m_energy_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Für SonOff POW (R2) / Gosund EP2 SonOff Dual R3 v2 / Nous A1T)
- * platformio run -e tasmota1m_shelly_ottelo ( = 1M Flash, Update nur über minimal da Img zu groß. Mit Shelly Pro 3EM / EcoTracker Emulation als Meter für smarte Akkus wie z.B. Marstek Venus / Jupiter)
- * platformio run -e tasmota4m_ottelo        (>= 4M Flash)
- * 
+ * platformio run -e tasmota1m_ottelo_tas        (1M Flash, nur Scripter)
+ * platformio run -e tasmota1m_energy_ottelo_tas (1M, Update nur über minimal. SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)
+ * platformio run -e tasmota1m_shelly_ottelo_tas (1M, Update nur über minimal. Mit Shelly Pro 3EM / EcoTracker Emulation für Marstek Venus / Jupiter)
+ * platformio run -e tasmota4m_ottelo_tas / _tc  (>= 4M Flash)
+ *
+ * Alle Images bauen (Bash + jq):
+ *   pio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')
+ *
  * für weitere ESPs siehe: https://github.com/arendst/Tasmota/blob/development/platformio_override_sample.ini bei default_envs
 \*****************************************************************************************************/
 
@@ -148,146 +157,197 @@
 
 //----------------------------------------------------------------------------
 
-// (3) Aktivierte zusätzliche Features (SML, Scripting, TCP, Ethernet, ...)
+// (3) Aktivierte zusätzliche Features (SML, Scripter ODER TinyC, TCP, Ethernet, ...)
+
+//-- Variant-Selektoren (gesetzt via build_flags in platformio_tasmota_cenv.ini):
+//--   -DOTTELO_VARIANT_TAS → klassischer Tasmota-Scripter
+//--   -DOTTELO_VARIANT_TC  → TinyC VM + Browser-IDE (KEIN Scripter)
+//-- ESP8266 1M (alle drei Varianten) und Berry haben nur _tas.
+#if !defined(OTTELO_VARIANT_TAS) && !defined(OTTELO_VARIANT_TC)
+  #error "OTTELO_VARIANT_TAS oder OTTELO_VARIANT_TC muss in build_flags gesetzt sein"
+#endif
+#if defined(OTTELO_VARIANT_TAS) && defined(OTTELO_VARIANT_TC)
+  #error "OTTELO_VARIANT_TAS und OTTELO_VARIANT_TC schliessen sich gegenseitig aus"
+#endif
 
 //-- Stack size erhöhen (Empfehlung: seit Core3 wird mehr benötigt)
 #undef SET_ESP32_STACK_SIZE
 #define SET_ESP32_STACK_SIZE (12 * 1024)
 
-//-- Max String Size: default 255. Wird nun aber im Script mit >D xx definiert !
-//#define SCRIPT_MAXSSIZE 128
-
-//-- 4096 statt 256 bytes für Variablennamen und größere Arrays (24h Diagramm)
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
-  #define SCRIPT_LARGE_VNBUFF
-  #define MAX_ARRAY_SIZE 2000
-#endif
-
-//-- Skriptgröße (max Anzahl an Zeichen) https://tasmota.github.io/docs/Scripting-Language/#script-buffer-size
-//-- Via Console Command "scriptsize N" in Tasmota änderbar. N = 1000 -UFSYS_SIZE.
-//-- ESP8266 1M Flash
-#if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) )
-  #define USE_EEPROM
-  #undef EEP_SCRIPT_SIZE
-  #if ( defined(TASMOTA1M_SHELLY_OTTELO) )
-    #define EEP_SCRIPT_SIZE 4096
-  #else
-    #define EEP_SCRIPT_SIZE 8192
-  #endif
-#else
-//-- ESP8266 4M+ Flash / ESP32
-  #define USE_SCRIPT_FATFS_EXT //https://tasmota.github.io/docs/Scripting-Language/#extended-commands-09k-flash
+//-- Filesystem (für SML-Meter-Files, Scripte, TinyC-Bytecode, TinyC-IDE)
+//-- ESP8266 1M hat kein UFILESYS — dort nutzt der Scripter EEPROM (siehe TAS-Block).
+#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
   #define USE_UFILESYS
   #undef UFSYS_SIZE
   #if defined(TASMOTA4M_OTTELO)
-    #define UFSYS_SIZE 8192  //ESP8266 +4M
+    #define UFSYS_SIZE 8192   //ESP8266 4M+
   #else
-    #define UFSYS_SIZE 16384 //ESP32
+    #define UFSYS_SIZE 16384  //ESP32
   #endif
 #endif
 
-//-- SML, Script, Google Chart Support und Home Assistant
-#define USE_SCRIPT        //(+36k code, +1k mem)
+//-- SML (in beiden Varianten — beim _tc liegt der Meter-Descriptor unter /sml_meter.def)
 #define USE_SML_M
 #define USE_SML_CRC       //enables CRC support for binary SML. Must still be enabled via line like "1,=soC,1024,15". https://tasmota.github.io/docs/Smart-Meter-Interface/#special-commands
-#undef USE_RULES          //USE_SCRIPT & USE_RULES can't both be used at the same time
-#define USE_GOOGLE_CHARTS
-#define LARGE_ARRAYS
-#define USE_SCRIPT_WEB_DISPLAY
-#define USE_CW_CALC //Kalenderwochen via Variable cw
+#define USE_SML_AUTHKEY   //selten genutzt, M,=so5
+
+//-- Home Assistant + HTTPS-Client (gemeinsam)
 #define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
 #define USE_WEBCLIENT_HTTPS //für HA benötigt
-#define USE_HTML_CALLBACK //für Smartmeter Descriptor dropdown list smlpd()
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
-  #define USE_ANGLE_FUNC //~2KB
-  #define USE_FEXTRACT //~8KB cts()
-  //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc Nur für ESPs mit FileSystem
-  #define USE_TINYC           // Enable TinyC VM (XDRV_124)
-  #define USE_TINYC_IDE       // Enable self-hosted browser IDE (requires USE_UFILESYS)
-#endif
-
-//-- enables authentication, this is not needed by most energy meters. M,=so5
-#define USE_SML_AUTHKEY
 #define USE_TLS
 
-//-- Software Serial für ESP32 (nur RX), Pin mit dem Zeichen '-' in der SML Sektion definieren (bei mehr als 2/3-Leseköpfen, je nach ESP32 Variante)
-//-- Optional: Serielle Schnittstelle (RX/TX RS232) im Script verwenden
-//-- Optional: Full Webpage (für Untermenüs/Diagramme)
-//-- TinyC !! Die schnelle gute Alternative zum Scripting. C-Code direkt in der Tasmota-TinyC IDE programmieren und ausführen!
+//-- Software Serial / MQTT-TLS / InfluxDB — nur ESP32 (gemeinsam _tas + _tc)
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
-  #define USE_ESP32_SW_SERIAL
-  #define USE_SCRIPT_SERIAL //3KB
-  #define SCRIPT_FULL_WEBPAGE //1KB
-  #define USE_MQTT_TLS //3KB
-  #define USE_INFLUXDB //6KB
-  //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc Nur für ESPs mit FileSystem (ich habe es nur für ESP32 aktiviert)
-  #define USE_TINYC           // Enable TinyC VM (XDRV_124)
-  #define USE_TINYC_IDE       // Enable self-hosted browser IDE (requires USE_UFILESYS)
+  #define USE_ESP32_SW_SERIAL //Pin mit '-' in der SML/TinyC Konfiguration definieren
+  #define USE_MQTT_TLS        //3KB
+  #define USE_INFLUXDB        //6KB
 #endif
 
-//-- Optional: ESP32 WT32_ETH01 (Ethernet LAN Modul)
+//-- Ethernet (WT32-ETH01) - gemeinsam
 #if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32P4_OTTELO) )
-  #define USE_ETHERNET          // Add support for ethernet (+20k code)
+  #define USE_ETHERNET          //Add support for ethernet (+20k code)
   #define USE_WT32_ETH01
   #define ETH_TYPE          0
   #define ETH_ADDRESS       0
   #define ETH_CLKMODE       3
 #endif
 
-//-- Optional: TCP-Server Script Support
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
-  #define USE_SCRIPT_TCP_SERVER
-  #define USE_SCRIPT_TASK
-#endif
 
-//-- Optional: shellypro3em emulieren (z.B. für Marstek Venus E)
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
-  #define USE_SCRIPT_MDNS //14KB !!
-#endif
+//=============================================================================
+// SCRIPTER-Variante (klassische Tasmota Scripting Language + Google Charts)
+//=============================================================================
+#ifdef OTTELO_VARIANT_TAS
 
-//-- Optional: globale Variablen im Script + shellypro3em emulieren (z.B. für Marstek Venus E)
-#define USE_SCRIPT_GLOBVARS //2KB
+  //-- Max String Size: default 255. Wird nun aber im Script mit >D xx definiert!
+  //#define SCRIPT_MAXSSIZE 128
 
-//-- Optional: >J Sektion aktivieren https://tasmota.github.io/docs/Scripting-Language/#j
-#define USE_SCRIPT_JSON_EXPORT //0KB
+  //-- 4096 statt 256 bytes für Variablennamen und größere Arrays (24h Diagramm) — nur ESP32
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
+    #define SCRIPT_LARGE_VNBUFF
+    #define MAX_ARRAY_SIZE 2000
+  #endif
 
-//-- Scriptliste
-#if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
-  #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/script-list-menu/scripts/"
-  #define SCRIPT_LIST "scripts.json"
-#endif
+  //-- Skriptgröße — ESP8266 1M nutzt EEPROM, größere Targets Filesystem
+  #if ( defined(TASMOTA1M_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA1M_SHELLY_OTTELO) )
+    #define USE_EEPROM
+    #undef EEP_SCRIPT_SIZE
+    #if ( defined(TASMOTA1M_SHELLY_OTTELO) )
+      #define EEP_SCRIPT_SIZE 4096
+    #else
+      #define EEP_SCRIPT_SIZE 8192
+    #endif
+  #else
+    #define USE_SCRIPT_FATFS_EXT //https://tasmota.github.io/docs/Scripting-Language/#extended-commands-09k-flash
+  #endif
+
+  //-- Scripter + Charts + Web-Display
+  #define USE_SCRIPT             //(+36k code, +1k mem)
+  #undef USE_RULES               //USE_SCRIPT & USE_RULES can't both be used at the same time
+  #define USE_GOOGLE_CHARTS
+  #define LARGE_ARRAYS
+  #define USE_SCRIPT_WEB_DISPLAY
+  #define USE_CW_CALC            //Kalenderwochen via Variable cw
+  #define USE_HTML_CALLBACK      //für Smartmeter Descriptor dropdown list smlpd()
+
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
+    #define USE_ANGLE_FUNC       //~2KB
+    #define USE_FEXTRACT         //~8KB cts()
+  #endif
+
+  //-- Serial / TCP-Server / Task — nur ESP32
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA4M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
+    #define USE_SCRIPT_SERIAL    //3KB
+    #define SCRIPT_FULL_WEBPAGE  //1KB
+    #define USE_SCRIPT_TCP_SERVER
+    #define USE_SCRIPT_TASK
+  #endif
+
+  //-- shellypro3em emulieren (z.B. für Marstek Venus E) — braucht mDNS
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+    #define USE_SCRIPT_MDNS      //14KB
+  #endif
+
+  //-- globale Variablen + >J Sektion
+  #define USE_SCRIPT_GLOBVARS    //2KB
+  #define USE_SCRIPT_JSON_EXPORT //0KB
+
+  //-- Scriptliste-Menü
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
+    #define SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/script-list-menu/scripts/"
+    #define SCRIPT_LIST "scripts.json"
+  #endif
+
+#endif // OTTELO_VARIANT_TAS
+
+
+//=============================================================================
+// TINYC-Variante (TinyC VM + Browser-IDE, KEIN Scripter)
+//=============================================================================
+#ifdef OTTELO_VARIANT_TC
+
+  //-- TinyC braucht USE_RULES nicht — der SML-Init-Gate (`Settings->rule_enabled`
+  //-- Bit 0) wird vom TinyC-Programm direkt über die Built-in-Variable `tasm_rule`
+  //-- gesetzt: einfach `tasm_rule = 1;` schaltet SML frei.
+  //-- Beispiel: tasmota/tinyc/examples/marstek_emu.tc
+  //-- Doku: https://gemu2015.github.io/Sonoff-Tasmota/reference/?h=use_sml_m#smart-meter-sml
+  //-- Meter-Descriptor liegt unter /sml_meter.def im Filesystem.
+  #undef USE_RULES
+
+  //-- SML_SetBaud / SML_Write in xsns_53_sml.ino sind hinter USE_SML_SCRIPT_CMD
+  //-- gegated. Normalerweise setzt xdrv_10_scripter.ino dieses Macro — ohne
+  //-- Scripter müssen wir es selbst definieren, sonst gibt's beim TinyC-VM-
+  //-- Aufruf (mscr SML_BAUD / SML_HEX Opcodes) einen "not declared in this scope"
+  //-- Fehler. Die Funktionen selbst haben keine Scripter-Abhängigkeit.
+  #define USE_SML_SCRIPT_CMD
+
+  //-- TinyC VM + selbstgehostete Browser-IDE
+  //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc
+  #define USE_TINYC          //Enable TinyC VM (XDRV_124)
+  #define USE_TINYC_IDE      //Enable self-hosted browser IDE (requires USE_UFILESYS)
+
+#endif // OTTELO_VARIANT_TC
+
 
 //-- Weiteres optionales
 //#define USE_DISPLAY_TM1621_SONOFF //4KB
 //#define USE_SENDMAIL
 
 
-//-- OTA Urls
+//=============================================================================
+// OTA-URLs (pro Plattform und Variante)
+//=============================================================================
 #undef OTA_URL
+
+#ifdef OTTELO_VARIANT_TAS
+  #define _OTTELO_SFX "_tas"
+#else
+  #define _OTTELO_SFX "_tc"
+#endif
+
 #if defined(TASMOTA32_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32C3_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c3_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c3_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32C6_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c6_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32c6_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32S2_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s2_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s2_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32S3_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32SOLO1_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32solo1_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32solo1_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32BERRY_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32berry_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32berry_ottelo_tas.bin"
 #elif defined(TASMOTA32P4_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4_ottelo.bin"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA1M_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota1m_ottelo.bin.gz"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota1m_ottelo_tas.bin.gz"
 #elif defined(TASMOTA1M_SHELLY_OTTELO)
   #define OTA_URL "Upgrade nur via minimal.bin moeglich!"
 #elif defined(TASMOTA1M_ENERGY_OTTELO)
   #define OTA_URL "Upgrade nur via minimal.bin moeglich!"
 #elif defined(TASMOTA4M_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota4m_ottelo.bin.gz"
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota4m_ottelo" _OTTELO_SFX ".bin.gz"
 #endif
 
 #endif // TASMOTA OTTELO

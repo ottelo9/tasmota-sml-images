@@ -4808,7 +4808,11 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
         }
 #endif //SCRIPT_GET_HTTPS_JP
 
-#if defined(ESP32) && defined(TESLA_POWERWALL)
+// gpwl() requires SCRIPT_GET_HTTPS_JP because that's the gate the
+// `call2pwl` definition (line ~14392) uses too — the bare
+// TESLA_POWERWALL gate here causes a link error when one is defined
+// but not the other.
+#if defined(ESP32) && defined(TESLA_POWERWALL) && defined(SCRIPT_GET_HTTPS_JP)
         if (!strncmp_XP(lp, XPSTR("gpwl("), 5)) {
           char *path;
           //lp = GetStringArgument(lp + 5, OPER_EQU, path, 0);
@@ -12435,6 +12439,12 @@ void ScriptFullWebpage(uint8_t page) {
 void Script_Check_HTML_Setvars(void) {
 
   if (!HttpCheckPriviledgedAccess()) { return; }
+
+  // Skip when no Scripter program is loaded — Scripter's variable resolver
+  // null-derefs (Run_script_sub: `*dfvar = ...`) for any unknown variable
+  // name. Without this guard a `?sv=N_V` URL from another driver (e.g.
+  // TinyC's webButton/webSlider) reboots the device with LoadProhibited.
+  if (!bitRead(Settings->rule_enabled, 0) || !glob_script_mem.script_ram) return;
 
   //if (Webserver->hasArg("gv")) {
     // get variable
