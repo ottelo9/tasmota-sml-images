@@ -49,6 +49,11 @@
 // so we pull in lwIP's definitions here (ESP32-only; ESP8266 path doesn't use TCP meters).
 #ifdef ESP32
 #include <lwip/sockets.h>
+// IDF UART RX-interrupt control — used by SmlUploadPause/Resume to silence the
+// per-meter UART ISR during a long /ufsu flash write (otherwise the ISR keeps
+// firing through the cache-disabled close(), starving WiFi/LwIP and OsWatch,
+// and the device hangs hard despite SML_Poll being paused — Andreas .104 repro).
+#include <driver/uart.h>
 #endif
 
 
@@ -256,6 +261,16 @@ public:
   void updateBaudRate(uint32_t baud);
   void rxRead(void);
   void end();
+  // Silence the RX-side interrupt for the duration of a long blocking task
+  // (the /ufsu LittleFS flush is the motivating case — see SmlUploadPause).
+  // Idempotent. HW-serial path disables the IDF UART RX interrupt; SW-serial
+  // path detaches the GPIO change interrupt. The RX FIFO may overflow during
+  // the silence — fine, the SML decoder resyncs on the next SYNC after enable.
+  void rx_intr_disable(void);
+  void rx_intr_enable(void);
+#ifdef USE_SML_EBUS_ARB
+  HardwareSerial *get_hws(void) { return hws; }   // eBUS arb RX-event wiring needs the raw UART
+#endif
   using Print::write;
 private:
   // Member variables
@@ -307,6 +322,22 @@ void SML_ESP32_SERIAL::setbaud(uint32_t speed) {
 void SML_ESP32_SERIAL::end(void) {
   if (m_buffer) {
     free(m_buffer);
+  }
+}
+
+void SML_ESP32_SERIAL::rx_intr_disable(void) {
+  if (hws) {
+    uart_disable_rx_intr((uart_port_t)uart_index);
+  } else if (m_rx_pin >= 0) {
+    detachInterrupt(m_rx_pin);
+  }
+}
+
+void SML_ESP32_SERIAL::rx_intr_enable(void) {
+  if (hws) {
+    uart_enable_rx_intr((uart_port_t)uart_index);
+  } else if (m_rx_pin >= 0) {
+    attachInterruptArg(m_rx_pin, sml_callRxRead, this, CHANGE);
   }
 }
 
@@ -561,6 +592,14 @@ struct METER_DESC {
 #else
   SML_ESP32_SERIAL *meter_ss;
 #endif
+  // UART hardware number this meter is bound to (0..2), -1 = none / SW / TCP.
+  // Captured at serial-create time so SmlUploadPause/Resume can disable RX IRQs
+  // by IDF call directly on the raw-HardwareSerial path (Arduino-ESP32's
+  // HardwareSerial does not expose its uart_nr; SML_ESP32_SERIAL has its own
+  // helper). Without this, the ufsu RX-IRQ kill only covers USE_ESP32_SW_SERIAL
+  // builds — Andreas's .104 (raw HardwareSerial path) is exactly where the hang
+  // lives, so the fix HAS to reach this branch.
+  int8_t hw_uart_index = -1;
 #endif  // ESP32
 
 // software serial pointers
@@ -609,6 +648,32 @@ struct METER_DESC {
 #ifdef ESP32
   int8_t uart_index;
 #endif
+#ifdef USE_SML_EBUS_MASTER
+  uint8_t  ebm_enh;          // 0=off, 1=requested (handshaking), 2=confirmed enhanced
+  uint8_t  ebm_raw;          // 1 = raw active-master TEST mode (no adapter/arbitration; Mac-UART harness)
+  uint8_t  ebm_qq;           // our master address (QQ)
+  uint8_t  ebm_state;        // EBM_* state
+  uint8_t  ebm_retry;        // arbitration / init retry counter
+  uint8_t  ebm_haveb1;       // 1 = a pending enhanced byte1 is held
+  uint8_t  ebm_b1;           // the pending enhanced byte1
+  uint8_t  ebm_txbuf[48];    // active telegram QQ..CRC (main task owns)
+  uint8_t  ebm_txlen;        // bytes in ebm_txbuf incl. CRC
+  uint8_t  ebm_txpos;        // next byte index to push to the adapter
+  uint8_t  ebm_reqbuf[48];   // staging buffer (producer fills, incl. CRC)
+  uint8_t  ebm_reqlen;
+  volatile uint8_t ebm_req;  // request pending — producer sets this LAST
+  uint32_t ebm_t0;           // millis() of last state transition (timeout base)
+#ifdef USE_SML_EBUS_ARB
+  uint8_t  ebm_arb;          // 1 = in-firmware arbitration master (soA)
+  uint8_t  eba_bus;          // EBA_BUS_* bus-sequence state
+  uint8_t  eba_phase;        // EBA_* arbitration phase for this meter
+  uint8_t  eba_restart;      // restart-on-clobber counter
+  uint32_t eba_syn_us;       // esp_timer_get_time() at the last observed SYN start
+  uint32_t eba_won, eba_lost, eba_late, eba_restarts;  // diagnostics
+  uint32_t eba_arm_ms;       // millis() when the current request was armed (watchdog base)
+  uint32_t eba_giveup;       // requests the watchdog dropped (never won the bus)
+#endif
+#endif
 };
 
 
@@ -637,6 +702,83 @@ struct METER_DESC  meter_desc[MAX_METERS];
 #define SML_SYNC		0x77
 #define EBUS_SYNC		0xaa
 #define EBUS_ESC    0xa9
+
+#ifdef USE_SML_EBUS_MASTER
+// ebusd "enhanced protocol" — the eBUS adapter (https://adapter.ebusd.eu) does the
+// timing-critical bus arbitration itself; the host exchanges 2-byte protocol symbols.
+//   byte1 = ENH_BYTE1 | (cmd<<2) | ((data&0xc0)>>6)
+//   byte2 = ENH_BYTE2 | (data&0x3f)
+#define ENH_BYTE_FLAG    0x80
+#define ENH_BYTE_MASK    0xc0
+#define ENH_BYTE1        0xc0
+#define ENH_BYTE2        0x80
+// host -> device
+#define ENH_REQ_INIT     0x0
+#define ENH_REQ_SEND     0x1
+#define ENH_REQ_START    0x2
+#define ENH_REQ_INFO     0x3
+// device -> host
+#define ENH_RES_RESETTED 0x0
+#define ENH_RES_RECEIVED 0x1
+#define ENH_RES_STARTED  0x2
+#define ENH_RES_INFO     0x3
+#define ENH_RES_FAILED   0xa
+#define ENH_RES_ERR_EBUS 0xb
+#define ENH_RES_ERR_HOST 0xc
+// active-master state machine
+#define EBM_OFF          0
+#define EBM_NEED_INIT    1
+#define EBM_INIT_WAIT    2
+#define EBM_IDLE         3
+#define EBM_ARB_REQ      4
+#define EBM_AWAIT_RESP   5
+#define EBM_RELEASE      6
+// events
+#define EBM_EV_TICK      0
+#define EBM_EV_ARB_WON   1
+#define EBM_EV_ARB_LOST  2
+#define EBM_EV_ERR       3
+// tuning (ms / counts)
+#define EBM_INIT_TMO     1500
+#define EBM_ARB_TMO      150
+#define EBM_RESP_TMO     300
+#define EBM_ARB_MAX_RETRY 4
+#define EBM_TX_START     1     // 1 = QQ already placed on bus by ENH_RES_STARTED; set 0 if not
+
+#ifdef USE_SML_EBUS_ARB
+// In-firmware eBUS bus arbitration (soA) — CLEAN-ROOM from the public eBUS spec, NOT copied from any
+// implementation. eBUS facts used: SYN delimiter = 0xAA; a master wanting the bus writes its address
+// (QQ) into the window 4300..4456 us after the SYN start bit (SYN symbol = 4167 us @2400 baud); the
+// line is wired-AND (dominant 0) so the numerically-lowest address wins; arbitration runs in two
+// priority rounds keyed on the address low nibble (same class -> second round). Read back our own
+// byte from the shared wire to learn the winner. This MUST run in a dedicated per-symbol hot path
+// (Eba_OnSymbol), never the ~50 ms SML_Poll loop.
+//
+// Bus sequence (which symbol slot we expect next), advanced per received symbol:
+#define EBA_BUS_IDLE      0   // waiting for the first SYN
+#define EBA_BUS_SYN       1   // saw a SYN; next non-SYN byte is a round-1 master address
+#define EBA_BUS_ADDR1     2   // saw SYN+ADDR; next SYN opens round 2, else bus goes busy
+#define EBA_BUS_SYN2      3   // saw SYN ADDR SYN; next byte is a round-2 master address
+#define EBA_BUS_BUSY      4   // a telegram is in progress (until the next SYN)
+// Arbitration phase for THIS meter:
+#define EBA_OFF           0   // soA not enabled
+#define EBA_IDLE          1   // enabled, nothing to send
+#define EBA_ARMED         2   // telegram staged (ebm_req) — write QQ on the next first-SYN
+#define EBA_R1            3   // wrote QQ in round 1, awaiting read-back
+#define EBA_R2WAIT        4   // tied on priority class — will write QQ in round 2
+#define EBA_R2            5   // wrote QQ in round 2, awaiting read-back
+#define EBA_WON           6   // we own the bus — stream the staged telegram (from byte 1)
+#define EBA_LOST          7   // lost this round — retry on a later SYN
+// Timing (microseconds), per eBUS spec test_1 v1.1.1 section 3.2:
+#define EBA_ARB_MIN_US    4300
+#define EBA_ARB_MAX_US    4456
+#ifndef EBM_ARB_TX_LEAD_US
+#define EBM_ARB_TX_LEAD_US 700  // ESP32-C3 UART write()->wire latency; SCOPE-TUNE per target chip
+#endif
+#define EBA_MAX_RESTART   3     // restart arbitration up to N times if our byte gets clobbered
+#define EBA_REQ_TMO_MS    3000  // watchdog: drop a queued request that never wins, freeing the slot
+#endif // USE_SML_EBUS_ARB
+#endif // USE_SML_EBUS_MASTER
 
 
 // calulate deltas
@@ -1514,6 +1656,330 @@ void sml_empty_receiver(uint32_t meters) {
 
 void SML_Decode(uint8_t index);
 
+// Passive eBUS frame accumulator (refactored out of case 'e' so the enhanced-protocol
+// de-framer can feed it too). Returns 1 when iob was a SYNC (frame boundary), else 0.
+uint8_t ebus_feed_byte(uint32_t meters, uint8_t iob) {
+  struct METER_DESC *mp = &meter_desc[meters];
+  if (iob == EBUS_SYNC) {
+    // should be end of telegram: QQ,ZZ,PB,SB,NN ..... CRC, ACK SYNC
+    if (mp->spos > 5 && mp->spos > mp->sbuff[4] + 5) {
+      uint16_t tlen = mp->sbuff[4] + 5 + check_ebus_esc(mp->sbuff, mp->spos);
+      if (mp->sbuff[tlen] == ebus_CalculateCRC(mp->sbuff, tlen)) {
+        ebus_esc(mp->sbuff, mp->spos);
+        SML_Decode(meters);
+      } else {
+        AddLog(LOG_LEVEL_INFO, PSTR("ebus crc error"));
+      }
+    }
+#ifdef USE_SML_EBUS_MASTER
+    // raw active-master TEST mode (no adapter, no real arbitration — Mac<->.39 full-duplex
+    // UART harness): on a bus SYNC the bus is idle, so blind-tx the staged telegram with
+    // inline AA/A9 escaping plus a trailing SYNC. One-shot: ebm_req cleared after send.
+    if (mp->ebm_raw && mp->ebm_req && mp->meter_ss) {
+      uint8_t tx[2 * sizeof(mp->ebm_reqbuf) + 1];
+      uint16_t n = 0;
+      for (uint8_t i = 0; i < mp->ebm_reqlen; i++) {
+        uint8_t b = mp->ebm_reqbuf[i];
+        if (b == EBUS_SYNC)      { tx[n++] = EBUS_ESC; tx[n++] = 0x01; }
+        else if (b == EBUS_ESC)  { tx[n++] = EBUS_ESC; tx[n++] = 0x00; }
+        else                     { tx[n++] = b; }
+      }
+      tx[n++] = EBUS_SYNC;                 // close the telegram with a SYNC
+      mp->meter_ss->write(tx, n);
+      mp->ebm_req = 0;                     // one-shot
+      AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS raw TX %u bytes"), n);
+    }
+    // a bus SYNC closes an active master exchange that was awaiting the slave reply
+    if (mp->ebm_enh == 2 && mp->ebm_state == EBM_AWAIT_RESP) {
+      mp->ebm_state = EBM_RELEASE;
+    }
+#endif
+    mp->spos = 0;
+    return 1;
+  }
+  mp->sbuff[mp->spos] = iob;
+  mp->spos++;
+  if (mp->spos >= mp->sbsiz) {
+    mp->spos = 0;
+  }
+  return 0;
+}
+
+#ifdef USE_SML_EBUS_MASTER
+// Write one 2-byte ebusd-enhanced protocol symbol to the adapter (host->device).
+void Ebm_SendEnh(struct METER_DESC *mp, uint8_t cmd, uint8_t data) {
+  if (!mp->meter_ss) { return; }
+  uint8_t b[2];
+  b[0] = ENH_BYTE1 | (cmd << 2) | ((data & 0xc0) >> 6);
+  b[1] = ENH_BYTE2 | (data & 0x3f);
+  mp->meter_ss->write(b, 2);
+}
+
+// Non-blocking active-master state machine. Stepped per 50 ms tick from SML_Poll and
+// event-driven from the RX de-framer (arbitration won/lost). Never blocks the loop.
+void Ebm_Step(uint32_t meters, uint8_t ev) {
+  struct METER_DESC *mp = &meter_desc[meters];
+  uint32_t now = millis();
+  switch (mp->ebm_state) {
+    case EBM_NEED_INIT:
+      Ebm_SendEnh(mp, ENH_REQ_INIT, 0x01);   // request reset + extra-features
+      mp->ebm_retry = 0;
+      mp->ebm_t0 = now;
+      mp->ebm_state = EBM_INIT_WAIT;
+      break;
+    case EBM_INIT_WAIT:
+      // ENH_RES_RESETTED (handled in Ebm_RxByte) flips ebm_enh=2 and state=EBM_IDLE
+      if (now - mp->ebm_t0 > EBM_INIT_TMO) {
+        if (mp->ebm_retry < 1) {
+          mp->ebm_retry++;
+          Ebm_SendEnh(mp, ENH_REQ_INIT, 0x01);
+          mp->ebm_t0 = now;
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS adapter not enhanced — falling back to passive"));
+          mp->ebm_enh = 0;            // raw passive path resumes in sml_shift_in
+          mp->ebm_state = EBM_OFF;
+        }
+      }
+      break;
+    case EBM_IDLE:
+      if (mp->ebm_req) {
+        uint8_t n = mp->ebm_reqlen;
+        if (n > sizeof(mp->ebm_txbuf)) { n = sizeof(mp->ebm_txbuf); }
+        memcpy(mp->ebm_txbuf, mp->ebm_reqbuf, n);
+        mp->ebm_txlen = n;
+        mp->ebm_req = 0;
+        mp->ebm_txpos = EBM_TX_START;
+        mp->ebm_retry = 0;
+        Ebm_SendEnh(mp, ENH_REQ_START, mp->ebm_txbuf[0]);   // arbitrate with our QQ
+        mp->ebm_t0 = now;
+        mp->ebm_state = EBM_ARB_REQ;
+      }
+      break;
+    case EBM_ARB_REQ:
+      if (ev == EBM_EV_ARB_WON) {
+        // We hold the bus — push the rest of the telegram (ZZ..CRC) to the adapter
+        // promptly; the adapter clocks it onto the 2400-baud bus and escapes as needed.
+        while (mp->ebm_txpos < mp->ebm_txlen) {
+          Ebm_SendEnh(mp, ENH_REQ_SEND, mp->ebm_txbuf[mp->ebm_txpos]);
+          mp->ebm_txpos++;
+        }
+        mp->ebm_t0 = now;
+        mp->ebm_state = EBM_AWAIT_RESP;
+      } else if (ev == EBM_EV_ARB_LOST || ev == EBM_EV_ERR || (now - mp->ebm_t0 > EBM_ARB_TMO)) {
+        if (mp->ebm_retry < EBM_ARB_MAX_RETRY) {
+          mp->ebm_retry++;
+          Ebm_SendEnh(mp, ENH_REQ_START, mp->ebm_txbuf[0]);   // retry on the next SYN slot
+          mp->ebm_t0 = now;
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS arbitration failed (qq=%02x)"), mp->ebm_txbuf[0]);
+          mp->ebm_state = EBM_IDLE;
+        }
+      }
+      break;
+    case EBM_AWAIT_RESP:
+      // ebus_feed_byte advances us to EBM_RELEASE on the trailing SYNC; this is the
+      // fallback for broadcasts / pure writes that produce no decodable reply.
+      if (now - mp->ebm_t0 > EBM_RESP_TMO) {
+        mp->ebm_state = EBM_RELEASE;
+      }
+      break;
+    case EBM_RELEASE:
+      Ebm_SendEnh(mp, ENH_REQ_START, EBUS_SYNC);   // release the bus
+      mp->ebm_state = EBM_IDLE;
+      break;
+    default:
+      break;
+  }
+}
+
+// De-frame raw UART bytes from an enhanced adapter into protocol symbols + bus bytes.
+void Ebm_RxByte(uint32_t meters, uint8_t raw) {
+  struct METER_DESC *mp = &meter_desc[meters];
+  if (!(raw & ENH_BYTE_FLAG)) { return; }              // not an enhanced byte
+  uint8_t kind = raw & ENH_BYTE_MASK;
+  if (kind == ENH_BYTE1) {
+    mp->ebm_b1 = raw;
+    mp->ebm_haveb1 = 1;
+    return;
+  }
+  // kind == ENH_BYTE2
+  if (!mp->ebm_haveb1) { return; }                     // byte2 without byte1
+  mp->ebm_haveb1 = 0;
+  uint8_t cmd  = (mp->ebm_b1 >> 2) & 0x0f;
+  uint8_t data = ((mp->ebm_b1 & 0x03) << 6) | (raw & 0x3f);
+  switch (cmd) {
+    case ENH_RES_RECEIVED:
+      ebus_feed_byte(meters, data);                    // into the passive decoder
+      break;
+    case ENH_RES_RESETTED:
+      if (mp->ebm_enh != 2) {
+        AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS enhanced active (qq=%02x)"), mp->ebm_qq);
+      }
+      mp->ebm_enh = 2;
+      if (mp->ebm_state == EBM_INIT_WAIT || mp->ebm_state == EBM_NEED_INIT) {
+        mp->ebm_state = EBM_IDLE;
+      }
+      break;
+    case ENH_RES_STARTED:
+      ebus_feed_byte(meters, data);                    // QQ is now on the bus -> start frame
+      Ebm_Step(meters, EBM_EV_ARB_WON);
+      break;
+    case ENH_RES_FAILED:
+      Ebm_Step(meters, EBM_EV_ARB_LOST);
+      break;
+    case ENH_RES_ERR_EBUS:
+    case ENH_RES_ERR_HOST:
+      Ebm_Step(meters, EBM_EV_ERR);
+      break;
+    default:
+      break;
+  }
+}
+
+// Stage a master telegram (QQ ZZ PB SB NN data..) for the active-master state machine.
+// Appends the eBUS CRC. Returns 1 = queued, 0 = rejected, -1 = busy. Never touches UART.
+int Ebm_QueueTelegram(uint32_t meter, uint8_t *body, uint8_t len) {
+  struct METER_DESC *mp = &meter_desc[meter];
+  uint8_t ready = (mp->ebm_enh == 2) || mp->ebm_raw;
+#ifdef USE_SML_EBUS_ARB
+  ready = ready || mp->ebm_arb;
+#endif
+  if (!ready) { return 0; }                            // no active-master mode enabled
+  if (mp->ebm_req) { return -1; }                      // a request is already in flight
+  if (len < 5 || len > sizeof(mp->ebm_reqbuf) - 1) { return 0; }
+  memcpy(mp->ebm_reqbuf, body, len);
+  mp->ebm_reqbuf[len] = ebus_CalculateCRC(body, len);  // CRC over QQ..last-data
+  mp->ebm_reqlen = len + 1;
+#ifdef USE_SML_EBUS_ARB
+  if (mp->ebm_arb && mp->eba_phase == EBA_IDLE) { mp->eba_phase = EBA_ARMED; mp->eba_restart = 0; mp->eba_arm_ms = millis(); }
+#endif
+  mp->ebm_req = 1;                                      // publish LAST (cross-task handoff)
+  return 1;
+}
+
+#ifdef USE_SML_EBUS_ARB
+// ── In-firmware eBUS arbitration (soA) — CLEAN-ROOM per the public eBUS spec ──────────────────────
+// Write our master address into the spec window 4300..4456 us after the SYN start bit; the
+// EBM_ARB_TX_LEAD_US lead compensates the UART write()->wire latency. Returns 1 if written, else
+// 0 (too late this round). MUST be called from the per-symbol hot path, never the 50 ms loop.
+int Eba_WriteAddr(struct METER_DESC *mp, uint32_t syn_us) {
+  if (!mp->meter_ss) { return 0; }
+  uint32_t since = micros() - syn_us;
+  if (since > EBA_ARB_MAX_US) { mp->eba_late++; return 0; }
+  int32_t wait = (int32_t)EBA_ARB_MIN_US - (int32_t)since - (int32_t)EBM_ARB_TX_LEAD_US;
+  if (wait > 0) { delayMicroseconds((unsigned int)wait); }
+  uint8_t qq = mp->ebm_qq;
+  mp->meter_ss->write(&qq, 1);                          // dominant-0 wired-AND: lowest addr wins
+  return 1;
+}
+
+// We won arbitration: stream the staged telegram from byte 1 (QQ already on the bus), AA/A9-escaped.
+void Eba_StreamTelegram(struct METER_DESC *mp) {
+  if (!mp->meter_ss || mp->ebm_reqlen < 2) { return; }
+  uint8_t tx[2 * sizeof(mp->ebm_reqbuf)];
+  uint16_t n = 0;
+  for (uint8_t i = 1; i < mp->ebm_reqlen; i++) {       // skip QQ (idx 0) — already transmitted
+    uint8_t b = mp->ebm_reqbuf[i];
+    if (b == EBUS_SYNC)      { tx[n++] = EBUS_ESC; tx[n++] = 0x01; }
+    else if (b == EBUS_ESC)  { tx[n++] = EBUS_ESC; tx[n++] = 0x00; }
+    else                     { tx[n++] = b; }
+  }
+  mp->meter_ss->write(tx, n);
+  AddLog(LOG_LEVEL_DEBUG, PSTR("SML: eBUS arb WON qq=%02x -> %u telegram bytes"), mp->ebm_qq, n);
+}
+
+// Per-symbol hot path: feed every received bus symbol here WITH a micros() timestamp taken as close
+// to reception as possible. Runs the two-round arbitration, streams the frame on a win, and forwards
+// the symbol to the passive decoder so reads + the slave response decode normally.
+// NOTE: timing only holds when called from a dedicated RX-event task (Phase 2). The 50 ms loop will
+// always read 'late' — inert because no meter enables soA until bench bring-up.
+void Eba_OnSymbol(uint32_t meters, uint8_t sym, uint32_t now_us) {
+  struct METER_DESC *mp = &meter_desc[meters];
+
+  // 1) read-back resolution — the byte right after our write IS the arbitration winner
+  if (mp->eba_phase == EBA_R1) {
+    if (sym == EBUS_SYNC) {                            // our address got clobbered -> restart
+      if (mp->eba_restart++ < EBA_MAX_RESTART) { mp->eba_restarts++; mp->eba_phase = EBA_ARMED; }
+      else { mp->eba_restart = 0; mp->eba_lost++; mp->eba_phase = EBA_LOST; }
+    } else if (sym == mp->ebm_qq) {                    // read back our own addr -> won round 1
+      mp->eba_won++; mp->eba_phase = EBA_WON;
+    } else if ((sym & 0x0f) == (mp->ebm_qq & 0x0f)) {  // tied priority class -> contest round 2
+      mp->eba_phase = EBA_R2WAIT;
+    } else {                                           // a lower address won -> lost round 1
+      mp->eba_lost++; mp->eba_phase = EBA_LOST;
+    }
+  } else if (mp->eba_phase == EBA_R2) {
+    if (sym == mp->ebm_qq) { mp->eba_won++; mp->eba_phase = EBA_WON; }
+    else { mp->eba_lost++; mp->eba_phase = EBA_LOST; }
+  }
+
+  // 2) SYN bookkeeping + arming the timed address writes
+  if (sym == EBUS_SYNC) {
+    mp->eba_syn_us = now_us;
+    if (mp->eba_phase == EBA_ARMED) {                  // first free SYN with a staged frame
+      mp->eba_phase = Eba_WriteAddr(mp, now_us) ? EBA_R1 : EBA_ARMED;
+    } else if (mp->eba_phase == EBA_R2WAIT) {          // round-2 SYN
+      if (Eba_WriteAddr(mp, now_us)) { mp->eba_phase = EBA_R2; }
+      else { mp->eba_lost++; mp->eba_phase = EBA_LOST; }   // missed our round-2 window
+    }
+  }
+
+  // 3) outcome
+  if (mp->eba_phase == EBA_WON) {
+    Eba_StreamTelegram(mp);
+    mp->ebm_req = 0; mp->eba_restart = 0; mp->eba_phase = EBA_IDLE;
+  } else if (mp->eba_phase == EBA_LOST) {
+    mp->eba_restart = 0;
+    mp->eba_phase = mp->ebm_req ? EBA_ARMED : EBA_IDLE;     // keep retrying while a request stands
+  }
+
+  // 4) always feed the passive decoder (reads + the slave response after we win)
+  ebus_feed_byte(meters, sym);
+}
+
+// ── Phase 2: dedicated per-byte RX-event reader ───────────────────────────────────────────────────
+// HardwareSerial onReceive + setRxFIFOFull(1) delivers one callback per received byte from the UART
+// event task (NOT an ISR — so the short delayMicroseconds() busy-wait in Eba_WriteAddr is allowed
+// here). Timestamping each symbol with micros() — the same base Eba_WriteAddr uses — is tight enough
+// for the 4300..4456 us arbitration window; the ~50 ms SML_Poll loop is far too coarse. This task is
+// the SOLE reader of the arb meter's UART (SML_Poll's drain is disabled for it). Eba_OnSymbol still
+// forwards every byte to ebus_feed_byte, so passive decode + the slave response keep working.
+int8_t eba_rx_meter = -1;   // meter index that owns the arb RX-event callback (one eBUS per device)
+
+void Eba_RxEvent(void) {
+  if (eba_rx_meter < 0) { return; }
+  struct METER_DESC *mp = &meter_desc[eba_rx_meter];
+  if (!mp->meter_ss) { return; }
+  uint32_t t = micros();                            // same base Eba_WriteAddr() uses for the SYN window
+  while (mp->meter_ss->available()) {
+    int s = mp->meter_ss->read();
+    if (s < 0) { break; }
+    Eba_OnSymbol((uint32_t)eba_rx_meter, (uint8_t)s, t);
+  }
+}
+
+// Attach the per-byte RX event to the arb meter's UART, right after begin(). One eBUS bus per device.
+void Eba_AttachRx(uint32_t meters) {
+  struct METER_DESC *mp = &meter_desc[meters];
+  if (!mp->ebm_arb || !mp->meter_ss) { return; }
+#ifdef USE_ESP32_SW_SERIAL
+  HardwareSerial *h = mp->meter_ss->get_hws();       // SML_ESP32_SERIAL wraps a HardwareSerial
+#else
+  HardwareSerial *h = mp->meter_ss;                  // meter_ss IS the HardwareSerial
+#endif
+  if (!h) {
+    AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS arb needs a hardware UART (rx pin >= 0); RX event not attached"));
+    return;
+  }
+  h->setRxFIFOFull(1);                               // one RX event per single byte
+  h->onReceive(Eba_RxEvent, false);                  // false = fire on FIFO-full, not only on timeout
+  eba_rx_meter = (int8_t)meters;
+  AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS arb RX-event attached meter=%d qq=%02x lead=%uus"),
+         (int)meters, mp->ebm_qq, (unsigned)EBM_ARB_TX_LEAD_US);
+}
+#endif // USE_SML_EBUS_ARB
+#endif // USE_SML_EBUS_MASTER
+
 void sml_shift_in(uint32_t meters, uint32_t shard) {
   uint32_t count;
 
@@ -1665,6 +2131,13 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
       iob = 0;
     }
   }
+
+#ifdef USE_SML_EBUS_MASTER
+  if (mp->type == 'e' && mp->ebm_enh) {
+    Ebm_RxByte(meters, iob);   // enhanced de-framer owns this byte
+    return;
+  }
+#endif
 
   switch (mp->type) {
     case 'o':
@@ -1839,29 +2312,17 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
       }
       break;
     case 'e':
-      // ebus
-      if (iob == EBUS_SYNC) {
-        // should be end of telegramm
-        // QQ,ZZ,PB,SB,NN ..... CRC, ACK SYNC
-        if (mp->spos > 5 && mp->spos > mp->sbuff[4] + 5) {
-          // get telegramm lenght
-          uint16_t tlen = mp->sbuff[4] + 5 + check_ebus_esc(mp->sbuff, mp->spos);
-          // test crc
-          if (mp->sbuff[tlen] == ebus_CalculateCRC(mp->sbuff, tlen)) {
-              ebus_esc(mp->sbuff, mp->spos);
-              SML_Decode(meters);
-          } else {
-              // crc error
-              AddLog(LOG_LEVEL_INFO, PSTR("ebus crc error"));
-          }
-        }
-        mp->spos = 0;
+#ifdef USE_SML_EBUS_ARB
+      // In-firmware arbitration master: route every symbol (with a timestamp) through the
+      // arbitration hot path, which also forwards to ebus_feed_byte. NOTE: real arbitration timing
+      // only holds from a dedicated RX-event task — wiring that (HardwareSerial onReceive +
+      // setRxFIFOFull(1)) is the next phase; from this 50 ms loop it just reads 'late' (inert,
+      // since no meter enables soA until bench bring-up).
+      if (mp->ebm_arb) { Eba_OnSymbol(meters, iob, micros()); break; }
+#endif
+      // ebus (passive accumulator refactored into ebus_feed_byte)
+      if (ebus_feed_byte(meters, iob)) {
         return;
-      }
-      mp->sbuff[mp->spos] = iob;
-      mp->spos++;
-      if (mp->spos >= mp->sbsiz) {
-        mp->spos = 0;
       }
       break;
   }
@@ -1878,12 +2339,81 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
 
 uint16_t sml_count = 0;
 
+// /ufsu large-file upload bracket. While a big internal-flash (LittleFS) write holds the
+// single-core loop for several seconds (cache disabled), keep SML_Poll off the meter UART so no
+// serial decode work piles up across the blocking close(). Set/cleared from xdrv_50's upload
+// open/close (mirrors TinyCFsWritePause()). Inert until set — decode is byte-identical otherwise.
+//
+// HARDENING (2026-05-30, after Andreas's .104 live-load repro — refined for raw-HardwareSerial
+// after his 1837 compile-error report): pausing SML_Poll alone is NOT enough. The UART
+// RXFIFO_FULL/TOUT ISR keeps firing while the meter sees continuous traffic (2400 Bd eBUS) —
+// that ISR load piled on top of any long blocking write (flash via /ufsu OR SD write — single-
+// core C3 just sees the blocked loop) starves WiFi/LwIP AND the OsWatch timer ISR, producing a
+// deep hang the soft watchdog never recovers from. Surgical fix: turn off the IDF UART RX
+// interrupt for each meter UART for the duration of the upload (RX FIFO silently overflows its
+// 128 B hardware buffer — fine, the SML decoder resyncs on the next SYNC byte after resume).
+// Both code paths (raw HardwareSerial when !USE_ESP32_SW_SERIAL, SML_ESP32_SERIAL otherwise)
+// are covered: SML_ESP32_SERIAL has its own rx_intr_disable/enable helpers; raw HardwareSerial
+// has no uart_nr getter so we use the hw_uart_index captured in METER_DESC at construction time.
+// TCP meters / not-yet-opened slots / SW-emulated SML_ESP32_SERIAL are safely skipped. ESP32
+// only; ESP8266 keeps the old behavior.
+bool sml_upload_pause = false;
+void SmlUploadPause(void)  {
+  sml_upload_pause = true;
+#ifdef ESP32
+  for (uint8_t m = 0; m < sml_globs.meters_used; m++) {
+    struct METER_DESC *mp = &meter_desc[m];
+    if (mp->srcpin == TCP_MODE_FLG) continue;       // TCP-attached meter, no UART
+    if (!mp->meter_ss) continue;                    // not opened yet
+#ifdef USE_ESP32_SW_SERIAL
+    mp->meter_ss->rx_intr_disable();                // SML_ESP32_SERIAL handles HW/SW internally
+#else
+    if (mp->hw_uart_index >= 0) uart_disable_rx_intr((uart_port_t)mp->hw_uart_index);
+#endif
+  }
+#endif
+}
+void SmlUploadResume(void) {
+#ifdef ESP32
+  for (uint8_t m = 0; m < sml_globs.meters_used; m++) {
+    struct METER_DESC *mp = &meter_desc[m];
+    if (mp->srcpin == TCP_MODE_FLG) continue;
+    if (!mp->meter_ss) continue;
+#ifdef USE_ESP32_SW_SERIAL
+    mp->meter_ss->rx_intr_enable();
+#else
+    if (mp->hw_uart_index >= 0) uart_enable_rx_intr((uart_port_t)mp->hw_uart_index);
+#endif
+  }
+#endif
+  sml_upload_pause = false;
+}
+
 // polled every 50 ms
 void SML_Poll(void) {
 uint32_t meters;
+    if (sml_upload_pause) { return; }   // /ufsu big write in progress — stay off the meter UART
 
     for (meters = 0; meters < sml_globs.meters_used; meters++) {
       struct METER_DESC *mp = &meter_desc[meters];
+#ifdef USE_SML_EBUS_MASTER
+      if (mp->type == 'e' && mp->ebm_enh) { Ebm_Step(meters, EBM_EV_TICK); }
+#ifdef USE_SML_EBUS_ARB
+      // arb watchdog: a low-priority QQ may never win on a busy multi-master bus; after EBA_REQ_TMO_MS
+      // drop the request so SML_Queue() stops returning -1 and the slot frees for the next telegram.
+      // Only abort between rounds (IDLE/ARMED) — never mid-arbitration, which would leave our QQ on the
+      // wire with no telegram following (a half-frame the bus must time out). A round is a few ms, so the
+      // next ARMED window catches it promptly.
+      if (mp->type == 'e' && mp->ebm_arb && mp->ebm_req &&
+          (mp->eba_phase == EBA_IDLE || mp->eba_phase == EBA_ARMED) &&
+          (millis() - mp->eba_arm_ms > EBA_REQ_TMO_MS)) {
+        mp->ebm_req = 0; mp->eba_phase = EBA_IDLE; mp->eba_restart = 0; mp->eba_giveup++;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("SML: eBUS arb give-up qq=%02x won=%u lost=%u late=%u rst=%u giveup=%u"),
+               mp->ebm_qq, (unsigned)mp->eba_won, (unsigned)mp->eba_lost, (unsigned)mp->eba_late,
+               (unsigned)mp->eba_restarts, (unsigned)mp->eba_giveup);
+      }
+#endif
+#endif
       if (mp->type == 'C') continue;
       if (mp->type != 'c') {
         if (mp->srcpin != TCP_MODE_FLG) {
@@ -1892,6 +2422,11 @@ uint32_t meters;
           if (sml_globs.ser_act_LED_pin != 255 && (sml_globs.ser_act_meter_num == 0 || sml_globs.ser_act_meter_num - 1 == meters)) {
             digitalWrite(sml_globs.ser_act_LED_pin, mp->meter_ss->available() && !digitalRead(sml_globs.ser_act_LED_pin)); // Invert LED, if queue is continuously full
           }
+#ifdef USE_SML_EBUS_ARB
+          // arb meter: the onReceive RX-event task is the sole reader (it feeds ebus_feed_byte);
+          // draining here too would double-consume the bus symbols and wreck arbitration timing.
+          if (!(mp->ebm_arb && eba_rx_meter == (int8_t)meters))
+#endif
           while (mp->meter_ss->available()) {
             sml_shift_in(meters, 0);
           }
@@ -2179,7 +2714,11 @@ void SML_Decode(uint8_t index) {
       uint8_t found = 1;
       double ebus_dval = 99;
       double mbus_dval = 99;
-      while (*mp != '@') {
+      // NOTE: a value descriptor must terminate its pattern with an '@' scale.
+      // The `&& *mp` guard stops this loop at the end of the descriptor string so
+      // a line missing '@' (e.g. "...uu,Name") can no longer scan past the buffer
+      // (out-of-bounds read -> crash -> boot loop). See the post-loop check below.
+      while (*mp != '@' && *mp) {
         if (found == 0) {
           // skip rest of decoder part
           mp++;
@@ -2478,6 +3017,28 @@ void SML_Decode(uint8_t index) {
               }
               mbus_dval = bcdval;
               ebus_dval = bcdval;
+            } else if (!strncmp_P(mp, PSTR("ETIME"), 5)) {
+              // eBUS time field (BTI = 3 BCD bytes HH MM SS, BCD|REV hours-first) ->
+              // integer HHMMSS (e.g. 09:21:00 -> 92100). Kept small + SEPARATE from the
+              // date on purpose: TinyC smlGet() returns a float (~2^22 exact), so a
+              // combined YYYYMMDDHHMM would lose precision on export. HHMMSS max 235959.
+              mp += 5;
+              uint8_t t_hh = (cp[0] >> 4) * 10 + (cp[0] & 0x0f);
+              uint8_t t_mi = (cp[1] >> 4) * 10 + (cp[1] & 0x0f);
+              uint8_t t_ss = (cp[2] >> 4) * 10 + (cp[2] & 0x0f);
+              ebus_dval = mbus_dval = (double)(t_hh * 10000 + t_mi * 100 + t_ss);
+              cp += 3;
+            } else if (!strncmp_P(mp, PSTR("EDATE"), 5)) {
+              // eBUS date field (BDA = 4 BCD bytes DD MM WD YY, day-first, WD=weekday) ->
+              // sortable integer YYMMDD (e.g. 2026-05-28 -> 260528). Century dropped so it
+              // stays float-exact for TinyC export (YYYYMMDD=20.2M would overflow float).
+              // YYMMDD max 991231.
+              mp += 5;
+              uint8_t d_dd = (cp[0] >> 4) * 10 + (cp[0] & 0x0f);
+              uint8_t d_mo = (cp[1] >> 4) * 10 + (cp[1] & 0x0f);
+              uint8_t d_yy = (cp[3] >> 4) * 10 + (cp[3] & 0x0f);
+              ebus_dval = mbus_dval = (double)(d_yy * 10000 + d_mo * 100 + d_dd);
+              cp += 4;
             } else if (*mp == 'v') {
               // vbus values vul, vsl, vuwh, vuwl, wswh, vswl, vswh
               // vub3, vsb3 etc
@@ -2580,6 +3141,19 @@ void SML_Decode(uint8_t index) {
             }
           }
         }
+      }
+      if (*mp != '@') {
+        // malformed descriptor: the value pattern has no '@' scale. Reject the line
+        // instead of running the scale parser off the end of the string. Warn once
+        // per boot (this runs per frame, so guard against log spam).
+        if (found) {
+          static bool sml_warned_no_at = false;
+          if (!sml_warned_no_at) {
+            sml_warned_no_at = true;
+            AddLog(LOG_LEVEL_INFO, PSTR("SML: a decoder line is missing its '@' scale — line ignored (meter %d)"), mindex + 1);
+          }
+        }
+        found = 0;
       }
       if (found) {
         // matches, get value
@@ -2736,8 +3310,23 @@ void SML_Decode(uint8_t index) {
           if (cp && (*cp == '+' || *cp == '-')) {
             double offset = CharToDouble(cp);
             sml_globs.meter_vars[vindex] += offset;
+            cp = skip_double(cp);
           }
           sml_globs.meter_vars[vindex] /= fac;
+          // optional no-value sentinel:  ...@<scale>[<offset>]:na<value>
+          // Suppress this reading from JSON/MQTT (and the immediate publish) when the
+          // scaled value equals <value> — e.g. a Vaillant aroTHERM reports -99.0 on an
+          // inactive sensor (Heizstab-VL while the backup heater is off). The token is
+          // inert unless ':na' is present, so every existing descriptor is byte-identical.
+          if (cp && cp[0] == ':' && cp[1] == 'n' && cp[2] == 'a') {
+            double na_val = CharToDouble(cp + 3);
+            double na_diff = sml_globs.meter_vars[vindex] - na_val;
+            if (na_diff < 0) na_diff = -na_diff;
+            if (na_diff <= 0.001) {
+              sml_globs.dvalid[vindex] = 0;   // omit from periodic JSON / web group
+              goto nextsect;                  // and skip the immediate-MQTT publish
+            }
+          }
           SML_Immediate_MQTT((const char*)mp, vindex, mindex);
         }
       }
@@ -3114,6 +3703,19 @@ uint32_t SML_getscriptsize(char *lp) {
       break;
     }
   }
+  // Silent-fail guard: if the meter-definition terminator (`\n#`) is not found
+  // within METER_DEF_SIZE chars, mlen stays 0 and downstream treats the
+  // definition as empty (maxvars=0, ready=false, no clue why). Loud-fail
+  // instead so the user knows to bump METER_DEF_SIZE. Reported by Andreas
+  // 2026-05-27: spent half an afternoon debugging "SML doesn't start anymore"
+  // after bumping 64→100 registers, root cause was descriptor outgrew the
+  // default 3000.
+  if (mlen == 0) {
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("SML: meter def exceeds METER_DEF_SIZE=%u (no `\\n#` terminator found) "
+                "— SML will not start. Bump #define METER_DEF_SIZE in your build."),
+           (unsigned)METER_DEF_SIZE);
+  }
   //AddLog(LOG_LEVEL_INFO, PSTR("len=%d"),mlen);
   return mlen;
 }
@@ -3248,6 +3850,36 @@ case '6':
       break;
 
 #endif // USE_SML_CANBUS
+#ifdef USE_SML_EBUS_MASTER
+    case 'E':   // soE[,QQ] — enable enhanced eBUS active master, optional master address (hex)
+      cp++;
+      mp->ebm_qq = 0xff;
+      if (*cp == ',') { cp++; mp->ebm_qq = strtol(cp, &cp, 16); }
+      mp->ebm_enh = 1;
+      mp->ebm_state = EBM_NEED_INIT;
+      mp->ebm_haveb1 = 0;
+      mp->ebm_t0 = 0;
+      AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS enhanced master requested, QQ=%02x"), mp->ebm_qq);
+      break;
+    case 'R':   // soR[,QQ] — raw active-master TEST mode (no adapter/arbitration; Mac<->.39 UART harness)
+      cp++;
+      mp->ebm_qq = 0xff;
+      if (*cp == ',') { cp++; mp->ebm_qq = strtol(cp, &cp, 16); }
+      mp->ebm_raw = 1;
+      AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS raw master TEST mode, QQ=%02x"), mp->ebm_qq);
+      break;
+#ifdef USE_SML_EBUS_ARB
+    case 'F':   // soF[,QQ] — in-Firmware arbitration master (real multi-master bus)
+      cp++;
+      mp->ebm_qq = 0xff;
+      if (*cp == ',') { cp++; mp->ebm_qq = strtol(cp, &cp, 16); }
+      mp->ebm_arb = 1;
+      mp->eba_phase = EBA_IDLE;
+      mp->eba_bus = EBA_BUS_IDLE;
+      AddLog(LOG_LEVEL_INFO, PSTR("SML: eBUS in-firmware arbitration master, QQ=%02x"), mp->ebm_qq);
+      break;
+#endif // USE_SML_EBUS_ARB
+#endif // USE_SML_EBUS_MASTER
 	}
 	return cp;
 }
@@ -3270,11 +3902,14 @@ int SML_print(const char *format, ...) {
 	va_list copy;
 	va_start(arg, format);
 	va_copy(copy, arg);
-	len = vsnprintf(NULL, 0, format, arg);
+	// Size with the COPY, format with the original — a va_list must not be
+	// reused after a v*printf consumes it (UB; garbage args / crash on %s).
+	len = vsnprintf(NULL, 0, format, copy);
 	va_end(copy);
 	if (len >= sizeof(loc_buf)) {
 		temp = (char*)malloc(len + 1);
 		if (temp == NULL) {
+	  	va_end(arg);
 	  	return 0;
 	  }
 	}
@@ -3542,6 +4177,11 @@ void SML_Init(void) {
   if (*lp == '>' && *(lp + 1) == 'M') {
     lp += 2;
     sml_globs.meters_used = strtol(lp, &lp, 10);
+    // SECURITY: meter_desc[] is a fixed MAX_METERS array; a `>M <n>` header with
+    // n > MAX_METERS (a config typo) would make reset_sml_vars()/the init loops
+    // free()/delete wild pointers and write past the array → boot-loop / heap
+    // corruption. Clamp here (the per-line checks validate against this value).
+    if (sml_globs.meters_used > MAX_METERS) sml_globs.meters_used = MAX_METERS;
   } else {
     return;
   }
@@ -3640,7 +4280,7 @@ void SML_Init(void) {
             lp1++;
 #ifdef USE_SML_TCP
 #ifdef USE_SML_TCP_IP_STR
-            strcpy(mmp->ip_addr, str);
+            strlcpy(mmp->ip_addr, str, sizeof(mmp->ip_addr));  // SECURITY: str[32] into ip_addr[16]
 #else
             mmp->ip_addr.fromString(str);
 #endif
@@ -3880,6 +4520,10 @@ next_line:
     struct METER_DESC *mp = &meter_desc[meters];
     if (mp->sbsiz) {
       mp->sbuff = (uint8_t*)calloc(mp->sbsiz, 1);
+      // SECURITY: the entire RX path writes mp->sbuff[...] unconditionally; on a
+      // failed alloc (likely on RAM-tight ESP8266 with a large sbsiz) that's a
+      // NULL deref. Disable the meter rather than crash.
+      if (!mp->sbuff) { mp->type = 0; mp->sbsiz = 0; continue; }
 			memory += mp->sbsiz;
     }
   }
@@ -3896,6 +4540,9 @@ next_line:
   for (uint8_t meters = 0; meters < sml_globs.meters_used; meters++) {
     METER_DESC *mp = &meter_desc[meters];
     if (mp->type == 'c') {
+        // SECURITY: sml_counters[]/sml_cnt_index[] are MAX_COUNTERS deep; don't
+        // index/increment cindex past them (the command path already clamps).
+        if (cindex >= MAX_COUNTERS) break;
         if (mp->flag & ANALOG_FLG) {
 
         } else {
@@ -4071,6 +4718,7 @@ next_line:
         }
 #ifdef USE_ESP32_SW_SERIAL
         mp->meter_ss = new SML_ESP32_SERIAL(uart_index);
+        mp->hw_uart_index = uart_index;        // for SmlUploadPause: SW path uses meter_ss->rx_intr_disable() but field is harmless to set
         if (mp->srcpin >= 0) {
           if (uart_index == 0) { ClaimSerial(); }
           uart_index--;
@@ -4078,6 +4726,7 @@ next_line:
         }
 #else
         mp->meter_ss = new HardwareSerial(uart_index);
+        mp->hw_uart_index = uart_index;        // captured BEFORE the post-decrement — Pause/Resume reads this to silence the right UART
         if (uart_index == 0) { ClaimSerial(); }
         uart_index--;
         if (uart_index < 0) uart_index = 0;
@@ -4135,6 +4784,9 @@ next_line:
         if (mp->so_flags.SO_DISS_PULL) {
           gpio_pullup_dis((gpio_num_t)mp->srcpin);
         }
+#ifdef USE_SML_EBUS_ARB
+        Eba_AttachRx(meters);   // in-firmware arbitration (soF): attach the per-byte RX-event reader
+#endif
 #ifdef USE_ESP32_SW_SERIAL
 				mp->meter_ss->setRxBufferSize(mp->sibsiz);
 #endif
@@ -4775,7 +5427,12 @@ MODBUS_TCP_HEADER tcph;
   tcph.U_ID = *sbuff;
 
   sbuff++;
-  for (uint8_t cnt = 0; cnt < slen - 3; cnt++) {
+  // SECURITY: bound the copy to the payload field (8 bytes on ESP8266 / non-
+  // USE_BAT_CTRL builds) — a long modbus/FC16 frame otherwise overruns it. Also
+  // guard slen<3 (the slen-3 / SIZE math underflows as unsigned otherwise).
+  uint16_t pcnt = (slen >= 3) ? (slen - 3) : 0;
+  if (pcnt > sizeof(tcph.payload)) pcnt = sizeof(tcph.payload);
+  for (uint16_t cnt = 0; cnt < pcnt; cnt++) {
     tcph.payload[cnt] = *sbuff++;
   }
 
@@ -4882,12 +5539,18 @@ void SML_Send_Seq(uint32_t meter, char *seq) {
       *ucp++ = lowByte(crc);
 
       // now check for escapes
-      uint8_t ksbuff[24];
+      // SECURITY: a byte in the escape set expands to 2 output bytes, so the
+      // escaped frame can be ~2x slen. The old ksbuff[24] (and the memcpy back
+      // into sbuff[48]) overflowed for a long escape-heavy payload sent via
+      // SML_Write/SmlSend on a 'k' meter. Size ksbuff for the worst case and
+      // stop before klen+trailing-0x0d could exceed sbuff (the memcpy target).
+      uint8_t ksbuff[2 * sizeof(sbuff)];
       ucp = ksbuff;
       *ucp++ = 0x80;
       uint8_t klen = 1;
       for (uint16_t cnt = 0; cnt < slen; cnt++) {
         uint8_t iob = sbuff[cnt];
+        if (klen + 2 > sizeof(sbuff) - 1) break;   // keep slen=klen+1 <= sizeof(sbuff)
         if ((iob == 0x80) || (iob == 0x40) || (iob == 0x0d) || (iob == 0x06) || (iob == 0x1b)) {
           *ucp++ = 0x1b;
           *ucp++ = iob ^= 0xff;
@@ -4930,6 +5593,23 @@ void SML_Send_Seq(uint32_t meter, char *seq) {
     slen += 6;
   }
 
+#ifdef USE_SML_EBUS_MASTER
+  if (mp->type == 'e' && (mp->ebm_enh == 2 || mp->ebm_raw
+#ifdef USE_SML_EBUS_ARB
+                          || mp->ebm_arb
+#endif
+                         )) {
+    // active eBUS master: stage the telegram. Enhanced mode arbitrates via the adapter;
+    // raw-test mode blind-tx's on the next bus SYNC (Mac<->.39 UART harness); in-firmware
+    // arbitration (soF) routes through Ebm_QueueTelegram → EBA state machine. Either way
+    // we never blind-write the bare bytes here — adding `ebm_arb` closes the soF send
+    // trigger Andreas hit on .104 (without it, an soF meter fell through to a raw
+    // meter_ss->write() at the bottom of this function = unprotected blind-tx into the
+    // multi-master bus, exactly what the arbitration code is meant to prevent).
+    Ebm_QueueTelegram(meter, sbuff, slen);
+    return;
+  }
+#endif
   if (mp->srcpin == TCP_MODE_FLG) {
     sml_tcp_send(meter, sbuff, slen);
   } else {
@@ -5147,6 +5827,19 @@ bool XSNS_53_cmd(void) {
           }
           ResponseTime_P(PSTR(",\"SML\":{\"CMD\":\"sml_globs.ser_act_LED_pin: %d\"}}"), sml_globs.ser_act_LED_pin);
         }
+#ifdef USE_SML_EBUS_ARB
+      } else if (*cp == 'a') {
+        // eBUS in-firmware arbitration diagnostics (won/lost/late tune EBM_ARB_TX_LEAD_US on the scope)
+        int8_t mi = eba_rx_meter;
+        if (mi >= 0) {
+          struct METER_DESC *mp = &meter_desc[mi];
+          ResponseTime_P(PSTR(",\"SML\":{\"EbusArb\":{\"qq\":\"%02x\",\"won\":%u,\"lost\":%u,\"late\":%u,\"restarts\":%u,\"giveup\":%u,\"req\":%u,\"phase\":%u}}}"),
+            mp->ebm_qq, (unsigned)mp->eba_won, (unsigned)mp->eba_lost, (unsigned)mp->eba_late,
+            (unsigned)mp->eba_restarts, (unsigned)mp->eba_giveup, (unsigned)mp->ebm_req, (unsigned)mp->eba_phase);
+        } else {
+          ResponseTime_P(PSTR(",\"SML\":{\"EbusArb\":\"not attached\"}}"));
+        }
+#endif
       } else {
         serviced = false;
       }

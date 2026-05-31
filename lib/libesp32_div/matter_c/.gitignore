@@ -1,0 +1,4 @@
+# Generated dev attestation credentials (contains a dev DAC private key).
+# Produced by test/gen_attest_creds.py for gated MTRC_ATTEST_TEST_CREDS builds.
+# Never shipped; regenerate locally rather than committing keys.
+include/mtrc_attest_creds.h

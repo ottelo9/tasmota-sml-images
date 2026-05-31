@@ -1,0 +1,17 @@
+{
+  "name": "matter_c",
+  "version": "0.1.0",
+  "description": "Minimal pure-C Matter device library. Firmware-agnostic core; all host couplings (persistence, time, RNG, UDP, BLE, mDNS) are injected through a port/HAL struct so it can be reused by any firmware. Inspired by the device-subset architecture of Tasmota Berry Matter (S. Hadinger); crypto via BearSSL (T. Pornin, BSD).",
+  "keywords": ["matter", "csa", "smart-home", "esp32", "homekit-alternative"],
+  "license": "GPL-3.0-or-later",
+  "frameworks": "*",
+  "platforms": ["espressif32"],
+  "headers": ["matter_c.h"],
+  "export": {
+    "include": ["include", "src"]
+  },
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}

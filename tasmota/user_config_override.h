@@ -177,6 +177,7 @@
 //-- Filesystem (für SML-Meter-Files, Scripte, TinyC-Bytecode, TinyC-IDE)
 //-- ESP8266 1M hat kein UFILESYS — dort nutzt der Scripter EEPROM (siehe TAS-Block).
 #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
+  #define USE_PING // Enable Ping command (+2k code)
   #define USE_UFILESYS
   #undef UFSYS_SIZE
   #if defined(TASMOTA4M_OTTELO)
@@ -284,6 +285,16 @@
 // TINYC-Variante (TinyC VM + Browser-IDE, KEIN Scripter)
 //=============================================================================
 #ifdef OTTELO_VARIANT_TC
+
+  // Matter-Bridge — https://gemu2015.github.io/Sonoff-Tasmota/reference/?h=#matter-esp32-requires-use_matter_c
+  // Braucht zwingend USE_DISCOVERY (mDNS) für Service-Advertising, sonst
+  // gibt's Linker-Error "undefined reference to StartMdns()" beim Matter-Init.
+  // Tasmota's my_user_config.h hat USE_DISCOVERY per Default auskommentiert.
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
+    #define USE_MATTER_C
+    #define USE_DISCOVERY        //+8KB Flash, +0.3KB RAM — mDNS, von Matter benötigt
+    #define WEBSERVER_ADVERTISE  //<Hostname>.local/ — Standard zusammen mit mDNS
+  #endif
 
   //-- TinyC braucht USE_RULES nicht — der SML-Init-Gate (`Settings->rule_enabled`
   //-- Bit 0) wird vom TinyC-Programm direkt über die Built-in-Variable `tasm_rule`

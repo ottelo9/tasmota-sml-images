@@ -820,7 +820,12 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_picotts_shutdown,            // 211
   JMPTBL&tmod_picotts_set_idle_notify,     // 212
   JMPTBL&tmod_picotts_set_error_notify,    // 213
-  JMPTBL&tmod_picotts_set_resources        // 214
+  JMPTBL&tmod_picotts_set_resources,       // 214
+  JMPTBL&tmod_expf,                        // 215  expf() — append-only, 0..214 unchanged
+  JMPTBL&tmod_I2cWrite8Bus,                // 216  I2cWrite8 4-arg dual-bus (jt[45] 3-arg left intact)
+  JMPTBL&tmod_I2cWrite0,                   // 217  I2cWrite0 dual-bus
+  JMPTBL&tmod_I2cReadBuffer0,              // 218  I2cReadBuffer0 dual-bus
+  JMPTBL&tmod_ext_call                     // 219  selector-dispatched extensible helper (ONE slot for many fns; new helper = new case, never a new jt slot)
 };
 
 // Engine prototypes come from lib/libesp32_div/pico/picotts.h, included
@@ -1698,6 +1703,12 @@ sel &= 0xff;
   return 0;
 }
 
+#if defined(ESP32) && defined(JPEG_PICTS)
+// Draw_jpeg lives in xdrv_13_display; its prototype used to come from the
+// Scripter (xdrv_10_scripter). Declare it here so JPEG_PICTS works in
+// scripter-less builds (TINYC_NO_SCRIPTER) too.
+void Draw_jpeg(uint8_t *mem, uint16_t jpgsize, uint16_t xp, uint16_t yp, uint8_t scale);
+#endif
 uint32_t tmod_jpeg_picture(uint32_t mem, uint32_t jpgsize, uint32_t xp, uint32_t yp, uint32_t scale) {
 #if  defined(ESP32) && defined(JPEG_PICTS)
   Draw_jpeg((uint8_t*)mem, jpgsize, xp, yp, scale);
@@ -1716,6 +1727,50 @@ float tmod_sinf(float a) { return sinf(a); }
 float tmod_cosf(float a) { return cosf(a); }
 float tmod_logf(float a) { return logf(a); }
 float tmod_sqrtf(float a) { return sqrtf(a); }
+float tmod_expf(float a) { return expf(a); }
+// Append-only dual-bus I2C wrappers (JMPTBL 216..218). The frozen
+// 3-arg jI2cWrite8 (jt[45]) is intentionally left untouched; these are
+// NEW slots so no existing plugin .bin behaviour changes.
+bool tmod_I2cWrite8Bus(uint32_t addr, uint32_t reg, uint32_t val, uint32_t bus) { return I2cWrite8(addr, reg, val, bus); }
+bool tmod_I2cWrite0(uint32_t addr, uint32_t reg, uint32_t bus) { return I2cWrite0(addr, reg, bus); }
+bool tmod_I2cReadBuffer0(uint32_t addr, uint8_t *buf, uint32_t len, uint32_t bus) { return I2cReadBuffer0(addr, buf, len, bus); }
+
+// jt[219] — ONE selector-dispatched slot so the frozen JMPTBL grows by
+// a single entry, not once per helper. Adding a future helper = a new
+// `case` here; NEVER a new jt slot. All args/return are uint32_t-wide
+// (ESP32 pointers are 32-bit); float/pointer payloads are bit-cast by
+// the plugin-side j-macros in module_defines.h. APPEND-ONLY: 0..218
+// are byte-identical, so no existing plugin .bin behaviour changes.
+//   sel 0 I2cRead8(a,r,bus)        4 I2cRead24(a,r,bus)
+//   sel 1 I2cRead16LE(a,r,bus)     5 I2cReadS16_LE(a,r,bus)
+//   sel 2 CalcTempHumToDew(t,h)    (a,b = float bits)
+//   sel 3 TempUnit()              6 PressureUnit() -> const char*
+int32_t tmod_ext_call(uint32_t sel, uint32_t a, uint32_t b, uint32_t c) {
+  switch (sel) {
+    case 0: return (int32_t)(uint8_t)  I2cRead8((uint8_t)a, (uint8_t)b, (uint8_t)c);
+    case 1: return (int32_t)(uint16_t) I2cRead16LE((uint8_t)a, (uint8_t)b, (uint8_t)c);
+    case 2: { float t, h, r;                       // CalcTempHumToDew
+              memcpy(&t, &a, 4); memcpy(&h, &b, 4);
+              r = CalcTempHumToDew(t, h);
+              int32_t o; memcpy(&o, &r, 4); return o; }
+    case 3: return (int32_t)(uint8_t)  TempUnit();
+    case 4: return                     I2cRead24((uint8_t)a, (uint8_t)b, (uint8_t)c);
+    case 5: return (int32_t)(int16_t)  I2cReadS16_LE((uint8_t)a, (uint8_t)b, (uint8_t)c);
+    case 6: { static String _pu; _pu = PressureUnit();
+              return (int32_t)(intptr_t) _pu.c_str(); }
+    case 7: { float p, r; memcpy(&p, &a, 4);          // ConvertPressure
+              r = ConvertPressure(p);
+              int32_t o; memcpy(&o, &r, 4); return o; }
+    case 8: { float p, r; memcpy(&p, &a, 4);          // ...ForSeaLevel
+              r = ConvertPressureForSeaLevel(p);
+              int32_t o; memcpy(&o, &r, 4); return o; }
+    case 9:  ResponseCmndIdxNumber((int)a); return 0;       // void
+    case 10: return (int32_t) SqrtInt((uint32_t)a);
+    case 11: return (int32_t) GetPin((uint32_t)a);
+    case 12: DigitalWrite((uint32_t)a,(uint32_t)b,(uint32_t)c); return 0; // void
+  }
+  return 0;
+}
 
 // shine mpeg3 encoder about 31kB code
 uint32_t tmod_shine(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3) {
@@ -2761,6 +2816,7 @@ const void * TGTAB[] PROGMEM = {
   &TasmotaGlobal.global_state,
   &TasmotaGlobal.gpio_pin,
   &RtcSettings,
+  &TasmotaGlobal.i2c_enabled,              // 13  append-only — 0..12 unchanged
 };
 
 void *tmod_gtbl(void) {
@@ -3374,6 +3430,7 @@ void Unlink_Named_Module(char *name) {
 }
 
 void Unlink_Module(uint32_t module) {
+  if (module >= MAX_PLUGINS) return;   // SECURITY: bound web-supplied index (also catches the module-1=0xFFFFFFFF underflow)
   if (modules[module].mod_addr) {
     if (modules[module].flags.initialized) {
       // call deiniz
@@ -3395,6 +3452,7 @@ void Unlink_Module(uint32_t module) {
 
 
 void Read_Module_Data(uint32_t module, uint32_t *data) {
+  if (module >= MAX_PLUGINS) return;   // SECURITY: bound web-supplied index
   if (modules[module].mod_addr) {
     FLASH_MODULE *fm = (FLASH_MODULE*)modules[module].mod_addr;
     if (fm->sync == MODULE_SYNC) {
@@ -3414,6 +3472,7 @@ void Read_Module_Data(uint32_t module, uint32_t *data) {
 }
 
 void Update_Module_Data(uint32_t module, uint32_t *data) {
+  if (module >= MAX_PLUGINS) return;   // SECURITY: bound web-supplied index (else OOB mod_addr -> arbitrary flash erase)
   if (modules[module].mod_addr) {
     uint8_t flag = modules[module].flags.initialized;
     if (flag) {
@@ -3674,6 +3733,7 @@ static void tc_blib_register_module(uint8_t module_idx) {
 }
 
 int32_t Init_module(uint32_t module) {
+  if (module >= MAX_PLUGINS) return 0;   // SECURITY: bound web-supplied index
   if (modules[module].mod_addr && !modules[module].flags.initialized) {
     const FLASH_MODULE *fm = (FLASH_MODULE*)modules[module].mod_addr;
     uint32_t mtv = fm->mtv;
@@ -3821,6 +3881,7 @@ void Module_iniz(void) {
 }
 
 void Deiniz_module(uint32_t module) {
+  if (module >= MAX_PLUGINS) return;   // SECURITY: bound web-supplied index
   if (modules[module].mod_addr && modules[module].flags.initialized) {
     const FLASH_MODULE *fm = (FLASH_MODULE*)modules[module].mod_addr;
     int32_t result = MOD_EXEC(pFUNC_DEINIT);

@@ -39,6 +39,11 @@
 #define SOC_UART_HP_NUM SOC_UART_NUM        // Set new define SOC_UART_HP_NUM in pre IDF 5.2 to SOC_UART_NUM
 #endif
 
+#else
+// ESP8266: SERIAL_8N1 lives in <HardwareSerial.h>, brought in transitively by
+// <Arduino.h>. Self-contained header so TUs that include TasmotaSerial.h
+// without Arduino.h first (e.g. some dual-format plugin sources) still build.
+#include <Arduino.h>
 #endif
 
 class TasmotaSerial : public Stream {

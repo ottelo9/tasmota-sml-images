@@ -10187,10 +10187,27 @@ const char HTTP_FORM_SCRIPT1b[] PROGMEM =
 
     "</script>";
 
+// Save posts the textarea as a multipart *file part* (Blob) so the
+// ESP8266 WebServer streams it to HandleScriptUpload() chunk-by-chunk
+// instead of buffering the whole body + a second arg() copy. `save`/`c1`
+// ride along as tiny normal fields. The response (Management page) is
+// written back into the document to mimic the old form-submit navigation.
 const char HTTP_SCRIPT_FORM_END[] PROGMEM =
       "<br/>"
-      "<button name='save' type='submit' formmethod='post' formenctype='multipart/form-data' formaction='/ta' class='button bgrn'>" D_SAVE "</button>"
-      "</form></fieldset>";
+      "<button type='button' onclick='scrsav()' class='button bgrn'>" D_SAVE "</button>"
+      "</form></fieldset>"
+      "<script>"
+      "function scrsav(){"
+      "var t=eb('t1');if(!t)return;"
+      "var f=new FormData();"
+      "f.append('save','1');"
+      "var c=eb('c1');if(c&&c.checked)f.append('c1','1');"
+      "f.append('t1',new Blob([t.value],{type:'text/plain'}),'t1');"
+      "fetch('/ta',{method:'POST',body:f}).then(function(r){return r.text();})"
+      ".then(function(h){document.open();document.write(h);document.close();})"
+      ".catch(function(){alert('save failed');});"
+      "}"
+      "</script>";
 
 #ifdef USE_SCRIPT_FATFS
 const char HTTP_FORM_SCRIPT1c[] PROGMEM =
@@ -10352,6 +10369,71 @@ uint16_t section_seek_end(char *lp) {
     lp = cp + 1;
   }
   return ((uint32_t)lp - (uint32_t)op) + 2;
+}
+
+// ── Streaming script save (ESP8266 RAM workaround) ─────────────────────────
+// The legacy save path did `String str = Webserver->arg("t1")` — on ESP8266
+// the WebServer first buffers the whole multipart body to parse the `t1`
+// field, then arg() makes a *second* full copy, so saving an N-byte script
+// transiently needed ~2-3×N heap on top of the permanent script_ram buffer.
+// That transient spike (not the steady state) is what capped editable size
+// far below script_size on ESP8266.
+//
+// Fix: the browser posts `t1` as a multipart *file part* (Blob, see the
+// save-button JS in HTTP_SCRIPT_FORM_END). File parts bypass arg-buffering
+// entirely — the WebServer streams them to this upload callback in chunks,
+// which we write straight into glob_script_mem.script_ram. No String, no
+// duplicate arg copy: peak extra heap during save drops from ~2-3×N to ~0.
+// Capable browsers (all modern) take this path; anything else falls back to
+// the legacy buffered branch in ScriptSaveSettings() so behaviour is
+// unchanged where the fast path can't run.
+static bool     script_ta_streamed = false;   // set true once a stream completed
+static uint32_t script_ta_widx = 0;            // write cursor into script_ram
+
+// In-place CR/CRLF → LF (matches the old String.replace() pair, no 2nd buffer)
+static void script_normalize_eol(char *p) {
+  char *w = p;
+  for (char *r = p; *r; r++) {
+    if (*r == '\r') {
+      if (*(r + 1) == '\n') { continue; }      // \r\n → \n (drop \r, keep \n)
+      *w++ = '\n';                              // lone \r → \n
+    } else {
+      *w++ = *r;
+    }
+  }
+  *w = 0;
+}
+
+void HandleScriptUpload(void) {
+  HTTPUpload& upload = Webserver->upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (!HttpCheckPriviledgedAccess()) { Web.upload_error = 1; return; }
+    script_ta_streamed = false;
+    script_ta_widx = 0;
+    if (glob_script_mem.script_ram && glob_script_mem.script_size > 0) {
+      glob_script_mem.script_ram[0] = 0;
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Web.upload_error || !glob_script_mem.script_ram) { return; }
+    uint32_t cap = (glob_script_mem.script_size > 0)
+                   ? (uint32_t)glob_script_mem.script_size - 1 : 0;
+    uint32_t n = upload.currentSize;
+    if (script_ta_widx + n > cap) {
+      n = (script_ta_widx < cap) ? (cap - script_ta_widx) : 0;  // truncate to fit
+      AddLog(LOG_LEVEL_INFO, PSTR("SCR: script truncated at %u B (script_size %u)"),
+             (unsigned)cap, (unsigned)glob_script_mem.script_size);
+    }
+    if (n) {
+      memcpy(glob_script_mem.script_ram + script_ta_widx, upload.buf, n);
+      script_ta_widx += n;
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Web.upload_error || !glob_script_mem.script_ram) { return; }
+    glob_script_mem.script_ram[script_ta_widx] = 0;
+    script_ta_streamed = true;
+  }
 }
 
 void HandleScriptTextareaConfiguration(void) {
@@ -10590,6 +10672,26 @@ void ScriptSaveSettings(void) {
     bitWrite(Settings->rule_enabled, 0, 0);
   }
 
+  if (script_ta_streamed) {
+    // Fast path: HandleScriptUpload() already streamed the script straight
+    // into script_ram (no String, no duplicate arg buffer).
+    script_ta_streamed = false;
+    if (glob_script_mem.script_ram && glob_script_mem.script_ram[0]) {
+      script_normalize_eol(glob_script_mem.script_ram);   // CR/CRLF → LF, in place
+      if (glob_script_mem.script_ram[0]!='>' && glob_script_mem.script_ram[1]!='D') {
+        AddLog(LOG_LEVEL_INFO, PSTR("SCR: error, must start with >D"));
+        bitWrite(Settings->rule_enabled, 0, 0);
+      }
+      SaveScript();
+    } else {
+      AddLog(LOG_LEVEL_INFO, PSTR("SCR: empty script"));
+    }
+    SaveScriptEnd();
+    return;
+  }
+
+  // Legacy buffered fallback — browsers without fetch/Blob, or callers that
+  // still POST `t1` as a normal form field. Same behaviour as before.
   String str = Webserver->arg("t1");
 
   if (*str.c_str()) {
@@ -14982,7 +15084,7 @@ bool Xdrv10(uint32_t function) {
 #endif // USE_SCRIPT_WEB_DISPLAY
     case FUNC_WEB_ADD_HANDLER:
       Webserver->on("/" WEB_HANDLE_SCRIPT, HandleScriptConfiguration);
-      Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration);
+      Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration, HandleScriptUpload);
       Webserver->on("/exs", HTTP_POST,[]() { Webserver->sendHeader("Location","/exs");Webserver->send(303);}, script_upload_start);
       Webserver->on("/exs", HTTP_GET, ScriptExecuteUploadSuccess);
 #if defined(USE_UFILESYS) && defined(USE_SCRIPT_WEB_DISPLAY)

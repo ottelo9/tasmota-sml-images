@@ -35,6 +35,10 @@
 // Default TinyC bytecode repository (used when /tinyc_repo.cfg is not present)
 #define TINYC_DEFAULT_REPO "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/bytecode"
 
+// Default URL for the TinyC IDE itself (one level up from the bytecode repo).
+// Used by `TinyCIde` to self-update the served /tinyc_ide.html.gz from the repo.
+#define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/tinyc_ide.html.gz"
+
 // Global pause flag — set by filesystem upload handler (xdrv_50) to pause VM during uploads
 bool tc_global_pause = false;
 
@@ -65,6 +69,29 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 // pulls in struct linger, SOL_SOCKET, SO_LINGER on ESP32's lwIP.
 #ifdef ESP32
   #include <lwip/sockets.h>
+#endif
+
+// Matter data-model API must be visible INSIDE the VM header (its SYS_MTR_*
+// handlers call matter_*). Included here, ahead of the VM header, so the real
+// prototypes/types are in scope; the include guard makes the later include in
+// the USE_MATTER_C block (with the port wiring) a harmless no-op.
+#ifdef USE_MATTER_C
+  #include "matter_c.h"
+  // Lazy start: Matter is compiled in but stays completely off (no mDNS, no UDP
+  // socket, no fabric load, no advertising) until a TinyC script first uses an
+  // mtr* syscall — same "off until enabled" model as HomeKit's hkStart(). These
+  // are defined further down (with the port wiring); forward-declared here so
+  // the VM header's mtr* syscall handlers can call them.
+  static bool mtrc_ensure_inited(void);   // init the core once (data model live)
+  static int  mtrc_request_start(void);   // matterStart(): advertise + commission
+
+  // C-linkage shim so pure-C matter_c.c can call Tasmota's PSRAM-aware
+  // special_malloc helper (the helper itself lives in a .ino, so its symbol
+  // is C++-mangled; a plain `extern void *special_malloc(...)` in a .c TU
+  // wouldn't resolve at link time). matter_init() uses this for the ~22 KB
+  // context so it lives in PSRAM on boards that have PSRAM, freeing
+  // internal DRAM where it matters most.
+  extern "C" void *matter_special_malloc(size_t n) { return special_malloc(n); }
 #endif
 
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
@@ -368,7 +395,22 @@ static uint8_t tc_qpc_counter(void) {
 #endif
 }
 
+static void tc_bootloop_marker_delete(void);           // fwd (defined below)
+
 static bool tc_bootloop_detected(void) {
+#ifdef ESP32
+  // Fix B (belt+suspenders to Fix A): a clean software reset
+  // (esp_restart from a `Restart` command / OTA / commanded reboot)
+  // is by definition NOT a crash-loop. Don't trip on it, and proactively
+  // clear any stale marker so a sequential `Restart 1` (esp. right
+  // after an OTA flash, when Tasmota also reports "settings reset")
+  // can never disable autoexec. Crash resets (PANIC/WDT/BROWNOUT) and
+  // power-on (handled by the QPC counter) still go through detection.
+  if (esp_reset_reason() == ESP_RST_SW) {
+    tc_bootloop_marker_delete();
+    return false;
+  }
+#endif
   if (tc_bootloop_marker_present()) return true;       // primary: filesystem marker
   if (tc_qpc_counter() >= TC_BOOTLOOP_QPC_THRESHOLD) return true; // QPC: power-cycle storm
   if (TasmotaGlobal.no_autoexec) return true;          // fallback: Tasmota's gate
@@ -715,21 +757,44 @@ static const char TC_NOT_INIT[] PROGMEM = "Not initialized";
 #define D_PRFX_TINYC "TinyC"
 
 void CmndCheckPartition(void);
+void CmndTinyCIde(void);
+#ifdef USE_MATTER_C
+void CmndMatterReset(void);
+#endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info"
+  "|Run|Stop|Reset|Exec|Info|Ide"
 #ifdef ESP32
   "|Chkpt"
+#endif
+#ifdef USE_MATTER_C
+  "|MtrReset"
 #endif
   ;
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
-  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde
 #ifdef ESP32
   , &CmndCheckPartition
 #endif
+#ifdef USE_MATTER_C
+  , &CmndMatterReset
+#endif
 };
+
+#ifdef USE_MATTER_C
+// TinyCMtrReset — factory-reset Matter: wipe all commissioned fabrics (RAM +
+// persisted UFS blob) and restart so the node re-advertises commissionable for
+// a fresh pairing. Use between commissioning attempts / to leave a controller.
+void CmndMatterReset(void) {
+  mtrc_ensure_inited();    // alloc context + load any persisted fabric so it can be wiped
+  matter_factory_reset();
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: factory reset — fabrics wiped, restarting"));
+  ResponseCmndDone();
+  TasmotaGlobal.restart_flag = 2;
+}
+#endif
 
 // --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
 #ifdef ESP32
@@ -1681,9 +1746,17 @@ static void HandleTinyCPage(void) {
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
     "<button onclick=\"window.open('/ide','tinyc_ide')\" "
-    "class='button bgrn'>Open IDE</button>"
+    "class='button bgrn'>Open IDE</button> "
+    "<button id='tcide_upd' onclick=\""
+    "if(!confirm('Update the IDE from the repository? (downloads tinyc_ide.html.gz, ~190 KB, and replaces the served IDE)'))return;"
+    "var b=this;b.disabled=1;b.textContent='Updating...';"
+    "fetch('/cm?cmnd=TinyCIde').then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
+    "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes). Re-open the IDE.');}"
+    "else{b.disabled=0;b.textContent='Update IDE';alert('IDE update failed (error '+d.error+'). The old IDE was kept.');}})"
+    ".catch(e=>{b.disabled=0;b.textContent='Update IDE';alert('IDE update request failed.');});\" "
+    "class='button'>Update IDE</button>"
     "</p>"
-    "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem (port 82 background task on real hw, port 80 fallback otherwise)</p>"));
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem (port 82 background task on real hw, port 80 fallback otherwise). \"Update IDE\" fetches the latest from the repo &mdash; no file manager needed.</p>"));
 #else
   WSContentSend_P(PSTR(
     "<div class='tc-ide-url'>"
@@ -1715,6 +1788,18 @@ static void HandleTinyCPage(void) {
       "</p></fieldset>"));
   }
 #endif
+
+  // Auto-refresh: re-fetch the page whenever the browser tab regains
+  // visibility (typical flow: user runs/stops a slot via the IDE tab,
+  // switches back to this tab — without this, slot state stayed stale
+  // until manual reload). Doesn't poll while the tab is hidden, so no
+  // background traffic.
+  WSContentSend_P(PSTR(
+    "<script>"
+    "document.addEventListener('visibilitychange',function(){"
+      "if(!document.hidden)location.reload();"
+    "});"
+    "</script>"));
 
   WSContentSpaceButton(BUTTON_MANAGEMENT);
   WSContentEnd();
@@ -1779,6 +1864,180 @@ static void HandleTinyCUploadDone(void) {
 static void HandleTinyCUploadCORS(void) {
   TCSendCORS("POST, OPTIONS");
   Webserver->send(204);
+}
+
+// ── Flash-FS write coordination (xdrv_50 /ufsu file-manager uploads) ──────────
+// A large internal-flash write (LittleFS) repeatedly disables the SPI flash
+// cache for each erase/program. On a dual-core node, while a TinyC VM task
+// exists the write DEADLOCKS the device (no watchdog recovery) — reproduced and
+// serial-traced by uploading the ~183 KB IDE to a Matter-bridge TaskLoop node.
+// (Suppressing main-loop callbacks via tc_global_pause alone is NOT enough —
+// tc_vm_task keeps stepping; and merely pausing / vTaskSuspend()ing it is also
+// NOT enough — the task still wedges the write. Verified the hard way.)
+//
+// TinyCFsWritePause() fully STOPS each running VM task (off the scheduler, like
+// TinyCStop) for the duration of the write — the only thing that lets it through
+// (~3 s vs a hard hang). Resume RESTARTS them: main() re-runs, which for the
+// bridge re-runs matterReset()+rebuild — identical to a normal boot, so the
+// Matter fabric (persisted on UFS) and commissioning survive.
+// Non-static so xdrv_50 can call them through a forward `extern` declaration.
+#ifndef TC_FS_BIG_WRITE
+#define TC_FS_BIG_WRITE 16384        // bytes: only /ufsu uploads >= this stop the VM.
+                                     // Small writes touch a few flash blocks and never
+                                     // deadlock, so they skip the bridge-disrupting
+                                     // stop/restart. Override with -DTC_FS_BIG_WRITE=N.
+#endif
+void TinyCFsWritePause(uint32_t fsize) {
+  // Size-gate: skip the VM stop for small writes (the common case — config /
+  // small .tc / data files). fsize==0 means the client didn't declare a size
+  // (?fsz=) so assume it could be large and protect.
+  if (fsize > 0 && fsize < TC_FS_BIG_WRITE) return;
+  tc_global_pause = true;             // also gates main-loop callbacks (see Xdrv124)
+  if (!Tinyc) return;
+#ifdef ESP32
+  // STOP (delete) each running VM task for the duration of the flash write.
+  // Verified the hard way on a dual-core S3 Matter bridge: cooperatively
+  // pausing or vTaskSuspend()ing the VM task is NOT enough — a large internal-
+  // flash (LittleFS) write still wedges while the task merely exists. Only
+  // FULLY removing it from the scheduler (exactly what TinyCStop does, which
+  // let the same 183 KB upload through in ~3 s) reliably works. main() is
+  // re-run on resume; the bridge's main() starts with matterReset() and
+  // rebuilds its endpoints (identical to a normal boot — the Matter fabric
+  // persists on UFS), so no commissioning is lost.
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (s && s->loaded && s->task_running) {
+      s->fs_was_running = true;
+      TinyCStopVM(s);                 // sets task_stop + waits for the task to exit
+    }
+  }
+#endif
+}
+
+void TinyCFsWriteResume(void) {
+  tc_global_pause = false;
+#ifdef ESP32
+  if (Tinyc) {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->fs_was_running) {
+        s->fs_was_running = false;
+        TinyCStartVM(s);              // re-runs main() (re-runs matterReset()+rebuild for the bridge)
+      }
+    }
+  }
+#endif
+}
+
+#ifdef USE_UFILESYS
+// Fetch the TinyC IDE (tinyc_ide.html.gz) from `url` and replace the on-FS
+// /tinyc_ide.html.gz that the /ide handler serves — lets the IDE be self-updated
+// from the console (TinyCIde) without the Tasmota file-manager upload page.
+// Safety: stream to a .tmp first, validate the gzip magic + a sane size, and
+// only then rename over the live IDE (a failed/short fetch must NOT brick the
+// served IDE). The ~150-190 KB LittleFS write is bracketed by TinyCFsWritePause
+// (stops VM tasks so none touch flash during the cache-disabled close) + a
+// loop-WDT hold, mirroring the /ufsu big-write path. Returns bytes (>0) or <0.
+static int tc_fetch_ide(const char *url) {
+  if (!ufsp || !url || !url[0]) return -1;
+  const char *dst = "/tinyc_ide.html.gz";
+  const char *tmp = "/tinyc_ide.html.gz.tmp";
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+  HTTPClientLight http;
+#else
+  WiFiClient http_client;
+  HTTPClient http;
+#endif
+  http.setTimeout(15000);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+  bool begun = http.begin(url);
+#else
+  bool begun = http.begin(http_client, url);
+#endif
+  if (!begun) { AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch begin() failed")); return -2; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK && code != HTTP_CODE_MOVED_PERMANENTLY) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch HTTP %d"), code);
+    http.end(); return -3;
+  }
+  TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
+  File f = ufsp->open(tmp, "w");
+  int written = 0; bool magic = false;
+  if (f) {
+    WiFiClient *stream = http.getStreamPtr();
+    int32_t len = http.getSize();
+    bool unknown = (len < 0);
+    if (unknown) len = 0x7fffffff;
+    uint8_t *buf = (uint8_t *)malloc(1024);
+    if (buf) {
+      uint32_t t0 = millis();
+      bool first = true;
+      while (http.connected() && len > 0 && (millis() - t0) < 30000) {
+        size_t avail = stream->available();
+        if (avail) {
+          if (avail > 1024) avail = 1024;
+          int rd = stream->readBytes(buf, avail);
+          if (rd <= 0) break;
+          if (first) { magic = (rd >= 2 && buf[0] == 0x1f && buf[1] == 0x8b); first = false; }
+          f.write(buf, rd);
+          written += rd;
+          if (!unknown) len -= rd;
+        } else {
+          delay(1);                                 // yield to WiFi/other tasks
+        }
+      }
+      free(buf);
+    }
+#ifdef ESP32
+    disableLoopWDT();                               // the cache-disabled close() can run multi-second
+#endif
+    f.close();
+#ifdef ESP32
+    feedLoopWDT(); enableLoopWDT();
+#endif
+  }
+  http.end();
+  TinyCFsWriteResume();
+  if (written < 1000 || !magic) {                   // reject garbage/short downloads — keep the old IDE
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — kept old"), written, magic);
+    ufsp->remove(tmp);
+    return -5;
+  }
+  // Atomically replace the live IDE. Try a direct rename first — LittleFS
+  // overwrites atomically, so there is no window where the served IDE is
+  // missing. Only if that fails (e.g. a FAT/SD backend that can't rename over
+  // an existing file) fall back to remove + retry.
+  if (!ufsp->rename(tmp, dst)) {
+    ufsp->remove(dst);
+    if (!ufsp->rename(tmp, dst)) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE rename failed"));
+      ufsp->remove(tmp);
+      return -6;
+    }
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE updated %d bytes from %s"), written, url);
+  return written;
+}
+#endif // USE_UFILESYS
+
+// TinyCIde [url] — download tinyc_ide.html.gz from the repo (or a given URL) and
+// replace the served IDE on the filesystem. No Tasmota file-manager needed.
+//   TinyCIde            -> default repo (TINYC_DEFAULT_IDE_URL)
+//   TinyCIde <full-url> -> a specific URL (e.g. a self-hosted / branch build)
+void CmndTinyCIde(void) {
+#ifdef USE_UFILESYS
+  char url[200];
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.data[0]) {
+    strlcpy(url, XdrvMailbox.data, sizeof(url));
+  } else {
+    strlcpy(url, TINYC_DEFAULT_IDE_URL, sizeof(url));
+  }
+  int n = tc_fetch_ide(url);
+  if (n > 0) { Response_P(PSTR("{\"TinyCIde\":{\"updated\":%d}}"), n); }
+  else       { Response_P(PSTR("{\"TinyCIde\":{\"error\":%d}}"), n); }
+#else
+  ResponseCmndChar_P(PSTR("no filesystem"));
+#endif
 }
 
 static void HandleTinyCUpload(void) {
@@ -1905,6 +2164,10 @@ static void HandleTinyCUpload(void) {
 #ifdef USE_UFILESYS
         if (ufsp) {
           const char *saveName = s->filename[0] ? s->filename : TC_FILE_NAME;
+          // NOTE: small .tcb write — not wrapped in TinyCFsWritePause (that's
+          // for the large /ufsu file-manager uploads that hang). tc_deploy
+          // stops/runs the target slot itself, so stopping all slots here would
+          // needlessly disrupt other running scripts (e.g. a Matter bridge).
 #ifdef USE_WEBCAM
           WcInterrupt(0);
 #endif
@@ -2421,6 +2684,598 @@ static void HandleHomeKitQR(void) {
 }
 #endif  // USE_HOMEKIT
 
+// ---- Matter pairing page (/mt) — replaces HomeKit when USE_MATTER_C ----
+// HomeKit and Matter are mutually exclusive (see user_config_override.h:
+// TINYC_HOMEKIT vs TINYC_MATTER). They share the same TinyC integration
+// slot, so this is the structural twin of HandleHomeKitQR above. The page
+// also forces the reusable matter_c library to link in a TINYC_MATTER build.
+#ifdef USE_MATTER_C
+#include "matter_c.h"
+#include <esp_random.h>
+#include <AsyncUDP.h>
+#include <mdns.h>          // ESP-IDF mDNS: commissionable subtypes (_L/_S/_CM)
+
+// Matter operational/commissioning UDP socket (port 5540). Inbound packets
+// are pumped into matter_udp_rx; the responder replies to the last peer.
+#define MTRC_COMMISSION_PORT_HOST 5540    // Matter operational/commissioning UDP port
+static AsyncUDP mtrc_udp;
+static IPAddress mtrc_peer_ip;
+static uint16_t  mtrc_peer_port = 0;
+// Last KNOWN-GOOD IPv6 peer. AsyncUDP intermittently mis-flags an inbound IPv6
+// datagram as IPv4 (isIPv6()==false -> remoteIP() returns garbage like
+// 158.158.110.255), which would clobber the reply address. We only refresh this
+// from datagrams that are reliably IPv6, and reply here for Matter (IPv6) peers.
+static IPAddress mtrc_peer_ip6;
+static uint16_t  mtrc_peer_port6 = 0;
+static bool      mtrc_udp_listening = false;
+
+// Per-packet AddLog formatting (`IPAddress::toString()` for IPv6 link-local
+// strings + vsnprintf into Tasmota's LOGSZ stack buffer) overflowed the
+// AsyncTCP task's ~4 KB stack and corrupted the saved RA with format-string
+// bytes — crashed .122 ~hourly with `Instruction access fault` MEPC=RA=ASCII
+// fragments like `,"Ho` / `stname":"ESP` / `rx 42 B` (captured live on serial
+// 2026-05-27 15:34:50, BootCount 290). matter_udp_rx itself was fine on that
+// stack (no crashes in crypto/IM dispatch); the overflow was specifically in
+// the log path. Fix: count packets in the async lambda (no formatting), then
+// log aggregated counters periodically from the main task where 8 KB+ of stack
+// is available. Volatile counters are word-sized → atomic on single-core C6.
+static volatile uint32_t mtrc_rx_pkts  = 0;
+static volatile uint32_t mtrc_rx_bytes = 0;
+static uint32_t          mtrc_rx_pkts_last  = 0;  // last logged value (main task)
+static uint32_t          mtrc_rx_bytes_last = 0;
+static uint32_t          mtrc_rx_log_ms     = 0;  // throttle: emit at most every 5 s
+
+// ---- Matter Invoke deferral queue ----------------------------------------
+// matter_udp_rx() (hence im_handle_invoke -> on_command) runs in the
+// async-tcpip task. Executing the Tasmota command pipeline
+// (ExecuteCommandPower) or a TinyC VM there overflows that task's small stack
+// and races the main loop -> crash. So on_command only ENQUEUES the action
+// (lightweight, async-safe) and replies SUCCESS; the main loop drains the
+// queue (FUNC_EVERY_50_MSECOND) and performs the relay/script action in the
+// safe main-task context. SPSC ring: producer = async task, consumer = main
+// loop; the C6 is single-core so byte/word index updates are atomic.
+struct MtrcInvokeJob { uint16_t ep; uint32_t cluster; uint32_t command; int32_t arg; };
+#define MTRC_INV_Q 8
+static volatile MtrcInvokeJob mtrc_inv_q[MTRC_INV_Q];
+static volatile uint8_t mtrc_inv_head = 0, mtrc_inv_tail = 0;
+static void mtrc_invoke_enqueue(uint16_t ep, uint32_t cl, uint32_t cmd, int32_t arg) {
+  uint8_t nh = (uint8_t)((mtrc_inv_head + 1) % MTRC_INV_Q);
+  if (nh == mtrc_inv_tail) return;       // full: drop (drained every 50 ms; won't happen)
+  mtrc_inv_q[mtrc_inv_head].ep      = ep;
+  mtrc_inv_q[mtrc_inv_head].cluster = cl;
+  mtrc_inv_q[mtrc_inv_head].command = cmd;
+  mtrc_inv_q[mtrc_inv_head].arg     = arg;
+  mtrc_inv_head = nh;                     // publish AFTER fields are written
+}
+
+// Route a Matter command Invoke to the script's MatterInvoke(ep, cluster, cmd)
+// callback on every slot that defines it (the structural twin of HomeKit's
+// tc_hk_write_callback). Returns true if at least one script handled it, so the
+// caller can fall back to the built-in OnOff->relay behavior otherwise.
+static bool MatterC_DispatchInvoke(uint16_t ep, uint32_t cluster, uint32_t cmd) {
+  if (!Tinyc) return false;
+  bool handled = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+    // Does this slot define a MatterInvoke callback?
+    bool has = false;
+    for (int c = 0; c < s->vm.callback_count; c++)
+      if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) { has = true; break; }
+    if (!has) continue;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+    if (s->vm.halted && s->vm.error == TC_OK) {
+      tc_current_slot = s;
+      TcVM *vm = &s->vm;
+      if (vm->sp + 3 <= vm->stack_size) {
+        // Pin pre-push SP so the 3 consumed args don't re-materialise (see
+        // tc_hk_write_callback for the same idiom).
+        uint16_t pre_push_sp = vm->sp;
+        vm->stack[vm->sp++] = (int32_t)ep;
+        vm->stack[vm->sp++] = (int32_t)cluster;
+        vm->stack[vm->sp++] = (int32_t)cmd;
+        tc_vm_call_callback(vm, "MatterInvoke");
+        vm->sp = pre_push_sp;
+        handled = true;
+      }
+      tc_current_slot = nullptr;
+    }
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+  }
+  return handled;
+}
+
+// Does any loaded slot define a MatterInvoke callback? Cheap (callback-name
+// scan, no VM execution) so it is safe to call from the async-tcpip task.
+static bool mtrc_have_matterinvoke(void) {
+  if (!Tinyc) return false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+    for (int c = 0; c < s->vm.callback_count; c++)
+      if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) return true;
+  }
+  return false;
+}
+
+// Drain queued Matter Invoke actions in the MAIN-LOOP task context (called from
+// FUNC_EVERY_50_MSECOND). Mirrors the old inline on_command body: offer to the
+// script first (MatterInvoke), then the built-in OnOff->relay-1 default.
+static void mtrc_invoke_drain(void) {
+  while (mtrc_inv_head != mtrc_inv_tail) {
+    MtrcInvokeJob j;                                       // copy out of volatile slot
+    j.ep      = mtrc_inv_q[mtrc_inv_tail].ep;
+    j.cluster = mtrc_inv_q[mtrc_inv_tail].cluster;
+    j.command = mtrc_inv_q[mtrc_inv_tail].command;
+    j.arg     = mtrc_inv_q[mtrc_inv_tail].arg;
+    mtrc_inv_tail = (uint8_t)((mtrc_inv_tail + 1) % MTRC_INV_Q);
+    if (MatterC_DispatchInvoke(j.ep, j.cluster, j.command)) continue;  // script handled
+    if (j.cluster == 0x0006 && j.command <= 2) {           // OnOff -> relay 1 (default)
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: OnOff -> Power %u (default)"), (unsigned)j.command);
+      ExecuteCommandPower(1, j.command, SRC_BUTTON);        // 0=off 1=on 2=toggle
+    }
+  }
+}
+
+// ---- matter_c host port (Tasmota backing for the firmware-agnostic lib) --
+// For the discovery + PASE-rx milestone we provide log / millis / CSPRNG /
+// a minimal kv store + mdns_publish (ESPmDNS) + udp_send (AsyncUDP). A
+// UFS-backed kv comes with the fabric-store milestone.
+extern "C" {
+  static uint32_t mtrc_p_millis(void *ctx) { (void)ctx; return millis(); }
+  static void mtrc_p_log(void *ctx, matter_log_level_t lvl, const char *msg) {
+    (void)ctx;
+    AddLog(lvl == MATTER_LOG_DEBUG ? LOG_LEVEL_DEBUG : LOG_LEVEL_INFO,
+           PSTR("MTR: %s"), msg);
+  }
+  static matter_err_t mtrc_p_random(void *ctx, void *buf, size_t len) {
+    (void)ctx; esp_fill_random(buf, len); return MATTER_OK;   // hardware CSPRNG
+  }
+  // UFS-backed key/value store (Matter fabric table persistence). Keys map to
+  // files "/mtr_<key>" on the Tasmota filesystem. Falls back to not-found/no-op
+  // when the filesystem is unavailable (matter still runs, just doesn't persist).
+#ifdef USE_UFILESYS
+  static void mtrc_kv_fname(const char *k, char *out, size_t cap) {
+    snprintf(out, cap, "/mtr_%s", k);
+  }
+  static matter_err_t mtrc_p_kv_get(void *ctx, const char *k, void *b, size_t *l) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    if (!TfsFileExists(fn)) return MATTER_ERR_STORE;
+    size_t fsz = TfsFileSize(fn);
+    if (fsz == 0 || fsz > *l) return MATTER_ERR_STORE;
+    if (!TfsLoadFile(fn, (uint8_t *)b, fsz)) return MATTER_ERR_STORE;
+    *l = fsz;
+    return MATTER_OK;
+  }
+  static matter_err_t mtrc_p_kv_set(void *ctx, const char *k, const void *b, size_t l) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    return TfsSaveFile(fn, (const uint8_t *)b, (uint32_t)l) ? MATTER_OK : MATTER_ERR_STORE;
+  }
+  static matter_err_t mtrc_p_kv_del(void *ctx, const char *k) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    if (TfsFileExists(fn)) TfsDeleteFile(fn);
+    return MATTER_OK;
+  }
+#else
+  static matter_err_t mtrc_p_kv_get(void *ctx, const char *k, void *b, size_t *l) {
+    (void)ctx;(void)k;(void)b;(void)l; return MATTER_ERR_STORE; }
+  static matter_err_t mtrc_p_kv_set(void *ctx, const char *k, const void *b, size_t l) {
+    (void)ctx;(void)k;(void)b;(void)l; return MATTER_OK; }
+  static matter_err_t mtrc_p_kv_del(void *ctx, const char *k) {
+    (void)ctx;(void)k; return MATTER_OK; }
+#endif  // USE_UFILESYS
+  static matter_err_t mtrc_p_mdns(void *ctx, const char *service, const char *instance,
+                                  uint16_t port, const char *const *txt, size_t n) {
+    (void)ctx;
+    if (!Mdns.begun) return MATTER_ERR_TRANSPORT;     // responder not up yet
+    bool operational = (strcmp(service, "matter") == 0);
+    // Matter DNS-SD service-type quirk (Core Spec §4.3.1): OPERATIONAL discovery
+    // is published under _matter._TCP — even though the operational transport is
+    // still UDP on 5540. Only commissionable (_matterc) and commissioner
+    // (_matterd) use _udp. Advertising operational under _udp makes Apple/Google
+    // home hubs (which browse _matter._tcp) find nothing, so they finish AddNOC
+    // but never start operational CASE (no Sigma1) and pairing fails at the end.
+    const char *proto  = operational ? "tcp"  : "udp";   // ESPmDNS form
+    const char *protou = operational ? "_tcp" : "_udp";  // esp-mdns component form
+    char stype0[20]; snprintf(stype0, sizeof(stype0), "_%s", service);
+
+    if (operational) {
+      // OPERATIONAL discovery: ONE _matter._tcp instance PER FABRIC. A node can
+      // belong to several fabrics (Apple Home alone may commission the device into
+      // TWO fabrics during one "Add"). ESP-IDF mdns keys a service by its instance
+      // name, so each fabric MUST be a distinct instance added via
+      // mdns_service_add_for_host(<CFID>-<nodeId>, ...). The previous code used
+      // MDNS.addService + mdns_service_instance_name_set, which keeps a SINGLE
+      // _matter._tcp service and RENAMES it on each call — so the 2nd fabric erased
+      // the 1st fabric's record, and that controller could never re-resolve the
+      // node operationally → Apple shows "Keine Antwort". Instance/host pair is
+      // idempotent: re-announcing the same fabric is a no-op (returns "exists").
+      mdns_txt_item_t items[8]; size_t ni = 0;
+      static char kvbuf[8][24];                          // key\0value, serialized in main task
+      for (size_t i = 0; i < n && ni < 8; i++) {
+        const char *eq = strchr(txt[i], '=');
+        if (!eq) continue;
+        size_t len = strlen(txt[i]);
+        if (len >= sizeof(kvbuf[0])) len = sizeof(kvbuf[0]) - 1;
+        memcpy(kvbuf[ni], txt[i], len); kvbuf[ni][len] = 0;
+        char *v = strchr(kvbuf[ni], '='); *v = 0; v++;   // split in place
+        items[ni].key = kvbuf[ni]; items[ni].value = v; ni++;
+      }
+      esp_err_t err = mdns_service_add_for_host(instance, stype0, protou, NULL, port,
+                                                ni ? items : NULL, ni);
+      // Operational browse subtype _I<compressedFabricId> (Core Spec §4.3.4):
+      // controllers browse _I<CFID>._sub._matter._tcp to re-find the node. The
+      // subtype must attach to THIS fabric's instance, not the default one.
+      char sub[24]; const char *dash = strchr(instance, '-');
+      size_t cl = dash ? (size_t)(dash - instance) : strlen(instance);
+      if (cl > 20) cl = 20;
+      snprintf(sub, sizeof(sub), "_I%.*s", (int)cl, instance);
+      mdns_service_subtype_add_for_host(instance, stype0, protou, NULL, sub);
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: operational mDNS %s._matter._tcp (%s) rc=%d"),
+             instance, sub, (int)err);
+      return MATTER_OK;
+    }
+
+    // COMMISSIONABLE (_matterc._udp): only one pairing window at a time → a single
+    // instance is correct here.
+    MDNS.addService(service, proto, port);
+    {
+      // Matter REQUIRES a 16-hex commissioning instance name (Core Spec §4.3.1);
+      // ESPmDNS defaults it to the hostname, which Apple Home rejects. Use a
+      // STABLE id derived from the chip MAC (not the core's per-boot random one)
+      // so reboots reuse the same instance and never seed new mDNS phantoms in
+      // controllers' caches.
+      // 16-hex instance, formatted byte-by-byte — newlib-nano printf (default on
+      // several Tasmota envs) ignores the 'll' modifier and emits garbage for a
+      // 64-bit "%016llX". Harmless here (Apple matches commissionable by the D=
+      // discriminator TXT), but the operational instance MUST be valid hex, so
+      // keep the formatting consistent and spec-correct everywhere.
+      char inst16[17]; unsigned long long mac = (unsigned long long)ESP.getEfuseMac();
+      for (int i = 0; i < 8; i++)
+        snprintf(inst16 + 2 * i, 3, "%02X", (unsigned)((mac >> ((7 - i) * 8)) & 0xFF));
+      mdns_service_instance_name_set(stype0, protou, inst16);
+    }
+    uint16_t disc = 0;
+    for (size_t i = 0; i < n; i++) {
+      const char *eq = strchr(txt[i], '=');
+      if (!eq) continue;
+      char key[12]; size_t kl = (size_t)(eq - txt[i]);
+      if (kl >= sizeof(key)) kl = sizeof(key) - 1;
+      memcpy(key, txt[i], kl); key[kl] = 0;
+      MDNS.addServiceTxt(service, proto, key, eq + 1);
+      if (kl == 1 && key[0] == 'D') disc = (uint16_t)atoi(eq + 1);
+    }
+    // Matter commissionable mDNS subtypes (Core Spec §4.3.4): commissioners
+    // (Apple Home / Google) browse _L<long-disc> / _S<short-disc> / _CM under
+    // _matterc._udp to find a device. Without these, Apple never discovers us.
+    // ESPmDNS has no subtype API, so call the ESP-IDF mdns component directly.
+    char sub[16];
+    snprintf(sub, sizeof(sub), "_L%u", (unsigned)disc);
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, sub);
+    snprintf(sub, sizeof(sub), "_S%u", (unsigned)(disc >> 8));         // short = top 4 bits
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, sub);
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, "_CM");
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: mDNS subtypes _L%u _S%u _CM added"),
+           (unsigned)disc, (unsigned)(disc >> 8));
+    return MATTER_OK;
+  }
+  // Withdraw a per-fabric operational instance (RemoveFabric / Unbind). Only the
+  // operational _matter._tcp service is per-fabric; commissionable is singular.
+  static matter_err_t mtrc_p_mdns_remove(void *ctx, const char *service, const char *instance) {
+    (void)ctx;
+    if (!Mdns.begun) return MATTER_ERR_TRANSPORT;
+    if (strcmp(service, "matter") != 0) return MATTER_OK;
+    esp_err_t err = mdns_service_remove_for_host(instance, "_matter", "_tcp", NULL);
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: operational mDNS remove %s rc=%d"), instance, (int)err);
+    return MATTER_OK;
+  }
+  // Reply to the last peer that sent us a datagram (PASE/CASE is a single
+  // exchange at a time). ip6/port from the core are ignored for now.
+  static matter_err_t mtrc_p_udp_send(void *ctx, const uint8_t ip6[16],
+                                      uint16_t port, const void *buf, size_t len) {
+    (void)ctx;
+    // Reply to THIS request's own source (the core passes the originating
+    // controller's IPv6) so concurrent controllers each get their answer. A
+    // zero address means the source was unknown (AsyncUDP mis-flagged the
+    // inbound packet as IPv4) -> fall back to the last KNOWN-GOOD IPv6 peer.
+    bool have_src = false;
+    if (port) { for (int i = 0; i < 16; i++) if (ip6[i]) { have_src = true; break; } }
+    IPAddress dst; uint16_t dport;
+    if (have_src) {
+      // Carry the STA interface zone so a link-local (fe80::) reply has an
+      // egress scope — Apple runs operational CASE from its link-local address.
+      // All controllers share the WiFi-STA interface, so the last-good peer's
+      // zone is the correct zone for every reconstructed address.
+      dst = IPAddress(IPv6, ip6, mtrc_peer_ip6.zone()); dport = port;
+    } else {
+      dst   = mtrc_peer_port6 ? mtrc_peer_ip6   : mtrc_peer_ip;
+      dport = mtrc_peer_port6 ? mtrc_peer_port6 : mtrc_peer_port;
+    }
+    if (!dport) return MATTER_ERR_TRANSPORT;
+    // Force the WiFi-STA netif. ESP-IDF lwIP is built without LWIP_IPV6_SCOPES,
+    // so a link-local (fe80::/10) destination has no zone and udp_sendto can't
+    // pick an egress interface — the datagram is silently dropped. Apple Home
+    // runs operational CASE *from its link-local address*. writeTo(...,tcpip_if)
+    // routes via _udp_sendto_if on the named netif; if STA is down it falls back
+    // to the default route, so global/ULA replies are unaffected.
+    size_t sent = mtrc_udp.writeTo((const uint8_t *)buf, len, dst, dport,
+                                   TCPIP_ADAPTER_IF_STA);
+    AddLog(LOG_LEVEL_DEBUG, PSTR("MTR: tx %u B -> [%s]:%u sent=%u"),
+           (unsigned)len, dst.toString().c_str(), (unsigned)dport, (unsigned)sent);
+    return MATTER_OK;
+  }
+  // Matter wrote a device attribute. OnOff (cluster 0x0006) -> Tasmota relay:
+  // the OnOff command id (Off=0/On=1/Toggle=2) maps 1:1 to POWER_OFF/ON/TOGGLE.
+  static void mtrc_p_on_attr_write(void *ctx, uint16_t endpoint, uint32_t cluster,
+                                   uint32_t attr, const uint8_t *tlv, size_t len) {
+    (void)ctx; (void)endpoint; (void)attr;
+    if (cluster == 0x0006 && len >= 1) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: OnOff -> Power %u"), (unsigned)tlv[0]);
+      ExecuteCommandPower(1, tlv[0], SRC_BUTTON);   // 0=off 1=on 2=toggle
+    }
+  }
+  // Matter reads an attribute -> return the live device value. OnOff (0x0006
+  // attr 0) reflects the real relay state (Power1).
+  static matter_err_t mtrc_p_on_attr_read(void *ctx, uint16_t endpoint,
+                                          uint32_t cluster, uint32_t attr,
+                                          uint64_t *out) {
+    (void)ctx;
+    // Only endpoint 1 (the plug) mirrors relay 1; other endpoints (e.g. an RGB
+    // light) keep their own OnOff in the data-model registry.
+    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000) {
+      *out = bitRead(TasmotaGlobal.power, 0) ? 1 : 0;
+      return MATTER_OK;
+    }
+    return MATTER_ERR_NOT_IMPLEMENTED;
+  }
+  // Matter invoked a command. First offer it to the script (MatterInvoke); if
+  // no script handles it, apply the built-in default (OnOff -> relay 1). The
+  // default runs ONLY when unhandled, so a script that drives the relay itself
+  // never double-toggles. Returns 1 if handled (core replies SUCCESS).
+  static int mtrc_p_on_command(void *ctx, uint16_t endpoint, uint32_t cluster,
+                               uint32_t command, int32_t arg) {
+    (void)ctx;
+    // Runs in the async-tcpip task: do NOT execute the relay pipeline or a
+    // TinyC VM here (stack overflow + reentrancy -> crash). Queue the action
+    // for the main loop and reply SUCCESS optimistically. "known" mirrors the
+    // old return value so im_handle_invoke's OnOff/catch-all status stays
+    // correct (LevelControl/ColorControl reply SUCCESS regardless of return).
+    bool known = (cluster == 0x0006 && command <= 2) ||
+                 cluster == 0x0008 || cluster == 0x0300 ||
+                 mtrc_have_matterinvoke();
+    if (known) mtrc_invoke_enqueue(endpoint, cluster, command, arg);
+    return known ? 1 : 0;
+  }
+}
+
+static matter_port_t mtrc_port;
+static bool mtrc_core_inited = false;   // matter_init() done — data model live
+static bool mtrc_started     = false;   // matter_start() done — advertising
+static bool mtrc_want_start  = false;   // a script asked to start; finish when mDNS is up
+
+// Commissioning window (web Bind/Unbind). Bind opens it for MTRC_BIND_WINDOW_S
+// seconds: the device accepts PASE and /mt shows the QR; on timeout (or Unbind)
+// it closes — QR hidden + PASE refused. mtrc_window_end is a millis() deadline.
+#ifndef MTRC_BIND_WINDOW_S
+#define MTRC_BIND_WINDOW_S  600          // 10 minutes
+#endif
+static uint32_t mtrc_window_end = 0;     // millis() deadline; 0 = window closed
+static bool mtrc_window_open(void) {
+  return mtrc_window_end != 0 && (int32_t)(mtrc_window_end - millis()) > 0;
+}
+static uint32_t mtrc_window_left_s(void) {
+  if (!mtrc_window_open()) return 0;
+  return (mtrc_window_end - millis()) / 1000;
+}
+
+// Initialize the Matter CORE once: wire the host port + matter_init() (seeds the
+// data model, loads persisted fabrics). Does NOT touch mDNS/UDP or advertise —
+// that is matterStart(). Called lazily from the mtr* syscalls, so a firmware
+// with Matter compiled-in costs nothing at runtime until a TinyC script uses it.
+static bool mtrc_ensure_inited(void) {
+  if (mtrc_core_inited) return true;
+  memset(&mtrc_port, 0, sizeof(mtrc_port));
+  mtrc_port.millis        = mtrc_p_millis;
+  mtrc_port.log           = mtrc_p_log;
+  mtrc_port.random_bytes  = mtrc_p_random;
+  mtrc_port.kv_get        = mtrc_p_kv_get;
+  mtrc_port.kv_set        = mtrc_p_kv_set;
+  mtrc_port.kv_del        = mtrc_p_kv_del;
+  mtrc_port.mdns_publish  = mtrc_p_mdns;
+  mtrc_port.mdns_remove   = mtrc_p_mdns_remove;
+  mtrc_port.udp_send      = mtrc_p_udp_send;
+  mtrc_port.on_attr_write = mtrc_p_on_attr_write;
+  mtrc_port.on_attr_read  = mtrc_p_on_attr_read;
+  mtrc_port.on_command    = mtrc_p_on_command;
+
+  matter_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.vendor_id     = 0xFFF1;          // Matter test VID
+  cfg.product_id    = 0x8000;
+  cfg.discriminator = 0x0A12;          // 2578 — unique, avoids old test-3840 phantom
+  cfg.passcode      = 13572468;        // unique non-trivial passcode
+  cfg.device_name   = TasmotaGlobal.hostname;
+
+  if (matter_init(&mtrc_port, &cfg) != MATTER_OK) return false;
+  mtrc_core_inited = true;
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: core init (data model live)"));
+  return true;
+}
+
+// Called every second: finishes a pending matterStart() once mDNS is ready. Does
+// NOTHING unless a script requested start (mtrc_want_start) — so an unused build
+// never enables mDNS, opens the UDP socket, or advertises.
+static void MatterC_MaybeStart(void) {
+  if (!mtrc_want_start || mtrc_started) return;
+  if (!mtrc_ensure_inited()) return;
+  // Matter on-network commissioning REQUIRES mDNS; SetOption55 defaults off.
+  if (!Settings->flag3.mdns_enabled) {
+    Settings->flag3.mdns_enabled = 1;
+    StartMdns();          // MDNS.begin(hostname)
+    return;               // let it settle; finish next tick
+  }
+  if (!Mdns.begun) { StartMdns(); return; }
+
+  // Listen on UDP 5540 for Matter operational/commissioning datagrams and
+  // pump them into the core. (onPacket runs in the async-tcpip task.)
+  if (!mtrc_udp_listening && mtrc_udp.listen(MTRC_COMMISSION_PORT_HOST)) {
+    mtrc_udp_listening = true;
+    mtrc_udp.onPacket([](AsyncUDPPacket p) {
+      // Matter commissioning/operational traffic from real controllers (Apple,
+      // chip-tool, Google) arrives over IPv6. AsyncUDP's remoteIP() returns
+      // 0.0.0.0 for IPv6 packets, so capture remoteIPv6() and reply there —
+      // otherwise our PASE/CASE responses go nowhere and the controller stalls.
+      mtrc_peer_ip   = p.isIPv6() ? p.remoteIPv6() : p.remoteIP();
+      mtrc_peer_port = p.remotePort();
+      if (p.isIPv6()) {                     // only trust reliably-IPv6 datagrams
+        mtrc_peer_ip6   = p.remoteIPv6();
+        mtrc_peer_port6 = p.remotePort();
+      }
+      // DO NOT call AddLog here — IPv6 toString() + vsnprintf overflows the
+      // AsyncTCP task's ~4 KB stack (see counter declarations above). Just
+      // bump cheap counters; main loop logs aggregates periodically.
+      mtrc_rx_pkts  += 1;
+      mtrc_rx_bytes += (uint32_t)p.length();
+      // Pass the datagram's own IPv6 source so the core can reply to the exact
+      // controller (Apple opens several sessions from different addresses).
+      // Only IPv6 is trusted (AsyncUDP mis-flags some v6 packets as v4); for a
+      // mis-flagged packet we pass zero -> the host falls back to last-good peer.
+      uint8_t ip6[16] = {0};
+      if (p.isIPv6()) { IPAddress a6 = p.remoteIPv6(); for (int i = 0; i < 16; i++) ip6[i] = a6[i]; }
+      matter_udp_rx(ip6, p.remotePort(), p.data(), p.length());
+    });
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: listening on UDP %u"), MTRC_COMMISSION_PORT_HOST);
+  }
+
+  matter_start();          // operational mDNS for fabrics; NOT pairable until Bind
+  mtrc_started = true;
+}
+
+// matterStart() backend: a TinyC script asked Matter to go live. Ensure the
+// core is inited, flag the request, and complete immediately if mDNS is already
+// up (else MatterC_MaybeStart finishes on the next tick). Returns 0 = accepted.
+static int mtrc_request_start(void) {
+  if (!mtrc_ensure_inited()) return -1;
+  mtrc_want_start = true;
+  MatterC_MaybeStart();
+  return 0;
+}
+
+// ---- Bind / Unbind (web) ----------------------------------------------
+// Bind: start Matter (if needed) and open the commissioning window for
+// MTRC_BIND_WINDOW_S — advertise commissionable (_matterc), accept PASE, show QR.
+static void mtrc_bind(void) {
+  mtrc_request_start();                 // ensure core + operational up
+  matter_open_commissioning_window();   // publish _matterc + accept PASE (sets commissionable)
+  mtrc_window_end = millis() + (uint32_t)MTRC_BIND_WINDOW_S * 1000;
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: Bind — commissioning window open %us"),
+         (unsigned)MTRC_BIND_WINDOW_S);
+}
+
+// Close the window: stop advertising commissionable + refuse new PASE (existing
+// fabrics / operational sessions are unaffected).
+static void mtrc_close_window(void) {
+  mtrc_window_end = 0;
+  matter_set_commissionable(0);
+  if (Mdns.begun) mdns_service_remove("_matterc", "_udp");   // stop being discoverable
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: commissioning window closed (QR expired)"));
+}
+
+// Unbind: leave all fabrics (factory reset) + close the window.
+static void mtrc_unbind(void) {
+  mtrc_ensure_inited();                 // load a persisted fabric so it can be wiped
+  matter_factory_reset();
+  mtrc_close_window();
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: Unbind — left all fabrics"));
+}
+
+// Unbind confirm + button markup, reused below.
+#define MTRC_UNBIND_BTN \
+  "<form action='/mt' method='get'><button name='unbind' value='1' " \
+  "onclick=\"return confirm('Remove this device from all Matter controllers?')\">" \
+  "Unbind</button></form>"
+
+static void HandleMatterQR(void) {
+  if (!mtrc_core_inited) {            // no TinyC script has defined a Matter device
+    WSContentStart_P(PSTR("Matter"));
+    WSContentSendStyle();
+    WSContentSend_P(PSTR("<div style='text-align:center'><h2>Matter</h2>"
+      "<p>No Matter device is defined. Add one from a TinyC script "
+      "(e.g. <b>matterAdd()</b> / <b>matterStart()</b>) — then Bind / Unbind "
+      "appear here.</p></div>"));
+    WSContentSpaceButton(BUTTON_MAIN);
+    WSContentStop();
+    return;
+  }
+  if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
+  if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+
+  bool open = mtrc_window_open();
+  uint32_t left = mtrc_window_left_s();
+
+  WSContentStart_P(PSTR("Matter Pairing"));
+  WSContentSendStyle();
+  WSContentSend_P(PSTR("<div style='text-align:center'><h2>Matter</h2>"));
+
+  if (open && matter_qr_uri()[0]) {
+    // Render the QR as an SVG ON THE DEVICE — no CDN / JS / internet needed.
+    int qn = matter_qr_size();
+    if (qn > 0) {
+      int q = 4, dim = qn + 2 * q;     // quiet zone
+      WSContentSend_P(PSTR("<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240' "
+        "viewBox='0 0 %d %d' shape-rendering='crispEdges' style='background:#fff;padding:8px'>"
+        "<rect width='%d' height='%d' fill='#fff'/><g fill='#000'>"), dim, dim, dim, dim);
+      char row[640];
+      for (int y = 0; y < qn; y++) {
+        int p = 0; int x = 0;
+        while (x < qn) {
+          if (matter_qr_dark(x, y)) {
+            int w = 1; while (x + w < qn && matter_qr_dark(x + w, y)) w++;
+            if (p < (int)sizeof(row) - 48)
+              p += snprintf(row + p, sizeof(row) - p,
+                            "<rect x='%d' y='%d' width='%d' height='1'/>", x + q, y + q, w);
+            x += w;
+          } else x++;
+        }
+        if (p) WSContentSend_P(PSTR("%s"), row);
+      }
+      WSContentSend_P(PSTR("</g></svg>"));
+    }
+    WSContentSend_P(PSTR(
+      "<p style='font-size:24px;font-family:monospace;letter-spacing:4px'><b>%s</b></p>"
+      "<p>Scan with the Apple Home / Google Home / Alexa app</p>"
+      "<p style='color:#080'>Pairing window open — closes in <span id='cd'>%um %02us</span></p>"
+      "<p style='font-size:10px;color:#888'>%s</p>"),
+      matter_manual_code(), left / 60, left % 60, matter_qr_uri());
+    // Live countdown; when it hits 0 reload /mt -> window is closed, QR gone.
+    WSContentSend_P(PSTR("<script>var s=%u;function t(){var e=document.getElementById('cd');"
+      "if(s<=0){location.href='/mt';return;}"
+      "e.textContent=Math.floor(s/60)+'m '+('0'+(s%%60)).slice(-2)+'s';s--;"
+      "setTimeout(t,1000);}t();</script>"), left);
+    WSContentSend_P(PSTR(MTRC_UNBIND_BTN));
+  } else {
+    WSContentSend_P(PSTR("<p>Matter is %s.<br>Press <b>Bind</b> to open a %u-minute "
+      "pairing window and show the QR code.</p>"),
+      mtrc_started ? PSTR("running (not in pairing mode)") : PSTR("off"),
+      (unsigned)(MTRC_BIND_WINDOW_S / 60));
+    WSContentSend_P(PSTR("<form action='/mt' method='get'>"
+      "<button name='bind' value='1'>Bind — open %u min pairing</button></form>"),
+      (unsigned)(MTRC_BIND_WINDOW_S / 60));
+    WSContentSend_P(PSTR(MTRC_UNBIND_BTN));
+  }
+  WSContentSend_P(PSTR("</div>"));
+  WSContentSpaceButton(BUTTON_MAIN);
+  WSContentEnd();
+}
+#endif  // USE_MATTER_C
+
 // ---- Self-hosted IDE (optional -- #define USE_TINYC_IDE) ----
 // Port 80 /ide handler: on ESP32 with port-82 download server up, issues a
 // 302 redirect to port 82 /ide so the actual 150 KB streaming happens in a
@@ -2494,6 +3349,11 @@ static void HandleTinyCIde(void) {
   if (gzipped) {
     Webserver->sendHeader(F("Content-Encoding"), F("gzip"));
   }
+  // Never cache the IDE — it's a fast-iterating dev tool. A prior
+  // max-age=600 on the port-82 path caused users to keep running a
+  // stale IDE for 10 min after a gz update (incl. window.open named-
+  // window reuse not reloading at all). Force a fresh fetch every time.
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
   Webserver->setContentLength(fsize);
   WSSend_P(200, PSTR("text/html"), PSTR(""));
 
@@ -2511,14 +3371,73 @@ static void HandleTinyCIde(void) {
 #endif  // USE_UFILESYS
 #endif  // USE_TINYC_IDE
 
+// ---- /cedit: serve sml_chart_editor.html from FS as inline text/html ----
+// Companion to tasmota/tinyc/utils/sml_chart_editor.html. The user uploads that
+// file (preferably .html.gz) to the device's filesystem, then visits
+// http://<device>/cedit and the page renders in the browser instead of being
+// downloaded — Tasmota's generic /ufsd?download= forces Content-Disposition
+// attachment, so a small inline-serving route is the simplest way to host the
+// editor on the device. Same-origin fetches from the editor hit /ufsd?download=
+// to load /sml_chart.bin, /ufsu to save, and /cm to restart the slot.
+#ifdef USE_UFILESYS
+static void HandleSmlChartEditor(void) {
+  if (!ffsp && !ufsp) {
+    WSSend_P(503, PSTR("text/plain"), PSTR("Filesystem not available"));
+    return;
+  }
+  bool gzipped = false;
+  File f;
+  if (ufsp) f = ufsp->open("/sml_chart_editor.html.gz", "r");
+  if (f) {
+    gzipped = true;
+  } else {
+    if (ufsp) f = ufsp->open("/sml_chart_editor.html", "r");
+    if (!f && ffsp && ffsp != ufsp) {
+      f = ffsp->open("/sml_chart_editor.html.gz", "r");
+      if (f) gzipped = true;
+      else f = ffsp->open("/sml_chart_editor.html", "r");
+    }
+  }
+  if (!f) {
+    WSSend_P(404, PSTR("text/plain"), PSTR(
+      "sml_chart_editor not found on the filesystem. Upload "
+      "sml_chart_editor.html.gz (or .html) — see "
+      "tasmota/tinyc/utils/sml_chart_editor.md."));
+    return;
+  }
+  uint32_t fsize = f.size();
+  if (gzipped) {
+    Webserver->sendHeader(F("Content-Encoding"), F("gzip"));
+  }
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  Webserver->setContentLength(fsize);
+  WSSend_P(200, PSTR("text/html"), PSTR(""));
+  uint8_t buf[256];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n > 0) Webserver->client().write(buf, n);
+    yield();
+  }
+  f.close();
+}
+#endif  // USE_UFILESYS
+
 // ---- WebUI: shared sv= parameter handler ----
 
 // Process sv= widget value updates from AJAX requests
 // Format: sv=gidx_value | sv=gidx_s_string | sv=gidx_t_HH:MM
 // Uses slot 0 for globals access (WebUI is bound to slot 0)
-static void TinyC_WebSetVar(void) {
+// `slot_idx` is the slot that owns the WebUI/WebPage being rendered.
+// /tc_ui resolves it from page_slot[]; the main-page path passes 0. A
+// hardcoded slot 0 here silently dropped every widget write for any
+// script not running in slot 0 (widgets render from the owning slot but
+// writes landed in slot 0 → "WebUI does nothing"). Takes an index, not
+// a TcSlot* — a pointer param breaks Arduino's auto-prototype (TcSlot
+// is declared later than the generated forward decl in tasmota.ino).
+static void TinyC_WebSetVar(uint8_t slot_idx) {
   if (!Tinyc) return;
-  TcSlot *s = Tinyc->slots[0];
+  if (slot_idx >= TC_MAX_VMS) return;
+  TcSlot *s = Tinyc->slots[slot_idx];
   if (!s || !s->loaded) return;
   if (!Webserver->hasArg(F("sv"))) return;
 
@@ -2587,8 +3506,17 @@ static void HandleTinyCDisplayRaw(void) {
   if (fb && (uintptr_t)fb < 0x3C000000) fb = nullptr;
   if (rgb && (uintptr_t)rgb < 0x3C000000) rgb = nullptr;
 
-  // Derive raw (unrotated) dimensions from rotated width/height + rotation
-  uint8_t rot = renderer->getRotation();
+  // Derive raw (unrotated) dimensions from rotated width/height + rotation.
+  // Use Tasmota's authoritative Settings->display_rotate instead of
+  // renderer->getRotation(): for EPD panels, the renderer's internal rotation
+  // field can stay 0 even when DisplayRotate=1 puts the renderer dims into
+  // landscape (the framebuffer is still physically laid out in panel-native
+  // orientation, so we need DisplayRotate to know which way to un-rotate the
+  // logical width()/height() back to the raw fb stride). Verified on .122
+  // (E-PAPER-29-V1, DisplayRotate=1: width()=296 height()=128 getRotation()=0
+  // but fb on the wire is 128-wide × 296-tall — the JS client was decoding it
+  // with stride 296 and showing rotated-but-garbled pixels).
+  uint8_t rot = Settings->display_rotate & 3;
   uint16_t rw, rh;  // raw framebuffer dimensions
   if (rot == 0 || rot == 2) {
     rw = renderer->width();
@@ -2881,11 +3809,37 @@ static void HandleTinyCDisplay(void) {
 
 // ---- Custom web handlers (webOn) -- uses slot 0 ----
 
+// A slot running a TaskLoop (Modbus/BYD polls etc.) is only sub-ms
+// non-halted; returning 503 immediately gave a "TinyC not ready"
+// white page on every page-switch. Wait briefly for halted instead.
+#ifndef TC_WEBON_HALTED_WAIT_MS
+#define TC_WEBON_HALTED_WAIT_MS 1500
+#endif
+
+// When the halted-wait above expires, return an HTML page with a
+// meta-refresh instead of a plain-text 503. The browser auto-reloads
+// after 1 s — by then the previous webOn render is essentially always
+// done. Removes the "TinyC busy (timeout)" stutter when the user clicks
+// through several /tcN routes quickly. (Andreas FYI 2026-05-20 22:07.)
+static const char TC_BUSY_HTML[] PROGMEM =
+  "<!DOCTYPE html><html><head>"
+  "<meta http-equiv=\"refresh\" content=\"1\">"
+  "<title>TinyC busy</title></head>"
+  "<body>TinyC busy &mdash; reloading in 1 s ...</body></html>";
+
 static void HandleTinyCWebOn(uint8_t handler_num) {
   if (!Tinyc) { Webserver->send(503, "text/plain", "TinyC not ready"); return; }
   TcSlot *s = Tinyc->slots[0];
-  if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) {
+  if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
     Webserver->send(503, "text/plain", "TinyC not ready");
+    return;
+  }
+  { uint32_t _t0 = millis();
+    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(20); yield();
+    } }
+  if (!s->vm.halted) {
+    Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
     return;
   }
   Tinyc->current_web_handler = handler_num;
@@ -3136,13 +4090,22 @@ static void HandleTinyCUI(void) {
   // Find the slot that registered this page
   uint8_t si = (page < Tinyc->page_count) ? Tinyc->page_slot[page] : 0;
   TcSlot *s = Tinyc->slots[si];
-  if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) {
+  if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
     Webserver->send(503, "text/plain", "TinyC not ready");
     return;
   }
+  { uint32_t _t0 = millis();
+    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(20); yield();
+    } }
+  if (!s->vm.halted) {
+    Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
+    return;
+  }
 
-  // Handle sv= parameter -- widget value update
-  TinyC_WebSetVar();
+  // Handle sv= parameter -- widget value update (target the slot that
+  // owns this page, NOT a hardcoded slot 0).
+  TinyC_WebSetVar(si);
 
   // Reset WebChart state before rendering
   tc_chart_seq = 0;
@@ -3187,6 +4150,10 @@ static void HandleTinyCUI(void) {
       "}"
     "}"
     "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
+    "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
+      "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+      "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
+      "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
     "function siva(v,i){rfsh=1;la('&sv='+i+'_s_'+v);rfsh=0;}"
     "function sivat(v,i){rfsh=1;la('&sv='+i+'_t_'+v);rfsh=0;}"
     "function pr(f){if(f){lt=setTimeout(la,2000);rfsh=1;}else{clearTimeout(lt);rfsh=0;}}"
@@ -3589,14 +4556,14 @@ static void tc_ide_serve_task(void *param) {
         "Content-Type: text/html; charset=utf-8\r\n"
         "Content-Encoding: gzip\r\n"
         "Content-Length: %u\r\n"
-        "Cache-Control: max-age=600\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Connection: close\r\n\r\n"), fsize);
   } else {
     client.printf_P(PSTR(
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Content-Length: %u\r\n"
-        "Cache-Control: max-age=600\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Connection: close\r\n\r\n"), fsize);
   }
 
@@ -3770,6 +4737,15 @@ static bool tc_mqtt_data_handler(void) {
       tc_current_slot = slot;
 #ifdef ESP32
       if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      // Re-check halted AFTER the lock (TOCTOU): the core-1 VM task can flip
+      // halted=false between the pre-lock check above and here; running
+      // OnMqttData on a non-halted VM corrupts its frame -> crash under MQTT
+      // traffic. Same race as tc_udp_on_receive (Bug #1 pattern).
+      if (!slot->vm.halted || slot->vm.error != TC_OK) {
+        if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+        tc_current_slot = nullptr;
+        continue;
+      }
 #endif
       tc_vm_call_callback_str2(&slot->vm, "OnMqttData", topic, payload);
 #ifdef ESP32
@@ -3901,6 +4877,7 @@ static void tc_spawn_task_body(void *param) {
     vm->fp = vm->frame_count;
     vm->frame_count++;
     vm->pc = vm->code_offset + vm->callbacks[cb_idx].address;
+    vm->worker_borrowed = true;   // stays set across delay() windows; cleared at cleanup
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') running on slot %d"), name, entry->slot_idx);
 
@@ -3959,6 +4936,7 @@ static void tc_spawn_task_body(void *param) {
     }
     vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
 
+    vm->worker_borrowed = false;
     vm->halted = true;
     vm->running = false;
     vm->pc = saved_pc;
@@ -4209,6 +5187,27 @@ bool Xdrv124(uint32_t function) {
 
   switch (function) {
     case FUNC_LOOP:
+#ifdef USE_MATTER_C
+      matter_loop();   // process any queued Matter datagram (PASE responder)
+      // Throttled aggregate log of UDP RX (every 5 s, only if traffic).
+      // Runs on main task → safe stack for the format/log path.
+      {
+        uint32_t now_ms = millis();
+        if ((uint32_t)(now_ms - mtrc_rx_log_ms) >= 5000) {
+          uint32_t pkts  = mtrc_rx_pkts;
+          uint32_t bytes = mtrc_rx_bytes;
+          uint32_t dp = pkts  - mtrc_rx_pkts_last;
+          uint32_t db = bytes - mtrc_rx_bytes_last;
+          if (dp) {
+            AddLog(LOG_LEVEL_DEBUG, PSTR("MTR: udp rx %u pkts / %u B (last 5s)"),
+                   (unsigned)dp, (unsigned)db);
+            mtrc_rx_pkts_last  = pkts;
+            mtrc_rx_bytes_last = bytes;
+          }
+          mtrc_rx_log_ms = now_ms;
+        }
+      }
+#endif
       if (tc_paused) { break; }
       // Deferred autoexec start — one-shot, gated on uptime so we
       // wait through Wi-Fi/RF coex bring-up. Spawning tc_vm_task at
@@ -4284,6 +5283,13 @@ bool Xdrv124(uint32_t function) {
       tc_all_callbacks_id(TC_CB_LOOP);
       break;
     case FUNC_EVERY_50_MSECOND:
+      tc_dmx_tick();   // DMX refresh + watchdog — runs even if VM paused
+                       // so the dimmer never loses its frame (no-op
+                       // until first dmxWrite / if TC_DMX_TX_PIN unset)
+#ifdef USE_MATTER_C
+      mtrc_invoke_drain();  // run queued Matter Invoke actions in the main task
+                            // (enqueued by on_command from the async-tcpip task)
+#endif
       if (tc_paused) { break; }
       TinyCEvery50ms();
       if (TasmotaGlobal.rules_flag.mqtt_disconnected) {
@@ -4301,6 +5307,13 @@ bool Xdrv124(uint32_t function) {
       // to declare the boot a success and clear the marker so future
       // recovery cycles work.
       TinyCCheckBootStable();
+#ifdef USE_MATTER_C
+#ifdef TC_MATTER_AUTOSTART
+      mtrc_want_start = true;   // compile-time opt-in: start Matter without a script
+#endif
+      MatterC_MaybeStart();   // no-op unless a script called matterStart() (or autostart)
+      if (mtrc_window_end && !mtrc_window_open()) mtrc_close_window();  // Bind window timeout
+#endif
       if (tc_paused) { break; }
       // Call user's EverySecond() callback on all active slots
       tc_all_callbacks_id(TC_CB_EVERY_SECOND);
@@ -4354,7 +5367,18 @@ bool Xdrv124(uint32_t function) {
               snprintf(cmd_str, sizeof(cmd_str), "%s", sub);
             }
 #ifdef ESP32
-            if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+            // 1.6.23 — Andreas's .104 (C3 single-core) saw the HTTP server
+            // hang for ~2:30 min when this lock was portMAX_DELAY and the
+            // VM-task TaskLoop was busy in a shareSetFloat burst. The HTTP
+            // serving task (loopTask on C3) blocked here, AsyncTCP backed
+            // up, and only the 60-s UDP-multicast socket reset recovered
+            // it. Use a bounded try-lock: if the VM is genuinely busy past
+            // 200 ms, bail out and let Tasmota return "Command unknown"
+            // — keeps the web server responsive and the user retries.
+            if (s->vm_mutex &&
+                xSemaphoreTake(s->vm_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+              continue;
+            }
 #endif
             if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -4385,13 +5409,23 @@ bool Xdrv124(uint32_t function) {
       break;
 #ifdef USE_WEBSERVER
     case FUNC_WEB_GET_ARG:
-      // Process sv= widget value updates from main page AJAX (slot 0)
-      TinyC_WebSetVar();
+      // Process sv= widget value updates from main page AJAX. The main
+      // page renders WebPage() for all slots; slot 0 remains the write
+      // target here (pre-existing multi-slot main-page assumption — the
+      // /tc_ui path above is slot-accurate).
+      TinyC_WebSetVar(0);
       break;
     case FUNC_WEB_SENSOR:
       TinyCShow(false);
       break;
     case FUNC_WEB_ADD_MAIN_BUTTON:
+#ifdef USE_MATTER_C
+      // Only show the Matter pairing UI once a TinyC script has defined a Matter
+      // device (any mtr* syscall lazily inits the core).
+      if (mtrc_core_inited)
+        WSContentSend_P(PSTR("<p></p><form action='/mt' method='get'><button>"
+                             "Matter Pairing (Bind / Unbind)</button></form>"));
+#endif
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
       // Show MJPEG stream from port 81 — rendered once, not AJAX-refreshed
       // onerror retry reconnects if stream drops (e.g. client disconnect)
@@ -4434,6 +5468,10 @@ bool Xdrv124(uint32_t function) {
             WSContentSend_P(PSTR(
               "<script>"
               "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
+              "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
+                "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+                "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
+                "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
               "function siva(v,i){la('&sv='+i+'_s_'+v);}"
               "function sivat(v,i){la('&sv='+i+'_t_'+v);}"
               "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"
@@ -4507,8 +5545,14 @@ bool Xdrv124(uint32_t function) {
 #if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
       WebServer_on(PSTR("/ide"), HandleTinyCIde);
 #endif
+#ifdef USE_UFILESYS
+      WebServer_on(PSTR("/cedit"), HandleSmlChartEditor);
+#endif
 #ifdef USE_HOMEKIT
       WebServer_on(PSTR("/hk"), HandleHomeKitQR);
+#endif
+#ifdef USE_MATTER_C
+      WebServer_on(PSTR("/mt"), HandleMatterQR);   // Matter pairing (replaces /hk)
 #endif
 #ifdef USE_DISPLAY
       WebServer_on(PSTR("/tc_display"), HandleTinyCDisplay);
@@ -4516,6 +5560,13 @@ bool Xdrv124(uint32_t function) {
       break;
 #endif
     case FUNC_SAVE_BEFORE_RESTART:
+      // Fix A: a commanded restart / OTA is graceful — Tasmota calls
+      // FUNC_SAVE_BEFORE_RESTART ONLY here, never on crash/WDT/panic.
+      // Drop the boot-loop marker FIRST so a user's (even repeated)
+      // `Restart` is never mistaken for a crash-loop and cannot
+      // disable autoexec. Real loops (no FUNC_SAVE_BEFORE_RESTART)
+      // still leave the marker.
+      tc_bootloop_marker_delete();
       // Call user's CleanUp() callback on all active slots (like scripter's >R section)
       tc_all_callbacks_id(TC_CB_CLEAN_UP);
       // Save persist variables for all loaded slots
