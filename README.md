@@ -61,7 +61,7 @@ int main() {
 ```
 
 => hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
-=> Die IDE ist nicht vorinstalliert und muss 1x geladen werden. Das geht nun (31.5.26) direkt in Tasmota Tools > TinyC Console > Update IDE. Oder ihr lädt sie selbst hoch, Download der [tinyc_ide.html.gz](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
+=> Die IDE ist nicht vorinstalliert und muss 1x geladen werden. Das geht nun (31.5.26) direkt in Tasmota Tools > TinyC Console > Update IDE. Oder ihr lädt sie selbst hoch, Download der [tinyc_ide.html.gz](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)  
 <img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
 <img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
 
@@ -334,6 +334,114 @@ Die wird erst erstellt, wenn man folgendes mit in die [platformio_tasmota_cenv.i
   
 Die extrem große Datei liegt unter `\.pio\build\tasmota32xxx\firmware.asm`. Dort kann man dann exakt nach der Adresse suchen.  
 Für den C6 muss man aber noch die `obj-dump.py` anpassen, da der C6 dort fehlt. Ich habe einfach die Zeile vom C3 kopiert.
+
+## Welche Images welchen Funktionsumfang bieten, könnt ihr anhand dieser Features/Treiber erkennen:
+**(1) Allgemeine Features (in beiden Varianten — `_tas` und `_tc`):**
+
+```
+USE_COUNTER
+USE_DEEPSLEEP (ESP32)
+USE_HOME_ASSISTANT
+USE_IMPROV
+USE_LIGHT
+USE_PING
+USE_SML_M
+USE_SML_CRC
+USE_SML_AUTHKEY
+USE_SPI (nur ESP32)
+USE_SUNRISE
+USE_TIMERS
+USE_TIMERS_WEB
+USE_UFILESYS (nur ESP32, ESP8266 4M+)
+USE_WEBSERVER
+USE_WEBCLIENT_HTTPS
+USE_TLS
+USE_MQTT_TLS (nur ESP32)
+USE_INFLUXDB (nur ESP32)
+USE_ESP32_SW_SERIAL (nur ESP32)
+USE_BMP (ESP32, ESP8266 1M Energy)
+USE_DS18x20 (ESP32, ESP8266 1M Energy)
+SET_ESP32_STACK_SIZE 12 * 1024
+UFSYS_SIZE 16384 (ESP32)
+UFSYS_SIZE 8192 (ESP8266 4M+)
+```
+
+**(2) Features für <sup>(1)</sup>Steckdosen mit Energiemessfunktion:**
+In allen ESP32 bzw. nur im ESP8266 (1M) Image `tasmota_energy_ottelo_tas` sind diese Treiber aktiv!
+<sup>(1)</sup>ESP8266: z.B. SonOff POW(R2), Gosund EP2, SonOff Dual R3 v2, NousA1T
+<sup>(1)</sup>ESP32: z.B. Shelly Plus Plug S
+
+```
+USE_ADE7953
+USE_BL09XX
+USE_DHT
+USE_CSE7766
+USE_ENERGY_MARGIN_DETECTION
+USE_ENERGY_POWER_LIMIT
+USE_ENERGY_SENSOR
+USE_HLW8012
+USE_I2C
+```
+
+**(3) [Tasmota Scripting](https://tasmota.github.io/docs/Scripting-Language/) (USE_SCRIPT) — nur in `_tas`-Images:**
+
+```
+USE_SCRIPT
+USE_SCRIPT_FATFS_EXT (ESP32, ESP8266 4M+)
+USE_EEPROM (ESP8266 1M)
+EEP_SCRIPT_SIZE 8192 (ESP8266 1M / 1M Energy)
+EEP_SCRIPT_SIZE 4096 (ESP8266 1M Shelly)
+USE_GOOGLE_CHARTS
+USE_SCRIPT_WEB_DISPLAY
+USE_HTML_CALLBACK
+LARGE_ARRAYS
+SCRIPT_LARGE_VNBUFF (ESP32)
+MAX_ARRAY_SIZE 2000 (ESP32)
+USE_CW_CALC
+USE_ANGLE_FUNC (ESP32, ESP8266 +4M)
+USE_FEXTRACT (ESP32, ESP8266 +4M)
+USE_SCRIPT_SERIAL (nur ESP32)
+SCRIPT_FULL_WEBPAGE (nur ESP32)
+USE_SCRIPT_TCP_SERVER (nur ESP32)
+USE_SCRIPT_TASK (nur ESP32)
+USE_SCRIPT_MDNS (ESP32, ESP8266 1M Shelly)
+USE_SCRIPT_GLOBVARS
+USE_SCRIPT_JSON_EXPORT
+------------------
+für Script-DropDown-Menüs:
+SCRIPT_LIST_DOWNLOAD_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/script-list-menu/scripts/"
+SCRIPT_LIST "scripts.json"
+```
+
+**(4) [TinyC](https://gemu2015.github.io/Sonoff-Tasmota/) — nur in `_tc`-Images:**
+
+```
+USE_MATTER
+USE_TINYC          (XDRV_124, TinyC-VM)
+USE_TINYC_IDE      (selbstgehostete Browser-IDE)
+USE_SML_SCRIPT_CMD (entkoppelt SML_SetBaud / SML_Write vom Scripter)
+------------------
+Partitionslayout:
+ESP32 4M / ESP32-C3 / -C6 / -S2 / -SOLO1:  app1856k_fs1344k
+ESP32-S3 16M:                              app3904k_fs11584k (Default)
+ESP32-P4:                                  Board-Default
+ESP8266 4M:                                eigenes Schema
+------------------
+SML aktivieren im TC-Programm:
+  tasm_rule = 1;         // einmalig setzen
+  // Meter-Descriptor liegt in /sml_meter.def
+```
+
+**(5) Features für ESP32-Module mit LAN-Port (Ethernet/LAN):**
+Nur in `tasmota32_ottelo_*`, `tasmota32solo1_ottelo_*`, `tasmota32s3_ottelo_*` und `tasmota32p4_ottelo_*` aktiviert!
+
+```
+USE_ETHERNET
+USE_WT32_ETH01
+```
+
+**(6) Features und Treiber die ich deaktiviert habe:**
+Siehe `#undef FEATURE` in der Datei [user_config_override.h](user_config_override.h).
 
 ------------------
 Bedanken möchte ich mich besonders bei [gemu2015](https://github.com/gemu2015), der das Tasmota Scripting und SML entwickelt hat und mir immer sofort bei Problemen geholfen hat. 
