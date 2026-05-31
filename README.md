@@ -61,7 +61,7 @@ int main() {
 ```
 
 => hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
-=> Damit die IDE funktioniert müsst ihr die [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tasmota/tinyc/tinyc_ide.html.gz) via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
+=> Die IDE ist nicht vorinstalliert und muss 1x geladen werden. Das geht nun (31.5.26) direkt in Tasmota Tools > TinyC Console > Update IDE. Oder ihr lädt sie selbst hoch, Download der [tinyc_ide.html.gz](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)
 <img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
 <img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
 
@@ -110,7 +110,7 @@ Der **gemu-Fork** (auf dem die ottelo-Images basieren) hat einen Laufzeit-Partit
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdofree.com zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
-Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben).
+Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben). (Liste kann unvollständig sein)  
 - TasmotaProjekt/`tasmota/user_config_override.h`
 - TasmotaProjekt/`platformio_tasmota_cenv.ini`
 - TasmotaProjekt/`ccache_wrapper.py` <- siehe ccache (unten)
