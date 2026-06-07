@@ -304,7 +304,17 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
 #ifndef TC_BOOT_STABLE_S
 #define TC_BOOT_STABLE_S 30   // uptime at which boot is considered "succeeded"
 #endif
+#ifndef TC_BOOT_MAIN_WAIT_MS
+#define TC_BOOT_MAIN_WAIT_MS 2000  // serial autoexec: max ms to wait for a slot's main() to
+#endif                             //   finish before starting the next (main() is usually <300 ms)
 static bool tc_boot_marker_cleared = false;
+// Set when a slot's durable command prefix (slot_config[].cmd_prefix) changed —
+// TinyCPrefixReheal() flushes /tinyc.cfg once on the main task (never from the VM task).
+static bool tc_cfg_prefix_dirty = false;
+// Per-slot "already warned" bits for the dual-claim guard in TinyCPrefixReheal()'s
+// LEARN step — keeps the per-second loop from spamming the log while a stray
+// cross-slot prefix write persists. (TC_MAX_VMS is small, fits a uint32 bitmask.)
+static uint32_t tc_prefix_dupwarn = 0;
 
 #ifdef USE_UFILESYS
 // Save current slot configuration to /tinyc.cfg
@@ -315,12 +325,28 @@ static void TinyCSaveSettings(void) {
   File f = fs->open(TC_CFG_FILE, "w");
   if (!f) { AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Cannot write " TC_CFG_FILE)); return; }
   for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-    f.printf("%s,%d\n", Tinyc->slot_config[i].filename, Tinyc->slot_config[i].autoexec ? 1 : 0);
+    // filename,autoexec[,cmd_prefix] — the 3rd field is the durable command prefix
+    // (back-compat: old 2-field lines load with an empty prefix).
+    f.printf("%s,%d,%s\n", Tinyc->slot_config[i].filename,
+             Tinyc->slot_config[i].autoexec ? 1 : 0, Tinyc->slot_config[i].cmd_prefix);
   }
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
   f.close();
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Settings saved"));
+}
+
+// Drop a slot's DURABLE command prefix on a program-replace / reset, so the
+// per-second self-heal can't resurrect the old program's prefix for a new
+// program. Marks /tinyc.cfg dirty; flushed by TinyCPrefixReheal (main task).
+// NB: NOT called on a plain stop or a same-file reload (incl. boot autoexec) —
+// the durable prefix must survive those so the heal can use it.
+static void TinyCClearDurablePrefix(uint8_t slot) {
+  if (!Tinyc || slot >= TC_MAX_VMS) return;
+  if (Tinyc->slot_config[slot].cmd_prefix[0]) {
+    Tinyc->slot_config[slot].cmd_prefix[0] = '\0';
+    tc_cfg_prefix_dirty = true;
+  }
 }
 
 // Boot-loop detector — primary signal is filesystem-only.
@@ -503,10 +529,13 @@ static void TinyCLoadSettings(void) {
     line.trim();
     if (line.length() == 0) { slot++; continue; }
 
-    // Parse: filename,autoexec
+    // Parse: filename,autoexec[,cmd_prefix]
     int comma = line.indexOf(',');
     String fname = (comma >= 0) ? line.substring(0, comma) : line;
     int autoexec = (comma >= 0 && comma + 1 < (int)line.length()) ? line.substring(comma + 1).toInt() : 0;
+    int comma2 = (comma >= 0) ? line.indexOf(',', comma + 1) : -1;
+    String pfx = (comma2 >= 0) ? line.substring(comma2 + 1) : String();
+    pfx.trim();
 
     // Special _info line
     if (fname == "_info") {
@@ -521,7 +550,8 @@ static void TinyCLoadSettings(void) {
       // Store config (lightweight — no RAM allocation for the VM)
       strlcpy(Tinyc->slot_config[slot].filename, fname.c_str(), sizeof(Tinyc->slot_config[slot].filename));
       Tinyc->slot_config[slot].autoexec = (autoexec != 0);
-      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: %s (autoexec=%d)"), slot, fname.c_str(), autoexec);
+      strlcpy(Tinyc->slot_config[slot].cmd_prefix, pfx.c_str(), sizeof(Tinyc->slot_config[slot].cmd_prefix));
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: %s (autoexec=%d prefix=%s)"), slot, fname.c_str(), autoexec, pfx.c_str());
     }
     slot++;
   }
@@ -583,15 +613,42 @@ static void TinyCStartAutoexec(void) {
     tc_bootloop_marker_write();
   }
 
+  // TWO-PHASE BOOT (Andreas .107, ESP32-S3+PSRAM, heap-tight).
+  //   Phase 1: start each slot and wait for its main() to reach addCommand/halt
+  //            (main_done) before starting the next — so only ONE main() runs at
+  //            a time. EACH slot's TaskLoop is held (hold_taskloop) the moment it
+  //            finishes main(), so it does NOT spin while later slots are still
+  //            initialising. Without this, slot-0's TaskLoop ran while slot-3's
+  //            main() tried to register, starved it of VM time/heap → BAT*/EM*
+  //            Unknown and a durable-prefix column that never got written.
+  //   Phase 2: once EVERY slot's main() has run, release all TaskLoops together.
+  // delay()/vTaskDelay feed the WDT. ESP32 only — the non-ESP32 path runs the VM
+  // cooperatively from the main loop (no task concurrency to serialise).
   for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
     if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
       if (TinyCLoadFile(Tinyc->slot_config[i].filename, i)) {
+#ifdef ESP32
+        Tinyc->slots[i]->hold_taskloop = true;   // park its TaskLoop until all mains have run
+#endif
         TinyCStartVM(Tinyc->slots[i]);
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: Auto-started slot %d (deferred from FUNC_INIT)"), i);
-        delay(100);  // stagger VM starts to avoid heap/stack exhaustion
+#ifdef ESP32
+        uint32_t t0 = millis();
+        TcSlot *as = Tinyc->slots[i];
+        while (as && !as->main_done && (millis() - t0) < TC_BOOT_MAIN_WAIT_MS) {
+          delay(20);
+        }
+#endif
       }
     }
   }
+#ifdef ESP32
+  // Phase 2: every autoexec main() has run (or timed out) — release the held
+  // TaskLoops together so none competed with a still-initialising slot's main().
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i]) { Tinyc->slots[i]->hold_taskloop = false; }
+  }
+#endif
 #endif
 }
 
@@ -760,6 +817,9 @@ void CmndCheckPartition(void);
 void CmndTinyCIde(void);
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+void CmndMatterCryptoTest(void);
+#endif
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
@@ -769,6 +829,9 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+  "|MtrCrypto"
+#endif
 #endif
   ;
 
@@ -780,6 +843,9 @@ void (* const TinyCCommand[])(void) PROGMEM = {
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+  , &CmndMatterCryptoTest
+#endif
 #endif
 };
 
@@ -794,7 +860,122 @@ void CmndMatterReset(void) {
   ResponseCmndDone();
   TasmotaGlobal.restart_flag = 2;
 }
-#endif
+
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+// ── TinyCMtrCrypto — Fork-B Stage-2 crypto-seam de-risk (task #125) ──────────
+// Off by default: this dev scaffold #includes a matter-BinPlugin-internal header
+// (mtrc_crypto_selftest.h) and needs the matter BLIB loaded, so it must NOT compile in
+// normal user builds. Enable with -DTINYC_MTRC_CRYPTO_SELFTEST for matter-plugin dev;
+// the *-plugin envs additionally supply the -Itasmota/Plugins/matter/include +
+// -Ilib/lib_ssl/bearssl-esp8266/src that the header chain (mtrc_crypto_ops.h →
+// t_bearssl.h/_ec.h) pulls in.  NB the include below uses "./Plugins/..." (NOT
+// "../Plugins/..."): Tasmota concatenates every .ino into .pio/build/<env>/src/
+// tasmota.ino.cpp, so a "../" path would resolve against the build dir, not tasmota/.
+// "./Plugins/..." matches the working xdrv_123_plugins.ino:37 include (Hans, 2026-06-07).
+// ⚠ TEMPORARY SCAFFOLD — remove this command (+ the KAT vectors + the plugin's
+// matter_crypto_selftest export + mtrc_crypto_selftest.h) once the real matter_c
+// amalgamation + the firmware-fills-ops / mtrc_crypto_bind path lands. Proven
+// green on .156 2026-06-03 ({"ran":90,"mask":"0x3f","pass":true}).
+// Hands the LOADED matter BinPlugin the firmware's BearSSL primitives BY POINTER
+// (mtrc_crypto_ops — incl. the two base-.rodata vtables br_ec_p256_m15 +
+// br_sha256_vtable), has it run SHA-256/HMAC/HKDF/EC/ECDSA/AES-CCM through the
+// by-pointer seam (its mtrc_crypto.c), and checks each result here against a
+// known-answer vector. A 0x3F mask proves the seam + both vtables work on a
+// mmap'd plugin with NO EXEC_OFFSET on the method pointers — the gate before the
+// full matter_c amalgamation. Requires the matter BLIB (xblib_02) loaded + iniz'd.
+#include "./Plugins/matter/include/mtrc_crypto_selftest.h"  // io struct + ops (pulls t_bearssl)
+
+// Known-answer vectors (firmware .rodata — no plugin relocation question).
+static const uint8_t MTRC_KAT_SHA[32] = {   // SHA-256("abc")
+  0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+  0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad };
+static const uint8_t MTRC_KAT_HMAC[32] = {  // RFC4231 TC2: HMAC-SHA256("Jefe", "what do ya want for nothing?")
+  0x5b,0xdc,0xc1,0x46,0xbf,0x60,0x75,0x4e,0x6a,0x04,0x24,0x26,0x08,0x95,0x75,0xc7,
+  0x5a,0x00,0x3f,0x08,0x9d,0x27,0x39,0x83,0x9d,0xec,0x58,0xb9,0x64,0xec,0x38,0x43 };
+static const uint8_t MTRC_KAT_HKDF[42] = {  // RFC5869 TC1 OKM
+  0x3c,0xb2,0x5f,0x25,0xfa,0xac,0xd5,0x7a,0x90,0x43,0x4f,0x64,0xd0,0x36,0x2f,0x2a,
+  0x2d,0x2d,0x0a,0x90,0xcf,0x1a,0x5a,0x4c,0x5d,0xb0,0x2d,0x56,0xec,0xc4,0xc5,0xbf,
+  0x34,0x00,0x72,0x08,0xd5,0xb8,0x87,0x18,0x58,0x65 };
+static const uint8_t MTRC_HKDF_SALT[13] = { 0,1,2,3,4,5,6,7,8,9,10,11,12 };
+static const uint8_t MTRC_HKDF_IKM[22]  = { 0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,
+                                            0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b };
+static const uint8_t MTRC_HKDF_INFO[10] = { 0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9 };
+static const uint8_t MTRC_EC_PRIV[32] = {   // NIST P-256 ECDH test scalar d
+  0xc9,0xaf,0xa9,0xd8,0x45,0xba,0x75,0x16,0x6b,0x5c,0x21,0x57,0x67,0xb1,0xd6,0x93,
+  0x4e,0x50,0xc3,0xdb,0x36,0xe8,0x9b,0x12,0x7b,0x8a,0x62,0x2b,0x12,0x0f,0x67,0x21 };
+static const uint8_t MTRC_KAT_ECPUB[65] = { // 0x04 || Qx || Qy  (Q = d*G)
+  0x04,
+  0x60,0xfe,0xd4,0xba,0x25,0x5a,0x9d,0x31,0xc9,0x61,0xeb,0x74,0xc6,0x35,0x6d,0x68,
+  0xc0,0x49,0xb8,0x92,0x3b,0x61,0xfa,0x6c,0xe6,0x69,0x62,0x2e,0x60,0xf2,0x9f,0xb6,
+  0x79,0x03,0xfe,0x10,0x08,0xb8,0xbc,0x99,0xa4,0x1a,0xe9,0xe9,0x56,0x28,0xbc,0x64,
+  0xf2,0xf1,0xb2,0x0c,0x2d,0x7e,0x9f,0x51,0x77,0xa3,0xc2,0x94,0xd4,0x46,0x22,0x99 };
+static const uint8_t MTRC_CCM_KEY[16]   = { 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,
+                                            0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f };
+static const uint8_t MTRC_CCM_NONCE[13] = { 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c };
+static const uint8_t MTRC_CCM_AAD[8]    = { 0,1,2,3,4,5,6,7 };
+static const uint8_t MTRC_CCM_PT[16]    = { 0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,
+                                            0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f };
+
+void CmndMatterCryptoTest(void) {
+  // 1) Fill the ops struct with the base's linked BearSSL primitives. The
+  //    __typeof__ fields make each assignment compiler-checked against the real
+  //    br_* prototype; the two vtables are passed as base-.rodata addresses as-is.
+  static mtrc_crypto_ops ops;
+  ops.sha256_init   = br_sha256_init;     ops.sha256_update = br_sha256_update;
+  ops.sha256_out    = br_sha256_out;
+  ops.hmac_key_init = br_hmac_key_init;   ops.hmac_init     = br_hmac_init;
+  ops.hmac_update   = br_hmac_update;     ops.hmac_out      = br_hmac_out;
+  ops.hkdf_init     = br_hkdf_init;       ops.hkdf_inject   = br_hkdf_inject;
+  ops.hkdf_flip     = br_hkdf_flip;       ops.hkdf_produce  = br_hkdf_produce;
+  ops.ecdsa_sign_raw= br_ecdsa_i15_sign_raw; ops.ecdsa_vrfy_raw= br_ecdsa_i15_vrfy_raw;
+  ops.aes_ct_ctrcbc_init = br_aes_ct_ctrcbc_init;
+  ops.ccm_init      = br_ccm_init;        ops.ccm_reset     = br_ccm_reset;
+  ops.ccm_aad_inject= br_ccm_aad_inject;  ops.ccm_flip      = br_ccm_flip;
+  ops.ccm_run       = br_ccm_run;         ops.ccm_get_tag   = br_ccm_get_tag;
+  ops.ccm_check_tag = br_ccm_check_tag;
+  ops.ec_p256_m15   = &br_ec_p256_m15;    ops.sha256_vtable = &br_sha256_vtable;
+
+  // 2) Fill the io struct: ops + firmware-owned input vectors.
+  static mtrc_crypto_selftest_io io;
+  memset(&io, 0, sizeof(io));
+  io.ops = &ops;
+  io.sha_in  = (const uint8_t *)"abc";                          io.sha_in_len  = 3;
+  io.hmac_key= (const uint8_t *)"Jefe";                         io.hmac_key_len= 4;
+  io.hmac_in = (const uint8_t *)"what do ya want for nothing?"; io.hmac_in_len = 28;
+  io.hkdf_salt = MTRC_HKDF_SALT; io.hkdf_salt_len = 13;
+  io.hkdf_ikm  = MTRC_HKDF_IKM;  io.hkdf_ikm_len  = 22;
+  io.hkdf_info = MTRC_HKDF_INFO; io.hkdf_info_len = 10; io.hkdf_out_len = 42;
+  io.ec_priv   = MTRC_EC_PRIV;
+  io.ccm_key   = MTRC_CCM_KEY;
+  io.ccm_nonce = MTRC_CCM_NONCE; io.ccm_nonce_len = 13;
+  io.ccm_aad   = MTRC_CCM_AAD;   io.ccm_aad_len   = 8;
+  io.ccm_pt    = MTRC_CCM_PT;    io.ccm_pt_len    = 16;
+
+  // 3) Resolve the plugin export (xdrv_123 registry, same TU) + call it through
+  //    the (buf,int)->int ABI, passing &io as the buf arg.
+  TC_BLIB_REG_ENTRY *r = tc_blib_lookup("matter_crypto_selftest");
+  if (!r) { ResponseCmndChar_P(PSTR("matter BLIB not loaded/iniz'd (no matter_crypto_selftest)")); return; }
+  int32_t ran = ((int32_t (*)(uint8_t *, int))r->fn)((uint8_t *)&io, (int)sizeof(io));
+
+  // 4) Compare the plugin's outputs against the KATs -> per-primitive pass bits.
+  uint32_t m = 0;
+  if (ran == 0x5A) {
+    if (memcmp(io.sha_out,  MTRC_KAT_SHA,   32) == 0) m |= 0x01;
+    if (memcmp(io.hmac_out, MTRC_KAT_HMAC,  32) == 0) m |= 0x02;
+    if (memcmp(io.hkdf_out, MTRC_KAT_HKDF,  42) == 0) m |= 0x04;
+    if (memcmp(io.ec_pub,   MTRC_KAT_ECPUB, 65) == 0) m |= 0x08;   // mulgen vtable
+    if (io.ecdsa_verify == 1)                         m |= 0x10;
+    if (io.ccm_dec_ok == 1 && memcmp(io.ccm_dec, MTRC_CCM_PT, 16) == 0) m |= 0x20;
+  }
+  AddLog(LOG_LEVEL_INFO,
+         PSTR("MTR crypto seam: ran=%d mask=0x%02x  sha=%d hmac=%d hkdf=%d ec=%d ecdsa=%d ccm=%d  %s"),
+         ran, m, !!(m&1), !!(m&2), !!(m&4), !!(m&8), !!(m&16), !!(m&32),
+         (m == 0x3F) ? "ALL PASS" : "FAIL");
+  Response_P(PSTR("{\"MtrCrypto\":{\"ran\":%d,\"mask\":\"0x%02x\",\"pass\":%s}}"),
+             ran, m, (m == 0x3F) ? "true" : "false");
+}
+#endif // TINYC_MTRC_CRYPTO_SELFTEST (Fork-B crypto-seam scaffold — off by default)
+#endif // USE_MATTER_C
 
 // --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
 #ifdef ESP32
@@ -1119,6 +1300,8 @@ void CmndTinyCStop(void) {
   TcSlot *s = Tinyc->slots[slot_num];
   if (!s) { ResponseCmndChar_P(TC_NOT_INIT); return; }
   TinyCStopVM(s);
+  s->cmd_prefix_saved[0] = '\0';   // deliberate stop — don't let the per-second
+                                   // self-heal resurrect this slot's command prefix.
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d stopped"), slot_num);
   ResponseCmndDone();
 }
@@ -1137,6 +1320,10 @@ void CmndTinyCReset(void) {
   if (s->vm.constants) { free(s->vm.constants); }
   if (s->vm.const_data) { free(s->vm.const_data); }
   memset(&s->vm, 0, sizeof(TcVM));  // zero all fields and pointers
+  s->cmd_prefix_saved[0] = '\0';   // deliberate reset — drop the sticky prefix too
+                                   // (it lives in TcSlot, not TcVM, so the memset
+                                   // above doesn't clear it).
+  TinyCClearDurablePrefix(slot_num);  // and the persisted copy (slot is being wiped)
   s->output_len = 0;
   s->output[0] = '\0';
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d reset"), slot_num);
@@ -1224,6 +1411,15 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   uint32_t fsize = file.size();
   if (fsize == 0 || fsize > TC_MAX_PROGRAM) { file.close(); return false; }
   TinyCStopVM(s);
+  s->cmd_prefix_saved[0] = '\0';   // replacing the program — drop the old program's
+                                   // sticky command prefix so the self-heal can't
+                                   // resurrect it before the new main() registers.
+  // Only drop the DURABLE prefix when this is a genuinely DIFFERENT program
+  // (s->filename still holds the old name here). A same-file reload or the boot
+  // autoexec load must keep it — that durable copy is what heals a heap-tight boot.
+  if (s->filename[0] && strcmp(s->filename, path) != 0) {
+    TinyCClearDurablePrefix(slot_num);
+  }
   if (s->program) { free(s->program); s->program = nullptr; }
   // Internal DRAM first — small programs (the common case) stay in fast RAM.
   // Only when the internal heap can't satisfy (very large .tcb, or DRAM
@@ -1288,6 +1484,7 @@ static void HandleTinyCPage(void) {
       if (cs) TinyCStartVM(cs);
     } else if (cmd == "stop" && cs) {
       TinyCStopVM(cs);
+      cs->cmd_prefix_saved[0] = '\0';   // deliberate (web) stop — no prefix self-heal
     } else if (cmd == "reset" && cs) {
       TinyCStopVM(cs);
       // Free remaining dynamic VM allocations before zeroing struct
@@ -1296,6 +1493,8 @@ static void HandleTinyCPage(void) {
       if (cs->vm.constants) { free(cs->vm.constants); }
       if (cs->vm.const_data) { free(cs->vm.const_data); }
       memset(&cs->vm, 0, sizeof(TcVM));
+      cs->cmd_prefix_saved[0] = '\0';   // deliberate (web) reset — drop sticky prefix
+      TinyCClearDurablePrefix(cmd_slot);  // and the persisted copy
       cs->output_len = 0;
       cs->output[0] = '\0';
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM slot %d reset (web)"), cmd_slot);
@@ -1432,6 +1631,12 @@ static void HandleTinyCPage(void) {
   // Custom styles for this page
   WSContentSend_P(PSTR(
     "<style>"
+    // Fixed page width again: Tasmota's content wrapper is display:inline-block, so
+    // it sizes to its widest child — and the Repository/Load <select>s grow to fit
+    // the LONGEST .tcb filename, which made the console width drift as the repo list
+    // changed. Pin the wrapper width and let the dropdowns shrink instead of stretch.
+    "body>div{width:480px;max-width:96vw;box-sizing:border-box}"
+    "select{min-width:0}"
     ".tc-run{color:#0a0}.tc-load{color:#fa0}.tc-empty{color:var(--c_txt);opacity:.5}"
     ".tc-err{color:#f44}"
     ".tc-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #333}"
@@ -1887,6 +2092,18 @@ static void HandleTinyCUploadCORS(void) {
                                      // deadlock, so they skip the bridge-disrupting
                                      // stop/restart. Override with -DTC_FS_BIG_WRITE=N.
 #endif
+#ifndef TC_FS_STOP_MINBLK
+#define TC_FS_STOP_MINBLK (24 * 1024) // (D) Heap-health gate: only STOP the VM slots
+                                     // for a big write when the heap is actually at
+                                     // risk. On a device with PSRAM (big allocs/TLS go
+                                     // to PSRAM, not the internal largest block) AND an
+                                     // internal largest-free block >= this, the write
+                                     // runs fine with the slots LIVE — and stopping them
+                                     // would risk an UNRECOVERABLE restart (post-write
+                                     // fragmentation < 16 KB-contiguous stack). So skip
+                                     // the stop there; keep it for heap-tight C3/.104 +
+                                     // a tight S3 bridge. Override -DTC_FS_STOP_MINBLK=N.
+#endif
 void TinyCFsWritePause(uint32_t fsize) {
   // Size-gate: skip the VM stop for small writes (the common case — config /
   // small .tc / data files). fsize==0 means the client didn't declare a size
@@ -1904,11 +2121,38 @@ void TinyCFsWritePause(uint32_t fsize) {
   // re-run on resume; the bridge's main() starts with matterReset() and
   // rebuilds its endpoints (identical to a normal boot — the Matter fabric
   // persists on UFS), so no commissioning is lost.
-  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-    TcSlot *s = Tinyc->slots[i];
-    if (s && s->loaded && s->task_running) {
-      s->fs_was_running = true;
-      TinyCStopVM(s);                 // sets task_stop + waits for the task to exit
+  // Stop EVERY loaded slot — NOT just those whose TaskLoop task is running.
+  // A main()-only slot that spawned a worker (spawnTask, e.g. an httpGet poller
+  // like ShellyPoll/StromTask) has task_running==false, yet its worker FreeRTOS
+  // task is alive and keeps allocating. On a heap already fragmented by the
+  // loaded VMs, that worker firing an httpGet/TLS alloc (~tens of KB) mid-write
+  // collapses the largest free block — Andreas's .104 trace: START maxblk=51100
+  // → after +2 KB write Heap=20 KB, LoadAvg=999, WiFi drop, hard hang (needs a
+  // power reset). TinyCStopVM() reaps the slot's spawnTask workers
+  // (tc_spawn_task_cleanup_slot) AND stops the VM task; TinyCStartVM() on resume
+  // re-runs main(), which re-spawns the workers — so none is lost.
+  //
+  // (D) HEAP-HEALTH GATE (Andreas KRITISCH 2026-06-02): on a heap-HEALTHY device
+  // this stop is both unnecessary and dangerous. Unnecessary: with PSRAM the
+  // write's + workers' big allocs draw from PSRAM, so the internal heap doesn't
+  // collapse and the write goes through with the slots live. Dangerous: after
+  // the write the internal heap is fragmented, and TinyCStartVM()'s xTaskCreate
+  // needs 16 KB CONTIGUOUS (TC_VM_TASK_STACK) — which may no longer exist, so the
+  // restart fails and the slots (display/controls) stay dead until a reboot. So
+  // only stop when the heap is actually at risk; otherwise keep every slot live.
+  uint32_t maxblk = ESP_getMaxAllocHeap();
+  bool heap_healthy = UsePSRAM() && (maxblk >= TC_FS_STOP_MINBLK);
+  if (heap_healthy) {
+    AddLog(LOG_LEVEL_DEBUG,
+           PSTR("TC: ufsu big-write — heap healthy (PSRAM, maxblk %u) — keeping slots live"),
+           (unsigned)maxblk);
+  } else {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->loaded) {
+        s->fs_was_running = true;
+        TinyCStopVM(s);               // reaps spawn workers + stops the VM task
+      }
     }
   }
 #endif
@@ -1922,11 +2166,123 @@ void TinyCFsWriteResume(void) {
       TcSlot *s = Tinyc->slots[i];
       if (s && s->fs_was_running) {
         s->fs_was_running = false;
-        TinyCStartVM(s);              // re-runs main() (re-runs matterReset()+rebuild for the bridge)
+        if (!TinyCStartVM(s)) {       // re-runs main() (re-runs matterReset()+rebuild for the bridge)
+          // (B) restart FAILED — almost always post-write heap fragmentation
+          // (no 16 KB-contiguous block for the task stack). Do NOT leave the slot
+          // silently dead (the old bug): flag it for a main-loop retry that keeps
+          // trying until the heap defragments enough — deterministic recovery,
+          // no forced reboot.
+          s->fs_restart_pending = true;
+          AddLog(LOG_LEVEL_INFO,
+                 PSTR("TC: slot %d restart after write FAILED (maxblk %u) — deferring, will retry"),
+                 i, (unsigned)ESP_getMaxAllocHeap());
+        }
       }
     }
   }
 #endif
+}
+
+// (B) Main-loop retry for slots whose post-write restart failed (fs_restart_pending).
+// Called once per second from FUNC_EVERY_SECOND. As the write's transient buffers
+// free and the heap defragments, TinyCStartVM() eventually finds its 16 KB-contiguous
+// stack and the slot comes back — without a forced reboot. A no-op when nothing pends.
+void TinyCFsRestartRetry(void) {
+#ifdef ESP32
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (s && s->fs_restart_pending) {
+      if (TinyCStartVM(s)) {
+        s->fs_restart_pending = false;
+        AddLog(LOG_LEVEL_INFO, PSTR("TC: slot %d restarted after write (heap recovered, maxblk %u)"),
+               i, (unsigned)ESP_getMaxAllocHeap());
+      }
+      // else: keep the flag and retry next second
+    }
+  }
+#endif
+}
+
+// (Andreas .107, 2026-06-04) Keep a loaded slot's registered command prefix
+// alive even when it was lost WITHOUT a full main() re-run. cmd_prefix is set
+// only by main()'s addCommand() (vm.h SYS_ADD_COMMAND) and cleared only by
+// TinyCStopVM teardown — so any worker stop+resume whose main() doesn't reach
+// addCommand() again (heap-tight boot, or the SD->Flash-sync worker-stop), or a
+// stray write clobbering the field, leaves the slot Running:1 while every BAT*/
+// command silently falls through to {"Command":"Unknown"}, recoverable until now
+// only by a full slot-restart (a reboot does NOT fix it). cmd_prefix_saved is the
+// sticky copy, cleared only on a deliberate stop/reset/program-replace; if a
+// loaded slot has the sticky copy but an empty live prefix, restore it so the
+// command/HTML interface keeps working. A no-op in the normal case (one strlcpy
+// guard per loaded slot per second). Skipped during an FS-write quiesce.
+void TinyCPrefixReheal(void) {
+  if (!Tinyc || tc_global_pause) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+
+    // (1) LEARN: mirror a freshly-registered prefix into the DURABLE /tinyc.cfg
+    //     copy so the expected prefix is known even on a future heap-tight boot
+    //     where main() never re-reaches addCommand(). Flushed once below.
+    if (s->cmd_prefix_saved[0] &&
+        strcmp(Tinyc->slot_config[i].cmd_prefix, s->cmd_prefix_saved) != 0) {
+      // DUAL-CLAIM GUARD (Andreas .142, 2026-06-07): refuse to persist a prefix
+      // that ANOTHER slot already owns in /tinyc.cfg. A stray cross-slot write
+      // (seen once via the IDE upload/autoexec path) can land slot X's freshly-
+      // registered prefix in slot Y's cmd_prefix_saved; without this guard the
+      // LEARN below would mirror it into slot_config[Y] and flush, leaving TWO
+      // slots claiming one prefix — dispatch then returns {"TinyC":"UNKNOWN"}
+      // (registered but undeliverable). Keep slot i's existing durable value and
+      // log the conflict instead (once per occurrence; the upstream stray write
+      // is task #151 / the deeper tc_current_slot audit).
+      bool dup = false;
+      for (uint8_t j = 0; j < TC_MAX_VMS; j++) {
+        if (j != i && Tinyc->slot_config[j].cmd_prefix[0] &&
+            strcmp(Tinyc->slot_config[j].cmd_prefix, s->cmd_prefix_saved) == 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        if (!(tc_prefix_dupwarn & (1u << i))) {
+          tc_prefix_dupwarn |= (1u << i);
+          AddLog(LOG_LEVEL_INFO,
+                 PSTR("TCC: prefix \"%s\" already owned by another slot — NOT persisting for slot %d (dual-claim guard; keeping \"%s\")"),
+                 s->cmd_prefix_saved, i, Tinyc->slot_config[i].cmd_prefix);
+        }
+      } else {
+        tc_prefix_dupwarn &= ~(1u << i);
+        strlcpy(Tinyc->slot_config[i].cmd_prefix, s->cmd_prefix_saved,
+                sizeof(Tinyc->slot_config[i].cmd_prefix));
+        tc_cfg_prefix_dirty = true;
+      }
+    } else {
+      tc_prefix_dupwarn &= ~(1u << i);   // no pending mismatch → re-arm the warn
+    }
+
+    // (2) HEAL: a RUNNING slot whose live prefix went empty. Restore from the
+    //     sticky RAM copy (prefix was set then lost — path A / B(i)), OR from the
+    //     durable config when this boot's main() never reached addCommand() so
+    //     cmd_prefix_saved is empty (path B(ii) — Andreas .107 heap-tight reboot).
+    //     The `running` gate re-arms only an executing VM (state initialised) —
+    //     never a deliberately-stopped slot whose durable prefix still lingers.
+    if (s->running && !s->cmd_prefix[0]) {
+      bool from_ram = (s->cmd_prefix_saved[0] != 0);
+      const char *want = from_ram ? s->cmd_prefix_saved : Tinyc->slot_config[i].cmd_prefix;
+      if (want[0]) {
+        strlcpy(s->cmd_prefix, want, sizeof(s->cmd_prefix));
+        if (!from_ram) strlcpy(s->cmd_prefix_saved, want, sizeof(s->cmd_prefix_saved));
+        AddLog(LOG_LEVEL_INFO,
+               PSTR("TCC: re-registered command prefix \"%s\" (slot %d) — %s"),
+               s->cmd_prefix, i,
+               from_ram ? "was lost without a main() re-run"
+                        : "main() never reached addCommand() (restored from persisted config)");
+      }
+    }
+  }
+  // Flush the durable prefix change once, on the main task (never the VM task).
+  if (tc_cfg_prefix_dirty) { tc_cfg_prefix_dirty = false; TinyCSaveSettings(); }
 }
 
 #ifdef USE_UFILESYS
@@ -2072,6 +2428,9 @@ static void HandleTinyCUpload(void) {
 
     // Stop any running program in this slot
     TinyCStopVM(s);
+    s->cmd_prefix_saved[0] = '\0';   // a new .tcb is being uploaded — drop the old
+                                     // program's sticky prefix (new main() re-registers).
+    TinyCClearDurablePrefix(slot_num);  // and the persisted copy — new program may differ
     // Allocate upload buffer.
     //
     // Sizing: the HTTP client may send `?fsz=N` (matches the `/ufsu` upload
@@ -2245,6 +2604,7 @@ static void HandleTinyCApi(void) {
     TcSlot *s = Tinyc->slots[slot_num];
     if (s) {
       TinyCStopVM(s);
+      s->cmd_prefix_saved[0] = '\0';   // deliberate (API) stop — no prefix self-heal
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: Program stopped (API, slot %d)"), slot_num);
     }
     WSSendJSON_P(200, PSTR("{\"ok\":true,\"running\":false}"));
@@ -2265,8 +2625,15 @@ static void HandleTinyCApi(void) {
     WSSendJSON(200, json);
   }
   else if (cmd == "status") {
-    // Return array of all slot statuses
-    String result = F("{\"ok\":true,\"slots\":[");
+    // Return firmware version markers (so the IDE can warn on a version/ABI
+    // mismatch — see the IDE's checkDeviceVersion) + an array of slot statuses.
+    //   release = TinyC firmware release string   (e.g. "1.6.38")
+    //   tcb     = bytecode FORMAT version the firmware accepts (TC_VERSION)
+    //   abi     = syscall ABI revision (TC_SYSCALL_ABI) — the one that matters:
+    //             a .tcb compiled against a different abi can dispatch syscalls
+    //             to the WRONG firmware function (silent UB), not just fail to load.
+    String result = String(F("{\"ok\":true,\"release\":\"" TC_RELEASE "\",\"tcb\":"))
+                    + TC_VERSION + F(",\"abi\":") + TC_SYSCALL_ABI + F(",\"slots\":[");
     bool first = true;
     for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
       TcSlot *s = Tinyc->slots[i];
@@ -4026,10 +4393,17 @@ static void TC_CamMotionDetect(void) {
   uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) return;
 
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+  // P4 has no DVP fmt2rgb888 software decoder; motion-detect via JPEG decode is
+  // a TODO on the HW jpeg_decode engine. Skip for now (capture/save still work).
+  free(rgb);
+  return;
+#else
   if (!fmt2rgb888(tc_cam_slot[0].buf, tc_cam_slot[0].len, PIXFORMAT_JPEG, rgb)) {
     free(rgb);
     return;
   }
+#endif
 
   // Allocate reference buffer if needed
   if (!tc_cam_motion.ref_buf || tc_cam_motion.ref_size != pixels) {
@@ -5307,6 +5681,8 @@ bool Xdrv124(uint32_t function) {
       // to declare the boot a success and clear the marker so future
       // recovery cycles work.
       TinyCCheckBootStable();
+      TinyCFsRestartRetry();   // (B) re-start any slot whose post-write restart failed
+      TinyCPrefixReheal();     // re-arm a loaded slot's command prefix if it was lost without a main() re-run
 #ifdef USE_MATTER_C
 #ifdef TC_MATTER_AUTOSTART
       mtrc_want_start = true;   // compile-time opt-in: start Matter without a script
@@ -5352,6 +5728,7 @@ bool Xdrv124(uint32_t function) {
       result = DecodeCommand(kTinyCCommands, TinyCCommand);
       if (!result && Tinyc) {
         // Check each slot for registered command prefix match
+        bool tc_busy = false;   // a prefix matched but its VM was busy -> answer "Busy", not "Unknown"
         for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
           TcSlot *s = Tinyc->slots[i];
           if (!s || !s->loaded) continue;
@@ -5377,6 +5754,7 @@ bool Xdrv124(uint32_t function) {
             // — keeps the web server responsive and the user retries.
             if (s->vm_mutex &&
                 xSemaphoreTake(s->vm_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+              tc_busy = true;   // ours, but locked past 200 ms (slot busy) — transient
               continue;
             }
 #endif
@@ -5384,6 +5762,7 @@ bool Xdrv124(uint32_t function) {
 #ifdef ESP32
               if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
 #endif
+              tc_busy = true;   // ours, but VM mid-execution / not idle — transient
               continue;
             }
             tc_current_slot = s;
@@ -5395,6 +5774,16 @@ bool Xdrv124(uint32_t function) {
             result = true;
             break;
           }
+        }
+        // 1.6.34 (Andreas, .107 UI-flicker) — a registered prefix matched a
+        // slot but it was busy: the bounded 200 ms try-lock (1.6.23) timed
+        // out, or the VM was mid-execution. Reply a DISTINCT {"Command":
+        // "Busy"} instead of falling through to the generic {"Command":
+        // "Unknown"}, so a polling HTML UI can keep its last good value on a
+        // transient busy rather than blanking (which looked like data loss).
+        if (!result && tc_busy) {
+          Response_P(PSTR("{\"Command\":\"Busy\"}"));
+          result = true;
         }
       }
       break;

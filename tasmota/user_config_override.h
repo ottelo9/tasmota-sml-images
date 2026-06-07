@@ -316,6 +316,13 @@
   #define USE_TINYC          //Enable TinyC VM (XDRV_124)
   #define USE_TINYC_IDE      //Enable self-hosted browser IDE (requires USE_UFILESYS)
 
+  //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
+  //-- (Audio, Sensoren, …) zur Laufzeit in die custom-Partition — ohne die
+  //-- Firmware neu zu flashen. Nicht automatisch an (siehe Plugins/readme.md).
+  //-- Die Plugins selbst werden separat mit tasmota/Plugins/build_plugin.py
+  //-- gebaut und sind erst nach Laden+Aktivieren via Konsole aktiv.
+  #define USE_BINPLUGINS
+
 #endif // OTTELO_VARIANT_TC
 
 

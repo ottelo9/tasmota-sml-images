@@ -116,7 +116,7 @@ Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpo
 - TasmotaProjekt/`ccache_wrapper.py` <- siehe ccache (unten)
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino)
 - TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` <- (optional) die aktuellste SML Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xsns_sensor/xsns_53_sml.ino)
-- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_vm.h` <- (optional, nur für TinyC-Build auf ESP8266 4M) — `igmp_leavegroup`-Aufruf mit `#ifdef ESP32`-Guard, sonst Build-Error. Issue beim gemu-Fork ist gemeldet.
+- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_vm.h` <- (wichtig für TinyC) die aktuellste TinyC-VM Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/include/xdrv_124_tinyc_vm.h) — ändert sich fast täglich
 - TasmotaProjekt/tasmota/`tasmota.ino` <- (optional) `image_name`-Buffer von 33 auf 64 Bytes erweitert, damit lange `CODE_IMAGE_STR` (z.B. `ESP32-C3 TC ottelo.jimdofree.com`) nicht abgeschnitten werden
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` <- (optional) HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends`
 - TasmotaProjekt/boards/`esp32s3-qio.json` <- (optional) für ESP32-S3 Image (siehe `platformio_tasmota_cenv.ini`) ohne PSRAM Support, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32)

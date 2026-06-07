@@ -525,6 +525,85 @@ extern "C" {
  extern void (* const MODULE_JUMPTABLE[])(void);
 }
 
+#ifdef USE_PLUGIN_FLOAT_BITS
+// ════════════════════════════════════════════════════════════════════════
+//  Bit-int float jumptable variants  (USE_PLUGIN_FLOAT_BITS, FIRMWARE-ONLY)
+// ════════════════════════════════════════════════════════════════════════
+// Every jt[] entry that takes or returns a `float` is swapped (below, via
+// PFB() in MODULE_JUMPTABLE) for a wrapper that carries the IEEE-754
+// binary32 BITS in an integer register. The two RISC-V float ABIs differ
+// ONLY in where a `float`-TYPED value is passed (ilp32 soft-float -> a*
+// regs; ilp32f hard-float -> fa* regs); a uint32_t is placed identically.
+// So these wrappers read/return a0,a1,... on BOTH ABIs (on P4 the math runs
+// on the FPU internally), and a soft-float _32r plugin — whose UNCHANGED
+// float(float,float) macro already passes operands in a0/a1 under ilp32 —
+// lands on them correctly even on a hard-float P4 firmware. Hence NO
+// plugin-side change: an existing _32r binary runs unmodified on a flag-ON
+// P4 firmware (Check_Arch below also accepts arch byte 2 = _32r there).
+//
+// double-only entries (jt[181..184,190,191]) are NOT wrapped — doubles
+// already cross in GPR pairs on both ABIs (P4 has no D-ext). Only `float`
+// args/returns are unpacked; bool/int/void/char*/pointer/uint args are
+// ABI-stable. Wrappers are defined before MODULE_JUMPTABLE so no fwd-decl.
+static inline uint32_t pfb_f2u(float f)    { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+static inline float    pfb_u2f(uint32_t u) { float f;    __builtin_memcpy(&f, &u, 4); return f; }
+
+// shape generators: W = wrapper name, F = wrapped firmware fn
+#define PFB_uF(W,F)   uint32_t W(uint32_t a){ return pfb_f2u(F(pfb_u2f(a))); }                       // float(float)
+#define PFB_uFF(W,F)  uint32_t W(uint32_t a,uint32_t b){ return pfb_f2u(F(pfb_u2f(a),pfb_u2f(b))); } // float(float,float)
+#define PFB_bF(W,F)   bool     W(uint32_t a){ return F(pfb_u2f(a)); }                                 // bool(float)
+#define PFB_bFF(W,F)  bool     W(uint32_t a,uint32_t b){ return F(pfb_u2f(a),pfb_u2f(b)); }           // bool(float,float)
+
+PFB_uFF(tmod_fdiv_bits,  tmod_fdiv)                      // jt[39]
+PFB_uFF(tmod_fmul_bits,  tmod_fmul)                      // jt[40]
+PFB_uFF(tmod_fdiff_bits, tmod_fdiff)                     // jt[41]
+PFB_uFF(tmod_fadd_bits,  tmod_fadd)                      // jt[43]
+PFB_uFF(FastPrecisePowf_bits,     FastPrecisePowf)       // jt[80]
+PFB_uFF(CalcTempHumToAbsHum_bits, CalcTempHumToAbsHum)   // jt[119]
+PFB_uF(ConvertTemp_bits,     ConvertTemp)                // jt[32]
+PFB_uF(ConvertHumidity_bits, ConvertHumidity)            // jt[33]
+PFB_uF(tmod_sinf_bits,  tmod_sinf)                       // jt[205]
+PFB_uF(tmod_cosf_bits,  tmod_cosf)                       // jt[206]
+PFB_uF(tmod_logf_bits,  tmod_logf)                       // jt[207]
+PFB_uF(tmod_sqrtf_bits, tmod_sqrtf)                      // jt[208]
+PFB_uF(tmod_expf_bits,  tmod_expf)                       // jt[215]
+PFB_bF(tmod_isnan_bits, tmod_isnan)                      // jt[31]
+PFB_bF(tmod_iseq_bits,  tmod_iseq)                       // jt[38]
+PFB_bF(tmod_isinf_bits, tmod_isinf)                      // jt[99]
+PFB_bFF(tmod_gtsf2_bits, tmod_gtsf2)                     // jt[49]
+PFB_bFF(tmod_ltsf2_bits, tmod_ltsf2)                     // jt[50]
+PFB_bFF(tmod_eqsf2_bits, tmod_eqsf2)                     // jt[51]
+#undef PFB_uF
+#undef PFB_uFF
+#undef PFB_bF
+#undef PFB_bFF
+
+// irregular shapes (hand-written; signature verified against the firmware fn)
+int      ResponseAppendTHD_bits(uint32_t a, uint32_t b)        { return ResponseAppendTHD(pfb_u2f(a), pfb_u2f(b)); }       // jt[95]  int(float,float)
+uint32_t tmod_tofloat_bits(uint64_t in)                        { return pfb_f2u(tmod_tofloat(in)); }                        // jt[42]  float(uint64_t)
+uint32_t tmod_NAN_bits(void)                                   { return pfb_f2u(tmod_NAN()); }                              // jt[48]  float(void)
+uint32_t tmod__floatsisf_bits(int32_t a)                       { return pfb_f2u(tmod__floatsisf(a)); }                      // jt[78]  float(int32_t)
+uint32_t tmod__floatunsisf_bits(uint32_t a)                    { return pfb_f2u(tmod__floatunsisf(a)); }                    // jt[79]  float(uint32_t)
+uint32_t GetTasmotaGlobalf_bits(uint32_t sel)                  { return pfb_f2u(GetTasmotaGlobalf(sel)); }                  // jt[81]  float(uint32_t)
+uint32_t tmod__fixunssfsi_bits(uint32_t a)                     { return tmod__fixunssfsi(pfb_u2f(a)); }                     // jt[83]  uint32_t(float)
+int32_t  tmod_fixsfti_bits(uint32_t a)                         { return tmod_fixsfti(pfb_u2f(a)); }                         // jt[133] int32_t(float)
+uint32_t fl_const_bits(int32_t m, int32_t d)                   { return pfb_f2u(fl_const(m, d)); }                          // jt[104] float(int32,int32)
+uint32_t CharToFloat_bits(const char* s)                       { return pfb_f2u(CharToFloat(s)); }                          // jt[147] float(const char*)
+double   tmod_extendsfdf2_bits(uint32_t a)                     { return tmod_extendsfdf2(pfb_u2f(a)); }                     // jt[187] double(float)
+uint32_t modff_bits(uint32_t a, float* p)                      { return pfb_f2u(modff(pfb_u2f(a), p)); }                    // jt[103] float(float,float*)
+char*    ftostrfd_bits(uint32_t a, unsigned char prec, char* s){ return ftostrfd(pfb_u2f(a), prec, s); }                    // jt[8]   char*(float,uint8_t,char*)
+uint32_t fscale_bits(int32_t n, uint32_t mul, uint32_t sub)    { return pfb_f2u(fscale(n, pfb_u2f(mul), pfb_u2f(sub))); }   // jt[10]  float(int32,float,float)
+void     ResponseCmndFloat_bits(uint32_t a, uint32_t dec)      { ResponseCmndFloat(pfb_u2f(a), dec); }                      // jt[94]  void(float,uint32_t)
+void     WSContentSend_THD_bits(const char* s, uint32_t t, uint32_t h) { WSContentSend_THD(s, pfb_u2f(t), pfb_u2f(h)); }    // jt[96]  void(const char*,float,float)
+void     WSContentSend_Temp_bits(const char* s, uint32_t v)    { WSContentSend_Temp(s, pfb_u2f(v)); }                       // jt[105] void(const char*,float)
+void     TempHumDewShow_bits(bool j, bool p, const char* t, uint32_t tm, uint32_t hm) { TempHumDewShow(j, p, t, pfb_u2f(tm), pfb_u2f(hm)); } // jt[34]  void(...)
+
+#define PFB(fn) fn##_bits     // jumptable: float entry -> bit-int wrapper
+#endif  // USE_PLUGIN_FLOAT_BITS
+#ifndef PFB
+#define PFB(fn) fn            // flag off: jumptable uses the native float fn
+#endif
+
 #define JMPTBL (void (*)())
 
 // this vector table table must contain all api calls needed by module
@@ -552,9 +631,9 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_ResponseAppend_P,
   JMPTBL&tmod_WSContentSend_PD,
 #endif
-  JMPTBL&ftostrfd,
+  JMPTBL&PFB(ftostrfd),
   JMPTBL&calloc,
-  JMPTBL&fscale,
+  JMPTBL&PFB(fscale),
   JMPTBL&Serial_print,
   JMPTBL&tmod_beginTransmission,
   JMPTBL&tmod_write,
@@ -580,10 +659,10 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&IndexSeparator,
   JMPTBL&Response_P,
   JMPTBL&I2cResetActive,
-  JMPTBL&tmod_isnan,
-  JMPTBL&ConvertTemp,
-  JMPTBL&ConvertHumidity,
-  JMPTBL&TempHumDewShow,
+  JMPTBL&PFB(tmod_isnan),
+  JMPTBL&PFB(ConvertTemp),
+  JMPTBL&PFB(ConvertHumidity),
+  JMPTBL&PFB(TempHumDewShow),
   JMPTBL&strlcpy,
 #if defined(ESP8266) || defined(__riscv)
   JMPTBL&GetTextIndexed,
@@ -591,20 +670,20 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_GetTextIndexed,
 #endif
   JMPTBL&GetTasmotaGlobal,
-  JMPTBL&tmod_iseq,
-  JMPTBL&tmod_fdiv,
-  JMPTBL&tmod_fmul,
-  JMPTBL&tmod_fdiff,
-  JMPTBL&tmod_tofloat,
-  JMPTBL&tmod_fadd,
+  JMPTBL&PFB(tmod_iseq),     // jt[38]  bit-int under USE_PLUGIN_FLOAT_BITS
+  JMPTBL&PFB(tmod_fdiv),     // jt[39]
+  JMPTBL&PFB(tmod_fmul),     // jt[40]
+  JMPTBL&PFB(tmod_fdiff),    // jt[41]
+  JMPTBL&PFB(tmod_tofloat),  // jt[42]
+  JMPTBL&PFB(tmod_fadd),     // jt[43]
   JMPTBL&I2cRead8,
   JMPTBL&I2cWrite8,
   JMPTBL&tmod_available,
   JMPTBL&AddLogMissed,
-  JMPTBL&tmod_NAN,
-  JMPTBL&tmod_gtsf2,
-  JMPTBL&tmod_ltsf2,
-  JMPTBL&tmod_eqsf2,
+  JMPTBL&PFB(tmod_NAN),
+  JMPTBL&PFB(tmod_gtsf2),
+  JMPTBL&PFB(tmod_ltsf2),
+  JMPTBL&PFB(tmod_eqsf2),
   JMPTBL&tmod_Pin,
   JMPTBL&tmod_newTS,
   JMPTBL&tmod_writeTS,
@@ -639,12 +718,12 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&AddlogT,
   JMPTBL&tmod__divsi3,
   JMPTBL&tmod__udivsi3,
-  JMPTBL&tmod__floatsisf,
-  JMPTBL&tmod__floatunsisf,
-  JMPTBL&FastPrecisePowf,
-  JMPTBL&GetTasmotaGlobalf,
+  JMPTBL&PFB(tmod__floatsisf),
+  JMPTBL&PFB(tmod__floatunsisf),
+  JMPTBL&PFB(FastPrecisePowf),
+  JMPTBL&PFB(GetTasmotaGlobalf),
   JMPTBL&tmod__muldi3,
-  JMPTBL&tmod__fixunssfsi,
+  JMPTBL&PFB(tmod__fixunssfsi),
   JMPTBL&tmod__umodsi3,
   JMPTBL&twi_readFrom,
   JMPTBL&MT_DecodeCommand,
@@ -659,22 +738,22 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_memmove_P,
 #endif
   JMPTBL&ResponseCmndNumber,
-  JMPTBL&ResponseCmndFloat,
-  JMPTBL&ResponseAppendTHD,
-  JMPTBL&WSContentSend_THD,
+  JMPTBL&PFB(ResponseCmndFloat),
+  JMPTBL&PFB(ResponseAppendTHD),
+  JMPTBL&PFB(WSContentSend_THD),
 #if defined(ESP8266) || defined(__riscv)
   JMPTBL&strncpy_P,
 #else
   JMPTBL&tmod_strncpy_P,
 #endif
   JMPTBL&isprint,
-  JMPTBL&tmod_isinf,
+  JMPTBL&PFB(tmod_isinf),
   JMPTBL&copyStr,
   JMPTBL&tmod_setClockStretchLimit,
   JMPTBL&tmod_writen,
-  JMPTBL&modff,
-  JMPTBL&fl_const,
-  JMPTBL&WSContentSend_Temp,
+  JMPTBL&PFB(modff),
+  JMPTBL&PFB(fl_const),
+  JMPTBL&PFB(WSContentSend_Temp),
   JMPTBL&delayMicroseconds,
   JMPTBL&digitalRead,
   JMPTBL&digitalWrite,
@@ -688,7 +767,7 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_directWriteHigh,
   JMPTBL&tmod_directModeInput,
   JMPTBL&tmod_directModeOutput,
-  JMPTBL&CalcTempHumToAbsHum,
+  JMPTBL&PFB(CalcTempHumToAbsHum),
 #if defined(ESP8266) || defined(__riscv)
   JMPTBL&WSContentSend_P,
 #else
@@ -706,7 +785,7 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&atoi,
   JMPTBL&tmod_strcpy_P,
   JMPTBL&SetTasmotaGlobal,
-  JMPTBL&tmod_fixsfti,
+  JMPTBL&PFB(tmod_fixsfti),
   JMPTBL&tmod_gtbl,
   JMPTBL&Settings,
   #ifdef USE_SPI
@@ -729,7 +808,7 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_file_seek,
   JMPTBL&tmod_file_read,
   JMPTBL&tmod_file_write,
-  JMPTBL&CharToFloat,
+  JMPTBL&PFB(CharToFloat),
   JMPTBL&tmod_AddLogData,
   JMPTBL&tmod_file_exists,
 #if defined(ESP8266) || defined(__riscv)
@@ -782,7 +861,7 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_floatunsidf,
   JMPTBL&tmod_fixdfdi,
   JMPTBL&tmod_fixunsdfsi,
-  JMPTBL&tmod_extendsfdf2,
+  JMPTBL&PFB(tmod_extendsfdf2),
   JMPTBL&tmod_random,
   JMPTBL&realloc,
   JMPTBL&tmod_floattidf,
@@ -804,10 +883,10 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_wc,
   JMPTBL&tmod_jpeg_picture,
   JMPTBL&tmod_shine,
-  JMPTBL&tmod_sinf,       // 205
-  JMPTBL&tmod_cosf,       // 206
-  JMPTBL&tmod_logf,       // 207
-  JMPTBL&tmod_sqrtf,      // 208
+  JMPTBL&PFB(tmod_sinf),       // 205
+  JMPTBL&PFB(tmod_cosf),       // 206
+  JMPTBL&PFB(tmod_logf),       // 207
+  JMPTBL&PFB(tmod_sqrtf),      // 208
   // PicoTTS engine API — exposed at indices 209-214 so the BinPlugin
   // (tasmota/Plugins/xdrv_42_i2s.cpp) can drive picotts directly.
   // Slots stay reserved even when USE_PICOTTS isn't compiled in so
@@ -821,12 +900,25 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
   JMPTBL&tmod_picotts_set_idle_notify,     // 212
   JMPTBL&tmod_picotts_set_error_notify,    // 213
   JMPTBL&tmod_picotts_set_resources,       // 214
-  JMPTBL&tmod_expf,                        // 215  expf() — append-only, 0..214 unchanged
+  JMPTBL&PFB(tmod_expf),                        // 215  expf() — append-only, 0..214 unchanged
   JMPTBL&tmod_I2cWrite8Bus,                // 216  I2cWrite8 4-arg dual-bus (jt[45] 3-arg left intact)
   JMPTBL&tmod_I2cWrite0,                   // 217  I2cWrite0 dual-bus
   JMPTBL&tmod_I2cReadBuffer0,              // 218  I2cReadBuffer0 dual-bus
   JMPTBL&tmod_ext_call                     // 219  selector-dispatched extensible helper (ONE slot for many fns; new helper = new case, never a new jt slot)
 };
+
+// ── Completeness guard for USE_PLUGIN_FLOAT_BITS (and jt[] stability) ──────
+// Fails the build ON PURPOSE if MODULE_JUMPTABLE grows or shrinks. When you
+// add an entry: bump the count below — AND, if the new entry takes OR returns
+// a `float`, you MUST add a tmod_*_bits wrapper above and wrap the entry with
+// PFB(), or a soft-float _32r plugin will SILENTLY misread it on a hard-float
+// P4 firmware (the exact bug USE_PLUGIN_FLOAT_BITS prevents). `double`-only
+// entries need no wrapper — doubles already cross in GPR pairs on both ABIs.
+// (All config branches — ESP8266/__riscv, USE_SPI, ESP32 — keep the same
+// length, so this count is build-invariant.)
+static_assert(sizeof(MODULE_JUMPTABLE) / sizeof(MODULE_JUMPTABLE[0]) == 220,
+  "MODULE_JUMPTABLE length changed: bump this count, and if the new entry uses "
+  "float add a tmod_*_bits wrapper + PFB() (see USE_PLUGIN_FLOAT_BITS above).");
 
 // Engine prototypes come from lib/libesp32_div/pico/picotts.h, included
 // at the top of this file under USE_PICOTTS. The wrappers below add a
@@ -839,6 +931,15 @@ void (* const MODULE_JUMPTABLE[])(void) PROGMEM = {
 // spell out the function-pointer types explicitly. Don't replace with
 // `picotts_output_cb_t` / `picotts_notify_cb_t` — the build will fail
 // with "type not declared" against the auto-generated prototype block.
+#if defined(USE_PICOTTS) && defined(ESP32)
+// C-linkage shim so the pure-C SVOX engine (lib/libesp32_div/pico/esp_picotts.c)
+// can allocate its ~1.1 MB working arena via Tasmota's PSRAM-aware special_malloc.
+// special_malloc is a C++-mangled .ino symbol not directly callable from a .c TU;
+// without routing through it the arena went to the ~200 KB internal heap and
+// picotts_init() failed with "insufficient memory" on a 4 MB ESP32-S3.
+extern "C" void *pico_arena_malloc(size_t size) { return special_malloc(size); }
+#endif
+
 bool tmod_picotts_init(unsigned prio, void (*cb)(int16_t *samples, unsigned count), int core) {
 #if defined(USE_PICOTTS) && defined(ESP32)
   return picotts_init(prio, cb, core);
@@ -1086,6 +1187,7 @@ uint32_t tmod_dummy() {
 
 #if defined(ESP32) && defined(USE_TLS)
 #include "WiFiClientSecureLightBearSSL.h"
+#include "HttpClientLight.h"
 #endif
 
 uint32_t tmod_wifi(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t p4) {
@@ -1182,6 +1284,24 @@ uint32_t tmod_wifi(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t
       break;
     case 19:
       sclient->setTimeout(p2);
+      break;
+    // ---- HTTPClientLight: Tasmota's BearSSL https-capable HTTP client ----
+    case 45:
+      return (uint32_t) new HTTPClientLight;
+    case 46:
+      return ((HTTPClientLight*)p1)->begin((char*)p2);
+    case 47:
+      return ((HTTPClientLight*)p1)->GET();
+    case 48:
+      return (uint32_t)((HTTPClientLight*)p1)->getStreamPtr();
+    case 49:
+      return ((HTTPClientLight*)p1)->connected();
+    case 54:
+      ((HTTPClientLight*)p1)->end();
+      break;
+    case 55:
+      delete (HTTPClientLight*)p1;
+      break;
 #endif // ESP32 + USE_TLS
 
     // class http
@@ -1703,14 +1823,16 @@ sel &= 0xff;
   return 0;
 }
 
-#if defined(ESP32) && defined(JPEG_PICTS)
+#if defined(ESP32) && defined(JPEG_PICTS) && defined(USE_DISPLAY)
 // Draw_jpeg lives in xdrv_13_display; its prototype used to come from the
 // Scripter (xdrv_10_scripter). Declare it here so JPEG_PICTS works in
-// scripter-less builds (TINYC_NO_SCRIPTER) too.
+// scripter-less builds (TINYC_NO_SCRIPTER) too. Gate on USE_DISPLAY: Draw_jpeg
+// is only DEFINED when a display driver is built, so a display-less build
+// (TINYC_NO_DISPLAY) must compile jpeg_picture out to avoid an undefined ref.
 void Draw_jpeg(uint8_t *mem, uint16_t jpgsize, uint16_t xp, uint16_t yp, uint8_t scale);
 #endif
 uint32_t tmod_jpeg_picture(uint32_t mem, uint32_t jpgsize, uint32_t xp, uint32_t yp, uint32_t scale) {
-#if  defined(ESP32) && defined(JPEG_PICTS)
+#if  defined(ESP32) && defined(JPEG_PICTS) && defined(USE_DISPLAY)
   Draw_jpeg((uint8_t*)mem, jpgsize, xp, yp, scale);
 #endif
   return 0;
@@ -1989,7 +2111,7 @@ uint32_t tmod_serialdispatch(uint32_t sel, uint32_t p1, uint32_t p2, uint32_t p3
 
 void *tmod_special_malloc(uint32_t size) {
   void *ptr = special_malloc(size);
-  memset(ptr, 0, size);
+  if (ptr) { memset(ptr, 0, size); }   // SECURITY: don't memset() a NULL on OOM
   return ptr;
 };
 
@@ -2255,6 +2377,24 @@ void tmod_vTaskExitCritical( void *mux ) {
 #define DIRECT_WRITE_HIGH(base, mask)   (GPOS = (mask))             //GPIO_OUT_W1TS_ADDRESS
 */
 
+// On the ESP32-P4 the SOC headers type the GPIO bank-0 registers (in / out_w1tc /
+// out_w1ts / enable_w1tc / enable_w1ts) as structs (gpio_in_reg_t, …), so the raw
+// 32-bit word must be reached via .val — exactly like the bank-1 (pin>=32) regs
+// below already do. Other targets keep GPIO.in / GPIO.out_w1tc as plain words.
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+  #define TMOD_GPIO_IN           (GPIO.in.val)
+  #define TMOD_GPIO_OUT_W1TC(m)  (GPIO.out_w1tc.val  = (m))
+  #define TMOD_GPIO_OUT_W1TS(m)  (GPIO.out_w1ts.val  = (m))
+  #define TMOD_GPIO_EN_W1TC(m)   (GPIO.enable_w1tc.val = (m))
+  #define TMOD_GPIO_EN_W1TS(m)   (GPIO.enable_w1ts.val = (m))
+#else
+  #define TMOD_GPIO_IN           (GPIO.in)
+  #define TMOD_GPIO_OUT_W1TC(m)  (GPIO.out_w1tc  = (m))
+  #define TMOD_GPIO_OUT_W1TS(m)  (GPIO.out_w1ts  = (m))
+  #define TMOD_GPIO_EN_W1TC(m)   (GPIO.enable_w1tc = (m))
+  #define TMOD_GPIO_EN_W1TS(m)   (GPIO.enable_w1ts = (m))
+#endif
+
 uint32_t tmod_directRead(uint32_t pin) {
 
 #ifdef ESP32
@@ -2265,7 +2405,7 @@ uint32_t tmod_directRead(uint32_t pin) {
     return (GPIO.in.val >> pin) & 0x1;
 #else  // ESP32 with over 32 gpios
     if ( pin < 32 )
-        return (GPIO.in >> pin) & 0x1;
+        return (TMOD_GPIO_IN >> pin) & 0x1;
     else
         return (GPIO.in1.val >> (pin - 32)) & 0x1;
 #endif
@@ -2286,7 +2426,7 @@ void tmod_directWriteLow(uint32_t pin) {
     GPIO.out_w1tc.val = ((uint32_t)1 << pin);
 #else  // ESP32 with over 32 gpios
     if ( pin < 32 )
-        GPIO.out_w1tc = ((uint32_t)1 << pin);
+        TMOD_GPIO_OUT_W1TC((uint32_t)1 << pin);
     else
         GPIO.out1_w1tc.val = ((uint32_t)1 << (pin - 32));
 #endif
@@ -2307,7 +2447,7 @@ void tmod_directWriteHigh(uint32_t pin) {
     GPIO.out_w1ts.val = ((uint32_t)1 << pin);
 #else  // ESP32 with over 32 gpios
     if ( pin < 32 )
-        GPIO.out_w1ts = ((uint32_t)1 << pin);
+        TMOD_GPIO_OUT_W1TS((uint32_t)1 << pin);
     else
         GPIO.out1_w1ts.val = ((uint32_t)1 << (pin - 32));
 #endif
@@ -2330,7 +2470,7 @@ void tmod_directModeInput(uint32_t pin) {
         GPIO.enable_w1tc.val = ((uint32_t)1 << (pin));
 #else  // ESP32 with over 32 gpios
         if ( pin < 32 )
-            GPIO.enable_w1tc = ((uint32_t)1 << pin);
+            TMOD_GPIO_EN_W1TC((uint32_t)1 << pin);
         else
             GPIO.enable1_w1tc.val = ((uint32_t)1 << (pin - 32));
 #endif
@@ -2354,7 +2494,7 @@ void tmod_directModeOutput(uint32_t pin) {
         GPIO.enable_w1ts.val = ((uint32_t)1 << (pin));
 #else  // ESP32 with over 32 gpios
         if ( pin < 32 )
-            GPIO.enable_w1ts = ((uint32_t)1 << pin);
+            TMOD_GPIO_EN_W1TS((uint32_t)1 << pin);
         else
             GPIO.enable1_w1ts.val = ((uint32_t)1 << (pin - 32));
 #endif
@@ -3185,7 +3325,7 @@ uint32_t eeprom_block;
         blocksize *= SPI_FLASH_SEC_SIZE;
       } else {
         // free module block, check required size
-        uint8_t blocks = (size / SPI_FLASH_SEC_SIZE) + 1;
+        uint32_t blocks = (size / SPI_FLASH_SEC_SIZE) + 1;   // was uint8_t: truncates for >=255-sector modules
         //AddLog(LOG_LEVEL_INFO, PSTR("needed blocks: %d"), blocks);
         uint32_t *bp = lp;
         uint8_t free = 1;
@@ -3282,8 +3422,13 @@ uint32_t Store_Module_Block(uint8_t *fdesc, uint8_t index) {
 #ifdef ESP32
   //AddLog(LOG_LEVEL_INFO, PSTR("save module: %08x, size: %d"),eeprom_block, size);
   uint32_t offset = eeprom_block - plugins.free_flash_start;
-  esp_err_t err = err = esp_partition_erase_range(plugins.flash_pptr, offset, ESP32_PLUGIN_HSIZE);
-  err = esp_partition_write(plugins.flash_pptr, offset, (void*)lwp, ESP32_PLUGIN_HSIZE);
+  esp_err_t err = esp_partition_erase_range(plugins.flash_pptr, offset, ESP32_PLUGIN_HSIZE);
+  if (err == ESP_OK) {
+    err = esp_partition_write(plugins.flash_pptr, offset, (void*)lwp, ESP32_PLUGIN_HSIZE);
+  }
+  if (err != ESP_OK) {   // a failed erase/write leaves a slot that will crash on iniz — surface it
+    AddLog(LOG_LEVEL_ERROR, PSTR("MOD: flash store FAILED off=%08x err=%d (slot may be unusable)"), offset, err);
+  }
   yield();
 #endif // ESP32
 
@@ -3460,6 +3605,7 @@ void Read_Module_Data(uint32_t module, uint32_t *data) {
       uint32_t num = fm->arch & 0xff000000;
       if (num) {
         num = num >> 24;
+        if (num > 16) { num = 16; }   // SECURITY: clamp untrusted header store-count to caller vals[16]
       } else {
         num = MAX_MOD_STORES;
       }
@@ -3489,6 +3635,7 @@ void Update_Module_Data(uint32_t module, uint32_t *data) {
         uint32_t num = fm->arch & 0xff000000;
         if (num) {
           num = num >> 24;
+          if (num > 16) { num = 16; }   // SECURITY: clamp untrusted header store-count to caller vals[16]
         } else {
           num = MAX_MOD_STORES;
         }
@@ -3512,6 +3659,7 @@ void Update_Module_Data(uint32_t module, uint32_t *data) {
         uint32_t num = fm->arch & 0xff000000;
         if (num) {
           num = num >> 24;
+          if (num > 16) { num = 16; }   // SECURITY: clamp untrusted header store-count to caller vals[16]
         } else {
           num = MAX_MOD_STORES;
         }
@@ -3922,6 +4070,7 @@ void Module_dump(void) {
         }
       }
       uint16_t size = 512;
+      if (!modules[module].mod_addr) { AddLog(LOG_LEVEL_INFO, PSTR("MOD: slot %d empty"), module + 1); return; }  // SECURITY: don't deref a NULL slot
       uint32_t *lp = (uint32_t*) modules[module].mod_addr;
       lp += (512 / sizeof(uint32_t)) * block; 
       for (uint32_t cnt = 0; cnt < (size / 32) + 1; cnt ++) {
@@ -4000,6 +4149,10 @@ void Check_partition(void) {
   uint8_t add = 0;
   uint8_t remove = 0;
   uint8_t pack = 0;
+  uint8_t mkpart = 0;       // chkpt n <name> <kb> : create a named DATA partition
+  uint8_t delpart = 0;      // chkpt d <name>      : delete a named DATA partition
+  char    pname[16] = {0};  // partition label (max 15 + NUL)
+  uint32_t pkb = 0;         // requested size in KB (64k-aligned)
   if (XdrvMailbox.data_len) {
     char *cp = XdrvMailbox.data;
     while (*cp == ' ') cp++;
@@ -4029,6 +4182,27 @@ void Check_partition(void) {
           new_app_size = (new_app_size + 0xFFFF) & ~0xFFFF;
         }
       }
+    } else if (*cp == 'n') {
+      // create a named DATA partition: "chkpt n <name> <kb>".
+      // Carved from the TAIL of spiffs, so any partition already after spiffs
+      // (e.g. the plugin "custom") keeps its flash offset. General-purpose:
+      // mmap'able blobs (TTS voices, fonts, models, lookup tables, ...).
+      cp++;
+      while (*cp == ' ') cp++;
+      uint8_t i = 0;
+      while (*cp && *cp != ' ' && i < sizeof(pname) - 1) { pname[i++] = *cp++; }
+      pname[i] = 0;
+      while (*cp == ' ') cp++;
+      pkb = strtol(cp, &cp, 10);
+      if (pname[0] && pkb >= 64) { mkpart = 1; }
+    } else if (*cp == 'd') {
+      // delete a named DATA partition: "chkpt d <name>" (space merged back to spiffs)
+      cp++;
+      while (*cp == ' ') cp++;
+      uint8_t i = 0;
+      while (*cp && *cp != ' ' && i < sizeof(pname) - 1) { pname[i++] = *cp++; }
+      pname[i] = 0;
+      if (pname[0]) { delpart = 1; }
     }
   }
 
@@ -4070,6 +4244,11 @@ void Check_partition(void) {
     LittleFS.format();
   }
 
+  if (mkpart || delpart) {
+    // resizing spiffs invalidates the LittleFS; reformat so it remounts cleanly
+    LittleFS.format();
+  }
+
   // partition talble is aways at 0x8000
 /*
 typedef struct {
@@ -4092,6 +4271,7 @@ typedef struct {
   int num_partitions;
 
   uint8_t *mp = (uint8_t*)calloc(SPI_FLASH_SEC_SIZE >> 2, 4);
+  if (!mp) { AddLog(LOG_LEVEL_ERROR, PSTR("MOD: partition scan OOM")); return; }  // SECURITY: don't read into a NULL buffer
   esp_err_t ret = esp_flash_read(NULL, mp, PART_OFFSET, SPI_FLASH_SEC_SIZE);
   if (ret) { 
     AddLog(LOG_LEVEL_INFO, "partition read error:", ret);
@@ -4120,7 +4300,62 @@ typedef struct {
             break;
           }
         }
-        if (pack) {
+        if (mkpart || delpart) {
+          // general named DATA-partition create/delete, carved from spiffs.
+          esp_partition_info_t *pe = (esp_partition_info_t*)mp;
+          int8_t sp = hasspiffs, np_idx = -1;
+          for (uint32_t c = 0; c < num_partitions; c++) {
+            if (!strcmp((char*)pe[c].label, pname)) np_idx = c;
+          }
+          if (sp < 0) {
+            AddLog(LOG_LEVEL_INFO, PSTR("chkpt: no spiffs partition to carve from"));
+            mkpart = delpart = 0;
+          } else if (mkpart) {
+            uint32_t psize = ((pkb * 1024) + 0xFFFF) & ~0xFFFF;   // 64k align
+            if (np_idx >= 0) {
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: partition '%s' already exists"), pname);
+              mkpart = 0;
+            } else if (pe[sp].pos.size < psize + 0x8000) {        // keep >=32k FS
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: spiffs %dKB too small for '%s' %dKB"),
+                     pe[sp].pos.size / 1024, pname, psize / 1024);
+              mkpart = 0;
+            } else {
+              uint32_t new_sp  = pe[sp].pos.size - psize;
+              uint32_t new_off = pe[sp].pos.offset + new_sp;      // carve from spiffs TAIL
+              // open a slot at sp+1 (any later partitions keep their flash offsets)
+              memmove(&pe[sp + 2], &pe[sp + 1], (num_partitions - sp - 1) * sizeof(esp_partition_info_t));
+              pe[sp].pos.size = new_sp;
+              esp_partition_info_t *n = &pe[sp + 1];
+              n->magic = ESP_PARTITION_MAGIC;
+              n->type = PART_TYPE_DATA;
+              n->subtype = 0x40;                                  // user data (not auto-mounted)
+              n->pos.offset = new_off;
+              n->pos.size = psize;
+              memset(n->label, 0, sizeof(n->label));
+              strncpy((char *)n->label, pname, sizeof(n->label) - 1);
+              n->flags = 0;
+              num_partitions++;
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: + '%s' DATA %dKB @ 0x%06x; spiffs -> %dKB"),
+                     pname, psize / 1024, new_off, new_sp / 1024);
+            }
+          } else { // delpart
+            if (np_idx < 0) {
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: partition '%s' not found"), pname);
+              delpart = 0;
+            } else if (np_idx != sp + 1) {
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: named partitions are LIFO - delete the most-recent one (directly after the filesystem) before '%s'"), pname);
+              delpart = 0;
+            } else {
+              uint32_t freed = pe[np_idx].pos.size;
+              pe[sp].pos.size += freed;                           // hand the space back to spiffs
+              memmove(&pe[np_idx], &pe[np_idx + 1], (num_partitions - np_idx - 1) * sizeof(esp_partition_info_t));
+              memset(&pe[num_partitions - 1], 0, sizeof(esp_partition_info_t));
+              num_partitions--;
+              AddLog(LOG_LEVEL_INFO, PSTR("chkpt: - '%s' (%dKB); spiffs -> %dKB"),
+                     pname, freed / 1024, pe[sp].pos.size / 1024);
+            }
+          }
+        } else if (pack) {
           // pack: resize app0 and spiffs, preserve custom
           int8_t hasapp0 = -1;
           int8_t hascustom = -1;
@@ -4228,11 +4463,11 @@ typedef struct {
   wf.close();
 #endif
 
-  if (add || remove || pack) {
+  if (add || remove || pack || mkpart || delpart) {
     scan_ptable(mp, num_partitions);
   }
 
-  if (add || remove || pack) {
+  if (add || remove || pack || mkpart || delpart) {
     // ESP_PARTITION_MAGIC_MD5
     // esp_partition_is_flash_region_writable
     ret = esp_flash_erase_region(NULL, PART_OFFSET, SPI_FLASH_SEC_SIZE);
@@ -4268,7 +4503,26 @@ const char HTTP_MODULES_SCRIPT[] PROGMEM =
   "setTimeout(function(){"
    "window.location.reload();"
   "}, 500);"
-"}";
+"}"
+// seva() is the GPIO/store selector handler used by the per-module pin
+// dropdowns below. When the Scripter web layer is compiled in, HTTP_SCRIPT_ROOT
+// expands to HTTP_SCRIPT_ROOT_WEB_DISPLAY.h which already defines seva(), so we
+// must NOT redefine it (harmless, but redundant). Builds that strip the Scripter
+// (e.g. the TinyC images, USE_SCRIPT_WEB_DISPLAY undefined) get
+// HTTP_SCRIPT_ROOT_NO_WEB_DISPLAY.h which has no seva() — the dropdowns'
+// onchange='seva(...)' then threw a ReferenceError and pin changes were silently
+// lost. Define it locally for exactly that case so /modu is self-contained:
+// la()'s '.?m=1' resolves to the root page from /modu, hitting FUNC_WEB_SENSOR ->
+// Modul_Check_HTML_Setvars() which writes the store back to flash.
+#ifndef USE_SCRIPT_WEB_DISPLAY
+"function seva(par,ivar){"
+  "la('&sv='+ivar+'_'+par);"
+  "setTimeout(function(){"
+   "window.location.reload();"
+  "}, 500);"
+"}"
+#endif
+;
 
 const char MOD_DIRECTORY[] PROGMEM =
   "<p><form action='" "mo_upl" "' method='get'><button>" "%s" "</button></form></p>";
@@ -4337,10 +4591,19 @@ void Modul_Check_HTML_Setvars(void) {
       // should better update values on closing menu
       uint32_t vals[16];
       Read_Module_Data(mind, vals);
-      uint32_t old = vals[pinn] & 0xff;
-      vals[pinn] = (vals[pinn] & 0xffffff00) | pind;
+      if (pinn < 16) {                       // SECURITY: bound web 'sv' index into vals[16] (was OOB stack r/w for pinn 16..255)
+        uint32_t old = vals[pinn] & 0xff;
+        vals[pinn] = (vals[pinn] & 0xffffff00) | pind;
+      }
       //AddLog(LOG_LEVEL_INFO,PSTR(">>> %d - %d - %d -> %d"), mind, pinn, old, pind);
       Update_Module_Data(mind, vals);
+    }
+    else if (!strncmp(cp, "auto", 4)) {
+      // autostart checkbox in the plugin-menu header: flip the Option_A7 flag
+      // (gpio_optiona.shelly_pro) only — nothing else.
+      cp += 4;
+      if (*cp == '_') { cp++; }
+      TasmotaGlobal.gpio_optiona.shelly_pro = strtol(cp, &cp, 10) ? 1 : 0;
     }
   }
 
@@ -4372,6 +4635,10 @@ void Module_upload() {
   } 
 
   WSContentSend_P(MOD_FORM_FILE_UPGc, WebColor(COL_TEXT), MAX_PLUGINS, MOD_FreeSlots(),color,GetTextIndexed(type, sizeof(type), plugins.upload_error, MOD_UPL_ERRMSG));
+
+  // Autostart-at-boot toggle (Option_A7 / gpio_optiona.shelly_pro) — moved into the plugin menu.
+  WSContentSend_P(PSTR("<p style='text-align:left'><label><input type='checkbox' onclick='seva(this.checked?1:0,\"auto\")'%s>&nbsp;Autostart plugins at boot</label></p>"),
+    TasmotaGlobal.gpio_optiona.shelly_pro ? " checked" : "");
 
 #ifdef EXECUTE_FROM_BINARY
   WSContentSend_P(MOD_FORM_FILE_UPG, PSTR("Plugin upload disabled"));
@@ -4422,6 +4689,7 @@ void Module_upload() {
       uint32_t num = fm->arch & 0xff000000;
       if (num) {
         num = num >> 24;
+        if (num > 16) { num = 16; }   // SECURITY: clamp untrusted header store-count to caller vals[16]
       } else {
         num = MAX_MOD_STORES;
       }
@@ -4513,7 +4781,20 @@ bool Check_Arch(FLASH_MODULE *fm) {
       return false;
     }
 
-    if ((fm->arch & 0x000000ff) != CURR_ARCH) {
+    uint32_t mod_arch = fm->arch & 0x000000ff;
+    bool arch_ok = (mod_arch == CURR_ARCH);
+#ifdef USE_PLUGIN_FLOAT_BITS
+    // With the bit-int float jumptable, every float jt[] entry crosses in
+    // integer regs, so a soft-float _32r module (ARCH_ESP32_RV) is ABI-
+    // compatible with THIS hard-float P4 firmware. Accept it in addition to
+    // the native _32p. (On C3/C6 firmware CURR_ARCH is itself ARCH_ESP32_RV,
+    // so this branch adds nothing there — it only widens acceptance on P4.)
+    if (!arch_ok && CURR_ARCH == ARCH_ESP32_P4 && mod_arch == ARCH_ESP32_RV) {
+      arch_ok = true;
+      AddLog(LOG_LEVEL_INFO, PSTR("PLG: accept _32r soft-float module on P4 (float-bits ABI)"));
+    }
+#endif
+    if (!arch_ok) {
       AddLog(LOG_LEVEL_INFO,PSTR("plugin architecture error"));
       plugins.upload_error = MOD_UPL_ERR_ARCH;
       return false;
@@ -4546,7 +4827,11 @@ void Set_Module_Start(uint8_t slot, uint32_t start) {
 bool Module_upload_start(const char* upload_filename) {
   strlcpy(plugins.mod_name, upload_filename, sizeof(plugins.mod_name));
   // Filename layout: <MODULE_NAME>_<arch>.bin (e.g. "I2SAUDIO_32.bin",
-  // "CRC_BLIB_32.bin", "DS18X20_32r.bin"). The arch suffix begins at
+  // "CRC_BLIB_32.bin", "DS18X20_32r.bin", "I2SAUDIO_32p.bin" for P4).
+  // Arch is validated by the sync-header byte (Check_Arch vs CURR_ARCH),
+  // NOT by this suffix — the suffix is only a human/curation tag. The
+  // strrchr('_') strip below handles any suffix width (_32 / _32r / _32p).
+  // The arch suffix begins at
   // the LAST underscore, so we strip from there, not the first one —
   // module names are allowed to contain underscores themselves
   // (e.g. CRC_BLIB). Using strchr(name, '_') stripped at the FIRST
@@ -4599,7 +4884,8 @@ bool Module_upload_write(uint8_t *upload_buf, size_t current_size) {
       return false;
     }
 
-    // allocate 1 sector size
+    // allocate 1 sector size (free any buffer leaked by a prior aborted upload first)
+    if (plugins.module_input_buffer) { free(plugins.module_input_buffer); plugins.module_input_buffer = nullptr; }
     plugins.module_input_buffer = (uint8_t *)special_malloc(SPI_FLASH_SEC_SIZE + 4);
     if (!plugins.module_input_buffer) {
       AddLog(LOG_LEVEL_INFO,PSTR("memory error"));
@@ -4614,6 +4900,7 @@ bool Module_upload_write(uint8_t *upload_buf, size_t current_size) {
   
   if (plugins.module_bytes_read == 0) {
     //AddLog(LOG_LEVEL_INFO,PSTR("progress bytes read 1; %d"),plugins.module_bytes_read);
+    if (current_size > SPI_FLASH_SEC_SIZE) { plugins.upload_error = MOD_UPL_ERR_MEM; return false; }  // SECURITY: bound write to the sector buffer
     memcpy(plugins.module_input_ptr, upload_buf, current_size);
     plugins.module_bytes_read += current_size;
     if (current_size < 2048) {
@@ -4623,6 +4910,7 @@ bool Module_upload_write(uint8_t *upload_buf, size_t current_size) {
     }
   } else {
     //AddLog(LOG_LEVEL_INFO,PSTR("progress bytes read 2; %d"),plugins.module_bytes_read);
+    if ((uint32_t)plugins.module_bytes_read + current_size > SPI_FLASH_SEC_SIZE) { plugins.upload_error = MOD_UPL_ERR_MEM; return false; }  // SECURITY: bound write to the sector buffer
     memcpy(plugins.module_input_ptr + plugins.module_bytes_read, upload_buf, current_size);
     Store_Module_Block(plugins.module_input_buffer, plugins.upload_slot);
     plugins.upload_start_block++;
@@ -4639,13 +4927,89 @@ bool Module_upload_write(uint8_t *upload_buf, size_t current_size) {
 void Module_upload_stop(void) {
   if (plugins.module_input_buffer) {
     free(plugins.module_input_buffer);
+    plugins.module_input_buffer = nullptr;   // avoid double-free if stop runs twice
   }
 }
+
+// ---- generic raw upload of a blob into a named DATA partition ----------------
+// Populates a partition created with "chkpt n <name> <kb>" (TTS voice, font,
+// model, ...) straight from an HTTP upload, bypassing the (possibly tiny) FS.
+// The multipart *filename* selects the target partition. For safety only
+// type=DATA subtype=0x40 partitions (exactly what "chkpt n" creates) are
+// writable, so app0/nvs/safeboot/spiffs can never be clobbered. Erase is
+// per-sector (spread across the transfer) to stay WDT-friendly.
+#ifdef ESP32   // esp_partition_* are ESP-IDF only; the named-partition /partu facility is ESP32-only
+static const esp_partition_t *partu_part = nullptr;
+static uint8_t  *partu_buf  = nullptr;   // one-sector staging buffer
+static uint32_t  partu_off  = 0;         // next flash offset within the partition
+static uint32_t  partu_fill = 0;         // bytes buffered in partu_buf
+static bool      partu_err  = false;
+
+static bool Partition_flush_sector(void) {
+  if (partu_off + SPI_FLASH_SEC_SIZE > partu_part->size) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("PARTU: overflow — partition too small"));
+    partu_err = true; plugins.upload_error = MOD_UPL_ERR_MEM; return false;
+  }
+  esp_err_t e = esp_partition_erase_range(partu_part, partu_off, SPI_FLASH_SEC_SIZE);
+  if (e == ESP_OK) { e = esp_partition_write(partu_part, partu_off, partu_buf, SPI_FLASH_SEC_SIZE); }
+  if (e != ESP_OK) { AddLog(LOG_LEVEL_ERROR, PSTR("PARTU: flash err=%d @0x%x"), e, partu_off); partu_err = true; plugins.upload_error = MOD_UPL_ERR_MEM; return false; }
+  partu_off += SPI_FLASH_SEC_SIZE; partu_fill = 0;
+  return true;
+}
+
+bool Partition_upload_start(const char *name) {
+  partu_part = nullptr; partu_off = 0; partu_fill = 0; partu_err = false;
+  if (partu_buf) { free(partu_buf); partu_buf = nullptr; }
+  const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, name);
+  if (!p) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("PARTU: no writable DATA(0x40) partition '%s' (create via 'chkpt n')"), name);
+    partu_err = true; plugins.upload_error = MOD_UPL_ERR_MEM; return false;
+  }
+  partu_buf = (uint8_t *)special_malloc(SPI_FLASH_SEC_SIZE);
+  if (!partu_buf) { AddLog(LOG_LEVEL_ERROR, PSTR("PARTU: OOM")); partu_err = true; plugins.upload_error = MOD_UPL_ERR_MEM; return false; }
+  partu_part = p;
+  plugins.upload_error = 0;
+  AddLog(LOG_LEVEL_INFO, PSTR("PARTU: writing '%s' into %dKB partition @0x%06x"), name, p->size / 1024, p->address);
+  return true;
+}
+
+bool Partition_upload_write(uint8_t *buf, size_t len) {
+  if (partu_err || !partu_part || !partu_buf) return false;
+  while (len) {
+    size_t space = SPI_FLASH_SEC_SIZE - partu_fill;
+    size_t n = (len < space) ? len : space;
+    memcpy(partu_buf + partu_fill, buf, n);
+    partu_fill += n; buf += n; len -= n;
+    if (partu_fill == SPI_FLASH_SEC_SIZE) { if (!Partition_flush_sector()) return false; }
+  }
+  return true;
+}
+
+void Partition_upload_stop(void) {
+  if (partu_part && partu_buf && !partu_err && partu_fill) {
+    memset(partu_buf + partu_fill, 0xff, SPI_FLASH_SEC_SIZE - partu_fill);  // pad final partial sector
+    Partition_flush_sector();
+  }
+  if (partu_buf) { free(partu_buf); partu_buf = nullptr; }
+  if (partu_part && !partu_err) { AddLog(LOG_LEVEL_INFO, PSTR("PARTU: done, %d bytes"), partu_off); }
+  partu_part = nullptr;
+}
+
+void Partition_HandleUploadLoop(void) {
+  if (HTTP_USER == Web.state) { return; }
+  HTTPUpload& upload = Webserver->upload();
+  switch (upload.status) {
+    case UPLOAD_FILE_START: Partition_upload_start(upload.filename.c_str()); break;
+    case UPLOAD_FILE_WRITE: Partition_upload_write(upload.buf, upload.currentSize); break;
+    case UPLOAD_FILE_END:   Partition_upload_stop(); break;
+  }
+}
+#endif  // ESP32 (named-partition /partu facility)
 
 void Module_HandleUploadLoop(void) {
 
   if (HTTP_USER == Web.state) { return; }
-    
+
   HTTPUpload& upload = Webserver->upload();
 
   switch (upload.status) {
@@ -4746,6 +5110,9 @@ bool Xdrv123(uint32_t function) {
         Webserver->on("/mo_upl", Module_upload);
         Webserver->on("/modu", HTTP_GET, Module_upload);
         Webserver->on("/modu", HTTP_POST,[](){Webserver->sendHeader(F("Location"),F("/modu"));Webserver->send(303);}, Module_HandleUploadLoop);
+#ifdef ESP32
+        Webserver->on("/partu", HTTP_POST,[](){Webserver->sendHeader(F("Location"),F("/modu"));Webserver->send(303);}, Partition_HandleUploadLoop);
+#endif
         Module_Execute(pFUNC_WEB_ADD_HANDLER);
       }
       break;
