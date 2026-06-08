@@ -10,7 +10,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 
 ### Welches Image (Firmware Binary) für welchen ESP?
 
-**Wichtig — Varianten-Suffix:** Jedes Image gibt es (bis auf Berry und ESP8266 1M) in zwei Varianten:
+**Wichtig — Varianten-Suffix:** Jedes ESP32-Image gibt es in zwei Varianten (ESP8266 nur `_tas`):
 - `_tas` → klassischer **Tasmota-Scripter** + Google Charts (wie bisher)
 - `_tc`  → **TinyC VM** + Browser-IDE (kein Scripter, Meter-Descriptor unter `/sml_meter.def`, SML wird im TinyC-Programm mit `tasm_rule = 1;` aktiviert)
 
@@ -18,13 +18,12 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | ------------- | ------------- |
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
 | tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
-| tasmota32berry_ottelo_tas        | Generic ESP32 mit Berry Scripting Support (nur Scripter-Variante, kein TinyC) |
 | tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4 (solo1, s3 mit Ethernet Support) |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! In den entsprechenden komprimiert Ordnern sind die Scripte ohne Kommentare, sie können 1:1 kopiert werden. |
 | tasmota1m_ottelo_tas         | ESP mit 1M Flash (z.B. ESP01s = Hichi v1 Lesekopf). Nur Scripter (kein UFILESYS → kein TinyC). |
-| tasmota4m_ottelo_tas / _tc   | ESP mit 4M+ Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter) und für Steckdosen mit Energiemessung (mit 4M Speicher). |
+| tasmota4m_ottelo_tas         | ESP mit 4M+ Flash. Nur Scripter (kein _tc — ESP8266 4M hat kein I2C für den BinPlugin-Loader, und TinyC lohnt bei dem RAM kaum). Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter) und für Steckdosen mit Energiemessung (mit 4M Speicher). |
 | tasmota1m_energy_ottelo_tas  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Nur Scripter. Web-Upgrade nur über tasmota-minimal! |
 | tasmota1m_shelly_ottelo_tas  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Nur Scripter. Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Für Scripte siehe, [ESP8266 Scripte - Ordner komprimiert](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
 | tasmota-minimal              | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
@@ -46,7 +45,7 @@ Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludi
 ## TinyC - Alternative zum Scripting/Berry (ESP32 / ESP8266 4M+)
 - **TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry. Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
 
-**Image-Variante wählen:** Ab dieser Release gibt es pro Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. Berry und ESP8266 1M gibt es weiterhin nur als `_tas`.
+**Image-Variante wählen:** Ab dieser Release gibt es pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. ESP8266 (1M + 4M) gibt es nur als `_tas`.
 
 **SML in `_tc`-Builds aktivieren:** Im TinyC-Programm einmalig `tasm_rule = 1;` setzen (in `main()` oder `BootInit()`). Das öffnet den SML-Init-Gate (`Settings->rule_enabled` Bit 0), der Treiber lädt dann den Meter-Descriptor aus `/sml_meter.def`. Boot-festes Pattern siehe [`marstek_emu.tc`](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/examples/marstek_emu.tc):
 ```c
@@ -75,7 +74,6 @@ Deswegen nutzen die `_tc`-Images auf 4 MB-Boards das Layout [`esp32_partition_ap
 | `tasmota32_ottelo_tc`, `tasmota32c3_ottelo_tc`, `tasmota32c6_ottelo_tc`, `tasmota32s2_ottelo_tc`, `tasmota32solo1_ottelo_tc` | `app1856k_fs1344k` (1024 KB mehr FS) |
 | `tasmota32s3_ottelo_tc` | Default (16 MB Flash: `app3904k_fs11584k`) |
 | `tasmota32p4_ottelo_tc` | Default (boardabhängig) |
-| `tasmota4m_ottelo_tc` (ESP8266) | eigenes Schema |
 | alle `_tas` | Default belassen — Scripter+Charts+HA+InfluxDB+MQTT-TLS würde 1856 KB sprengen |
 
 #### Partitionen ohne Factory-Flash umstellen — `chkpt`
@@ -137,7 +135,6 @@ Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_ou
 
 ESP32 (Scripter-Variante `_tas`):  
 `pio run -e tasmota32_ottelo_tas`        (Generic ESP32)  
-`pio run -e tasmota32berry_ottelo_tas`   (Generic ESP32 + Berry, nur Scripter)  
 `pio run -e tasmota32s2_ottelo_tas`  
 `pio run -e tasmota32s3_ottelo_tas`  
 `pio run -e tasmota32c3_ottelo_tas`  
@@ -145,7 +142,7 @@ ESP32 (Scripter-Variante `_tas`):
 `pio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 `pio run -e tasmota32p4_ottelo_tas`  
 
-ESP32 (TinyC-Variante `_tc`, kein Berry):  
+ESP32 (TinyC-Variante `_tc`):  
 `pio run -e tasmota32_ottelo_tc`  
 `pio run -e tasmota32s2_ottelo_tc`  
 `pio run -e tasmota32s3_ottelo_tc`  
@@ -158,8 +155,7 @@ ESP8266:
 `pio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
 `pio run -e tasmota1m_energy_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)  
 `pio run -e tasmota1m_shelly_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
-`pio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, Scripter)  
-`pio run -e tasmota4m_ottelo_tc`         (>= 4M Flash, TinyC)  
+`pio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, nur Scripter — kein _tc, ESP8266 4M hat kein I2C für den BinPlugin-Loader)  
 
 Um alle gleichzeitig zu erstellen (Bash + jq):  
 `pio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')`
@@ -272,7 +268,6 @@ Nach dem Bauen aller Envs liegen die Firmware-Dateien (`*.bin`, `*.factory.bin`,
 
 3. Die ZIPs landen im Unterordner `tasmota_zips/`:
    - `tasmota8266_bundle_ottelo.zip` — alle ESP8266-Builds gebündelt + tasmota-minimal
-   - `tasmota32berry_ottelo_tas.zip` — ESP32 + Berry (nur Scripter)
    - `tasmota32<board>_ottelo_tas.zip` / `_tc.zip` — pro ESP32-Plattform jeweils zwei ZIPs (Scripter / TinyC), insgesamt 14 Stück
 
 **Verhalten bei fehlenden Builds:** Wenn eine erwartete Datei fehlt (z.B. C6 oder P4 nicht gebaut), meldet das Script `FEHLER: Datei fehlt: …` und überspringt nur dieses eine ZIP — die anderen werden weiterhin erstellt.

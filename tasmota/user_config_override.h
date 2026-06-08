@@ -46,7 +46,7 @@
  * "tasmota\user_config_override.h" kopieren. Die andere Datei "platformio_tasmota_cenv.ini" mit meinen
  * Varianten kommt ins Hauptverzeichnis von Tasmota. Eine detaillierte Anleitung findet ihr auf github.
  *
- * Es gibt für jede Plattform (außer Berry und ESP8266-1M) zwei Varianten:
+ * Es gibt für jede ESP32-Plattform zwei Varianten (ESP8266 nur _tas):
  *   _tas  → klassischer Tasmota-Scripter (Tasmota Scripting Language, Google Charts)
  *   _tc   → TinyC VM + Browser-IDE (https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc)
  *
@@ -54,7 +54,6 @@
  * ESP32 (jeweils _tas oder _tc):
  * platformio run -e tasmota32_ottelo_tas        (Generic ESP32, Scripter)
  * platformio run -e tasmota32_ottelo_tc         (Generic ESP32, TinyC)
- * platformio run -e tasmota32berry_ottelo_tas   (ESP32 mit Berry, nur Scripter)
  * platformio run -e tasmota32s2_ottelo_tas / _tc
  * platformio run -e tasmota32s3_ottelo_tas / _tc
  * platformio run -e tasmota32c3_ottelo_tas / _tc
@@ -67,7 +66,7 @@
  * platformio run -e tasmota1m_ottelo_tas        (1M Flash, nur Scripter)
  * platformio run -e tasmota1m_energy_ottelo_tas (1M, Update nur über minimal. SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)
  * platformio run -e tasmota1m_shelly_ottelo_tas (1M, Update nur über minimal. Mit Shelly Pro 3EM / EcoTracker Emulation für Marstek Venus / Jupiter)
- * platformio run -e tasmota4m_ottelo_tas / _tc  (>= 4M Flash)
+ * platformio run -e tasmota4m_ottelo_tas        (>= 4M Flash, nur Scripter — kein _tc, ESP8266 4M hat kein I2C fuer den BinPlugin-Loader)
  *
  * Alle Images bauen (Bash + jq):
  *   pio run $(pio project config --json-output | jq -r '.[] | .[0] | select(test("_ottelo_(tc|tas)$")) | sub("env:"; "-e ")')
@@ -76,9 +75,9 @@
 \*****************************************************************************************************/
 
 //siehe platformio_tasmota_cenv.ini
-#if ( defined(TASMOTA32_OTTELO)       || defined(TASMOTA32C3_OTTELO)       || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO) || defined(TASMOTA32S3_OTTELO) || \
-      defined(TASMOTA32SOLO1_OTTELO)  || defined(TASMOTA32BERRY_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
-      defined(TASMOTA1M_OTTELO)       || defined(TASMOTA1M_SHELLY_OTTELO)  || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
+#if ( defined(TASMOTA32C3_OTTELO) || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO)      || defined(TASMOTA32S3_OTTELO) || \
+      defined(TASMOTA32_OTTELO)   || defined(TASMOTA32SOLO1_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
+      defined(TASMOTA1M_OTTELO)   || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
 //     dort müssen mindestens 12k RAM für einen stabilen Betrieb frei sein (inkl. Script).
@@ -140,13 +139,11 @@
 #undef GV_USE_ESPINFO //ESP8266 info (+2k1 code) ab 15.2.0
 //ESP32 only features
 #undef USE_GPIO_VIEWER
-#if ( !defined(TASMOTA32_OTTELO) && !defined(TASMOTA32BERRY_OTTELO) )
+#if ( !defined(TASMOTA32_OTTELO) )
   #undef USE_ADC
 #endif
 #undef USE_NETWORK_LIGHT_SCHEMES
-#if ( !defined(TASMOTA32BERRY_OTTELO) )
-  #undef USE_BERRY          //https://tasmota.github.io/docs/Berry/
-#endif
+#undef USE_BERRY
 #undef USE_AUTOCONF       //https://tasmota.github.io/docs/ESP32/#autoconf
 #undef USE_CSE7761
 //----------------------------------------------------------------------------
@@ -162,7 +159,7 @@
 //-- Variant-Selektoren (gesetzt via build_flags in platformio_tasmota_cenv.ini):
 //--   -DOTTELO_VARIANT_TAS → klassischer Tasmota-Scripter
 //--   -DOTTELO_VARIANT_TC  → TinyC VM + Browser-IDE (KEIN Scripter)
-//-- ESP8266 1M (alle drei Varianten) und Berry haben nur _tas.
+//-- ESP8266 (1M alle Varianten + 4M) haben nur _tas; TinyC (_tc) nur auf ESP32.
 #if !defined(OTTELO_VARIANT_TAS) && !defined(OTTELO_VARIANT_TC)
   #error "OTTELO_VARIANT_TAS oder OTTELO_VARIANT_TC muss in build_flags gesetzt sein"
 #endif
@@ -294,6 +291,10 @@
     #define USE_MATTER_C
     #define USE_DISCOVERY        //+8KB Flash, +0.3KB RAM — mDNS, von Matter benötigt
     #define WEBSERVER_ADVERTISE  //<Hostname>.local/ — Standard zusammen mit mDNS
+    //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
+    //-- (Audio, Sensoren, …) zur Laufzeit in die custom-Partition — ohne die
+    //-- Firmware neu zu flashen. Nicht automatisch an (siehe Plugins/readme.md)
+    #define USE_BINPLUGINS
   #endif
 
   //-- TinyC braucht USE_RULES nicht — der SML-Init-Gate (`Settings->rule_enabled`
@@ -315,13 +316,6 @@
   //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc
   #define USE_TINYC          //Enable TinyC VM (XDRV_124)
   #define USE_TINYC_IDE      //Enable self-hosted browser IDE (requires USE_UFILESYS)
-
-  //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
-  //-- (Audio, Sensoren, …) zur Laufzeit in die custom-Partition — ohne die
-  //-- Firmware neu zu flashen. Nicht automatisch an (siehe Plugins/readme.md).
-  //-- Die Plugins selbst werden separat mit tasmota/Plugins/build_plugin.py
-  //-- gebaut und sind erst nach Laden+Aktivieren via Konsole aktiv.
-  #define USE_BINPLUGINS
 
 #endif // OTTELO_VARIANT_TC
 
@@ -354,8 +348,6 @@
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32SOLO1_OTTELO)
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32solo1_ottelo" _OTTELO_SFX ".bin"
-#elif defined(TASMOTA32BERRY_OTTELO)
-  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32berry_ottelo_tas.bin"
 #elif defined(TASMOTA32P4_OTTELO)
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA1M_OTTELO)

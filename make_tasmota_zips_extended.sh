@@ -6,7 +6,7 @@
 # - erstellt pro Plattform getrennte ZIPs für die beiden Varianten:
 #     _tas → klassischer Tasmota-Scripter
 #     _tc  → TinyC VM + Browser-IDE (kein Scripter)
-# - Ausnahmen: Berry (nur _tas), ESP8266 1M (nur _tas), ESP8266 4M (beide)
+# - ESP8266 (1M alle Varianten + 4M): nur _tas. TinyC (_tc) nur auf ESP32.
 #
 # Erwartetes Layout: alle .bin / .bin.gz / .factory.bin liegen im aktuellen
 # Arbeitsverzeichnis (typisch nach `cp build_output/firmware/* .`).
@@ -58,15 +58,7 @@ create_zip "tasmota8266_bundle_ottelo.zip" \
     tasmota1m_ottelo_tas.bin.gz \
     tasmota1m_energy_ottelo_tas.bin.gz \
     tasmota1m_shelly_ottelo_tas.bin.gz \
-    tasmota4m_ottelo_tas.bin.gz \
-    tasmota4m_ottelo_tc.bin.gz || true
-
-# =============================================================================
-# ESP32 + Berry — nur Scripter-Variante (kein TinyC, weil Berry-only)
-# =============================================================================
-create_zip "tasmota32berry_ottelo_tas.zip" \
-    tasmota32berry_ottelo_tas.bin \
-    tasmota32berry_ottelo_tas.factory.bin || true
+    tasmota4m_ottelo_tas.bin.gz || true
 
 # =============================================================================
 # ESP32-Plattformen — je ein ZIP pro Variante (_tas und _tc)
