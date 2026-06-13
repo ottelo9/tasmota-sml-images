@@ -1787,7 +1787,14 @@ bool UfsUploadFileOpen(const char* upload_filename) {
 
 bool UfsUploadFileWrite(uint8_t *upload_buf, size_t current_size) {
   if (ufs_upload_file) {
-    ufs_upload_file.write(upload_buf, current_size);
+    // On a FULL filesystem write() returns short (or 0). The old code ignored the
+    // return and then reported HTTP 200 over a silently truncated file (Andreas:
+    // 0.04 MB free, the upload "succeeded" but the file was unchanged/partial).
+    // Fail the upload loudly so the client gets an error instead of a corrupt one.
+    if (ufs_upload_file.write(upload_buf, current_size) != current_size) {
+      ufs_upload_file.close();
+      return false;
+    }
   } else {
     return false;
   }

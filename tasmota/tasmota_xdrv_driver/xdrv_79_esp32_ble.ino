@@ -3763,7 +3763,9 @@ bool Xdrv79(uint32_t function)
     case FUNC_INTERRUPT_START:
       break;
 */
-#ifdef USE_WEBSERVER
+// USE_BLE_NO_WEBUI hides the built-in "Configure BLE" menu button + /ble page on
+// builds that keep the BLE stack only as a foundation (e.g. TinyC bleScan/GATT).
+#if defined(USE_WEBSERVER) && !defined(USE_BLE_NO_WEBUI)
     case FUNC_WEB_ADD_BUTTON:
 //      WSContentSend_P(BLE_ESP32::HTTP_BTN_MENU_BLE);
       WSContentSend_P(HTTP_FORM_BUTTON, PSTR(WEB_HANDLE_BLE), PSTR(D_CONFIGURE_BLE));
@@ -3771,7 +3773,7 @@ bool Xdrv79(uint32_t function)
     case FUNC_WEB_ADD_HANDLER:
       WebServer_on(PSTR("/" WEB_HANDLE_BLE), BLE_ESP32::HandleBleConfiguration);
       break;
-#endif  // USE_WEBSERVER
+#endif  // USE_WEBSERVER && !USE_BLE_NO_WEBUI
     case FUNC_ACTIVE:
       result = true;
       break;

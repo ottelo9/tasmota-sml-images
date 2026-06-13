@@ -291,7 +291,7 @@ static FS *tc_file_path(char *path) {
 // Syscall ABI generation — MUST match the IDE compiler's SYSCALL_ABI (opcodes.js).
 // Bump BOTH in lockstep whenever syscall NUMBERS are inserted/renumbered (pure
 // appends don't need it). The loader warns (still loads) on a .tcb abi_rev mismatch.
-#define TC_SYSCALL_ABI     1
+#define TC_SYSCALL_ABI     2     // V2: + SYS_BLIB_CALL_F (371, fcall float blib call) — pure append; bumped to flag fcall .tcb built against pre-fcall firmware
 // REMINDER: when bumping TC_RELEASE, also update the visible <h1> label
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
 // maintained; got stuck at "v1.3.20" through 5 releases until Andreas's
@@ -662,6 +662,7 @@ enum TcSyscall {
   SYS_TCP_CONNECTED   = 292, // () -> int — 1 if selected TCP client connected, 0 otherwise
   SYS_TCP_SELECT      = 293, // (slot) -> void — select outgoing TCP slot (0..TC_TCP_CLI_SLOTS-1)
   SYS_TCP_CONNECT_REF = 294, // (ip_ref, port) -> int — connect with IP from runtime char array
+  SYS_TCP_CONNECT_TIMEOUT = 491, // (ms) -> void — bound subsequent outbound connects: tcpConnect() AND httpGet()/httpPost() (0=lib default); probe absent hosts in ~ms instead of blocking ~5-75s (WDT-safe)
   // MQTT subscribe / publish-to-topic (USE_MQTT). Dispatches OnMqttData(topic,payload) callback.
   SYS_MQTT_SUBSCRIBE   = 295, // (topic_const)          -> int slot (0..9, -1=err)
   SYS_MQTT_UNSUBSCRIBE = 296, // (topic_const)          -> int (0=ok, -1=err)
@@ -784,6 +785,19 @@ enum TcSyscall {
                                   //   int32 slot) into a contiguous uint8_t before the
                                   //   call. Stack-allocated up to 256 B; larger frames
                                   //   malloc briefly.
+  SYS_BLIB_CALL_F           = 371, // fcall("name", float a, float b) -> float
+                                  //   Float blib call. Requires argc==2,
+                                  //   arg_types == { TC_ARG_FLOAT, TC_ARG_FLOAT },
+                                  //   ret_type == TC_RET_FLOAT. The two float args
+                                  //   and the result cross as raw 32-bit BITS in
+                                  //   integer registers (the soft-float _32r plugin
+                                  //   ABI) — so on the hard-float P4 the call is
+                                  //   issued via an int(int,int) cast to keep the
+                                  //   bits out of fa0/fa1. This is the TinyC->plugin
+                                  //   analog of the PFB float-bits jumptable wrappers,
+                                  //   and the end-to-end check that float passing works.
+                                  //   Returns: result float bits; 0 (0.0f) on
+                                  //   unknown name / signature mismatch / no BinPlugins.
 
   // ────────────────────────── TWAI / CAN-bus (380..386) ─────────────────
   // ESP32-only (gated on SOC_TWAI_SUPPORTED at the dispatcher site).
@@ -1563,6 +1577,10 @@ struct TINYC {
   // (e.g. BYD BMU + SMA HM2.0 + Wallbox) in parallel. Slot 0 is the default.
   WiFiClient tcp_cli_clients[TC_TCP_CLI_SLOTS];  // outgoing TCP client slots
   uint8_t    tcp_cli_slot;                       // currently selected slot (0..TC_TCP_CLI_SLOTS-1)
+  uint16_t   tcp_connect_timeout_ms;             // 0 = WiFiClient default (~unbounded); else bound the
+                                                 // tcpConnect()/tcpProbe() connect (set via tcpConnectTimeout).
+                                                 // Lets a script probe absent hosts fast instead of blocking
+                                                 // ~75 s on the LwIP connect timeout (would trip the task WDT).
   // Per-slot last-disconnect reason (v1.5.1). Read via tcpDisconnectReason().
   // Semantics chosen so calloc-zero ("never used") is the natural default:
   //   0 = TC_TCP_REASON_NEVER (slot never opened — fresh after calloc)
@@ -3731,7 +3749,7 @@ static int32_t tc_sprintf_float(char *out, int outSize, const char *fmt, float f
 
 // Forward declarations (defined after tc_vm_load)
 static void tc_persist_save(TcVM *vm);
-static void tc_persist_load(TcVM *vm);
+static void tc_persist_load(TcVM *vm, bool heap_phase);
 static uint32_t tc_persist_layout_hash(TcVM *vm);  // fwd: used by SYS_PERSIST_DUMP, defined later
 
 /*********************************************************************************************\
@@ -5011,6 +5029,9 @@ int  tc_lvgl_init(void);     // idempotent start_lvgl(nullptr); returns 1 if act
 int  tc_lvgl_active(void);   // 1 if LVGL is running, else 0
 void tc_lvgl_lock(void);     // take the LVGL recursive mutex (no-op before init)
 void tc_lvgl_unlock(void);   // release the LVGL recursive mutex
+// /tc_display LVGL screen mirror: snapshot active screen to RGB565 (caller frees handle).
+int  tc_lvgl_snapshot(uint8_t **data, uint16_t *w, uint16_t *h, void **handle);
+void tc_lvgl_snapshot_free(void *handle);
 // Phase 1 object API (defined in xdrv_54_lvgl.ino; only int/const char* cross the boundary).
 int  tc_lv_obj(int parent);
 int  tc_lv_label(int parent);
@@ -9323,8 +9344,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       a = TC_POP(vm);  // url ref
       char url[256];
       tc_ref_to_cstr(vm, a, url, sizeof(url));
-      int32_t *buf = tc_resolve_ref(vm, b);
-      int32_t maxLen = buf ? tc_ref_maxlen(vm, b) : 0;
+      int32_t cap;
+      { int32_t *bf0 = tc_resolve_ref(vm, b); cap = bf0 ? tc_ref_maxlen(vm, b) : 0; }
       int32_t result = -1;
       // Read the body OURSELVES instead of http.getString(). On a busy C3
       // (matter_c + WiFi), getString() intermittently returns an EMPTY body on a
@@ -9332,41 +9353,61 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // small TCP segments) and occasionally for an ESP32 peer. We drain the raw
       // stream patiently (waiting for available() with a per-idle wall-clock
       // bound, and continuing past FIN while bytes remain buffered) and de-chunk
-      // Transfer-Encoding: chunked on the fly. GET is idempotent, so we also
-      // retry the whole request on a transport error (-1) or an empty read.
-      // (POST below is NOT retried — it may be non-idempotent.)
+      // Transfer-Encoding: chunked on the fly. GET is idempotent, so we retry the
+      // whole request on an EMPTY read (not on a transport error — see below).
       const uint32_t TC_HTTP_IDLE_MS = 1500;  // give up if no byte for this long
+      // Bound the HTTP CONNECT (separate from the 5 s read timeout). The library
+      // default is 5 s, so a single unreachable host blocks ~5 s/attempt → 2 s is
+      // plenty for any reachable host; tcpConnectTimeout() overrides it lower for
+      // a fleet sweep. (Andreas .136 field report 2026-06-12, fix B.)
+      const uint32_t _http_ctmo = Tinyc->tcp_connect_timeout_ms ? Tinyc->tcp_connect_timeout_ms : 2000;
+      // We land the body in a LOCAL heap buffer, NOT the VM-heap response ref,
+      // because we RELEASE vm_mutex around the blocking network I/O: holding it
+      // would let one dead IP starve the main loop (which waits portMAX_DELAY) →
+      // LoadAvg ramp → watchdog reset (Andreas's fix A). While unlocked the other
+      // task may run this slot's bytecode and move/realloc the VM heap, so we must
+      // not write into `buf` until after re-taking the mutex. Mirrors the SendMail
+      // syscall's give/take + tc_current_slot restore.
+      uint8_t *lbuf = (cap > 1) ? (uint8_t*)malloc(cap) : nullptr;
+      int len = 0;
+      TcSlot *_hs = tc_current_slot;
       for (int attempt = 0; attempt < 3 && result <= 0; attempt++) {
+        len = 0;
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
         HTTPClientLight http;
         http.setTimeout(5000);
+        http.setConnectTimeout(_http_ctmo);
         http.begin(url);
 #else
         WiFiClient http_client;
         HTTPClient http;
         http.setTimeout(5000);
+        http.setConnectTimeout(_http_ctmo);
         http.begin(http_client, url);
 #endif
-        for (int i = 0; i < Tinyc->http_hdr_count; i++) {
+        for (int i = 0; i < Tinyc->http_hdr_count; i++) {     // staged headers read while LOCKED
           http.addHeader(Tinyc->http_hdr_name[i], Tinyc->http_hdr_value[i]);
         }
+        // ---- release vm_mutex around the blocking connect + read ----
+#ifdef ESP32
+        if (_hs && _hs->vm_mutex) xSemaphoreGive(_hs->vm_mutex);
+#endif
         int httpCode = http.GET();
-        if (httpCode > 0 && buf) {
+        if (httpCode > 0 && lbuf) {
           int32_t gsize = http.getSize();          // -1 = chunked / unknown
           WiFiClient *st = http.getStreamPtr();
-          int len = 0;
           if (st) {
             if (gsize >= 0) {                        // identity body
               uint32_t last = millis();
-              while (len < maxLen - 1 && len < gsize) {
-                if (st->available()) { buf[len++] = (int32_t)(uint8_t)st->read(); last = millis(); }
+              while (len < cap - 1 && len < gsize) {
+                if (st->available()) { lbuf[len++] = (uint8_t)st->read(); last = millis(); }
                 else if (!st->connected() && !st->available()) break;
                 else if (millis() - last > TC_HTTP_IDLE_MS) break;
                 else delay(1);
               }
             } else {                                 // chunked body
               bool done = false;
-              while (!done && len < maxLen - 1) {
+              while (!done && len < cap - 1) {
                 char sz[12]; int si = 0; bool gotline = false;  // chunk-size hex line
                 uint32_t t0 = millis();
                 while (si < 11) {
@@ -9385,7 +9426,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
                 if (csz <= 0) { done = true; break; }  // final 0-chunk
                 long got = 0; uint32_t td = millis();
                 while (got < csz) {
-                  if (st->available()) { int c = st->read(); if (len < maxLen - 1) buf[len++] = (int32_t)(uint8_t)c; got++; td = millis(); }
+                  if (st->available()) { int c = st->read(); if (len < cap - 1) lbuf[len++] = (uint8_t)c; got++; td = millis(); }
                   else if (!st->connected() && !st->available()) break;
                   else if (millis() - td > TC_HTTP_IDLE_MS) break;
                   else delay(1);
@@ -9400,14 +9441,48 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
               }
             }
           }
-          buf[len] = 0;
           result = len;                              // empty (0) -> retry
         } else {
-          result = httpCode;                         // transport error -> retry
+          result = httpCode;                         // transport error
+        }
+        // Abort-close (SO_LINGER 0 -> RST instead of FIN) so the socket frees
+        // its lwIP PCB IMMEDIATELY instead of sitting ~6 s in TIME_WAIT. A
+        // program doing many connects (the fleet scanner sweeps ~40 devices)
+        // would otherwise exhaust the 16-slot CONFIG_LWIP_MAX_ACTIVE_TCP pool
+        // and wedge the network stack. Status polling tolerates the peer RST.
+        {
+          WiFiClient *_lc = http.getStreamPtr();
+          if (_lc) { int _fd = _lc->fd();
+            if (_fd >= 0) { struct linger _lg; _lg.l_onoff = 1; _lg.l_linger = 0;
+              setsockopt(_fd, SOL_SOCKET, SO_LINGER, &_lg, sizeof(_lg)); } }
         }
         http.end();
-        if (result <= 0 && attempt < 2) delay(120);
+        bool transport_err = (httpCode <= 0);
+        // ---- re-take vm_mutex before touching the VM again ----
+#ifdef ESP32
+        if (_hs && _hs->vm_mutex) { xSemaphoreTake(_hs->vm_mutex, portMAX_DELAY); tc_current_slot = _hs; }
+#endif
+        // C: do NOT retry a transport error (connect refused/timeout) — the retry
+        // was only ever for HTTP-200 empty bodies; on a dead host it just triples
+        // the block. (Andreas .136, 2026-06-12.)
+        if (transport_err) break;
+        if (result > 0) break;
+        if (attempt < 2) delay(120);
       }
+      // copy the landed body into the VM-heap response (re-resolve: the heap may
+      // have moved while the mutex was released)
+      {
+        int32_t *buf = tc_resolve_ref(vm, b);
+        if (buf) {
+          int32_t cap2 = tc_ref_maxlen(vm, b);
+          int n = (result > 0 && lbuf) ? result : 0;
+          if (n > cap2 - 1) n = cap2 - 1;
+          for (int i = 0; i < n; i++) buf[i] = (int32_t)lbuf[i];
+          if (cap2 > 0) buf[n] = 0;
+          if (result > 0) result = n;                // actual stored length
+        }
+      }
+      if (lbuf) free(lbuf);
       Tinyc->http_hdr_count = 0;  // consume staged headers after all attempts
       TC_PUSH(vm, result);
       break;
@@ -9420,14 +9495,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       tc_ref_to_cstr(vm, a, url, sizeof(url));
       char postData[TC_OUTPUT_SIZE];
       tc_ref_to_cstr(vm, dataRef, postData, sizeof(postData));
+      // Bound the connect (2 s default, tcpConnectTimeout overrides) — a dead
+      // host otherwise blocks ~5 s holding vm_mutex. See SYS_HTTP_GET note.
+      const uint32_t _post_ctmo = Tinyc->tcp_connect_timeout_ms ? Tinyc->tcp_connect_timeout_ms : 2000;
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
       HTTPClientLight http;
       http.setTimeout(5000);
+      http.setConnectTimeout(_post_ctmo);
       http.begin(url);
 #else
       WiFiClient http_client;
       HTTPClient http;
       http.setTimeout(5000);
+      http.setConnectTimeout(_post_ctmo);
       http.begin(http_client, url);
 #endif
       http.addHeader(F("Content-Type"), F("application/x-www-form-urlencoded"));
@@ -9435,10 +9515,29 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         http.addHeader(Tinyc->http_hdr_name[i], Tinyc->http_hdr_value[i]);
       }
       Tinyc->http_hdr_count = 0;
+      // Release vm_mutex around the blocking POST + body read (Andreas's fix A —
+      // a dead host must not starve the main loop, which waits portMAX_DELAY).
+      // payload is an Arduino String on the C heap, so it survives the unlocked
+      // window; we touch the VM heap (buf) only after re-taking. Mirrors SendMail.
+      TcSlot *_ps = tc_current_slot;
+#ifdef ESP32
+      if (_ps && _ps->vm_mutex) xSemaphoreGive(_ps->vm_mutex);
+#endif
       int httpCode = http.POST(postData);
+      String payload;
+      if (httpCode > 0) payload = http.getString();
+      {                                              // abort-close: free the PCB now, no TIME_WAIT (see SYS_HTTP_GET)
+        WiFiClient *_lc = http.getStreamPtr();
+        if (_lc) { int _fd = _lc->fd();
+          if (_fd >= 0) { struct linger _lg; _lg.l_onoff = 1; _lg.l_linger = 0;
+            setsockopt(_fd, SOL_SOCKET, SO_LINGER, &_lg, sizeof(_lg)); } }
+      }
+      http.end();
+#ifdef ESP32
+      if (_ps && _ps->vm_mutex) { xSemaphoreTake(_ps->vm_mutex, portMAX_DELAY); tc_current_slot = _ps; }
+#endif
       int32_t result = -1;
       if (httpCode > 0) {
-        String payload = http.getString();
         int32_t *buf = tc_resolve_ref(vm, respRef);
         if (buf) {
           int32_t maxLen = tc_ref_maxlen(vm, respRef);
@@ -9451,7 +9550,6 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       } else {
         result = httpCode;
       }
-      http.end();
       TC_PUSH(vm, result);
       break;
     }
@@ -12922,7 +13020,17 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         } else {
           WiFiClient *_oc = TC_TCP_OUT_CLIENT();
           _oc->stop();  // close any previous connection on this slot
-          if (_oc->connect(ip, port)) {
+          IPAddress _ipa;
+          bool _cok;
+          if (Tinyc->tcp_connect_timeout_ms && _ipa.fromString(ip)) {
+            // bounded probe path: the IPAddress overload skips DNS, and the
+            // non-blocking connect + select(timeout) bounds even the
+            // no-ARP-answer (absent host) case — keeps the VM/WDT safe.
+            _cok = _oc->connect(_ipa, port, (int32_t)Tinyc->tcp_connect_timeout_ms);
+          } else {
+            _cok = _oc->connect(ip, port);
+          }
+          if (_cok) {
             _oc->setNoDelay(true);
             Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 1;  // CONNECTED
             AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip, port);
@@ -12950,7 +13058,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         } else {
           WiFiClient *_oc = TC_TCP_OUT_CLIENT();
           _oc->stop();
-          if (_oc->connect(ip_tmp, port)) {
+          IPAddress _ipa;
+          bool _cok;
+          if (Tinyc->tcp_connect_timeout_ms && _ipa.fromString(ip_tmp)) {
+            _cok = _oc->connect(_ipa, port, (int32_t)Tinyc->tcp_connect_timeout_ms);  // bounded, no DNS
+          } else {
+            _cok = _oc->connect(ip_tmp, port);
+          }
+          if (_cok) {
             _oc->setNoDelay(true);
             Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 1;  // CONNECTED
             AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip_tmp, port);
@@ -12971,6 +13086,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] disconnected"), Tinyc->tcp_cli_slot);
       }
       Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 5;  // USER_CLOSED
+      break;
+    }
+    case SYS_TCP_CONNECT_TIMEOUT: {  // tcpConnectTimeout(ms) -> void
+      // Bound subsequent tcpConnect() connects. ms=0 restores the WiFiClient
+      // default. Lets a script probe an absent host in ~ms instead of blocking
+      // ~75 s on the LwIP connect timeout (which trips the task WDT and crashes).
+      int32_t ms = TC_POP(vm);
+      Tinyc->tcp_connect_timeout_ms = (ms > 0 && ms < 65535) ? (uint16_t)ms : 0;
       break;
     }
     case SYS_TCP_CONNECTED: {  // tcpConnected() -> int
@@ -13218,6 +13341,43 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       break;
     }
 #endif  // USE_BINPLUGINS — closes the #ifndef branch's split case
+
+    case SYS_BLIB_CALL_F: {  // fcall("name", a, b) -> float (float args/ret as bits)
+      // Pop reverse-push order: b, a, name. The two args are float BITS on the
+      // TinyC stack (the compiler pushed them via floatArgs).
+      int32_t b_bits  = TC_POP(vm);
+      int32_t a_bits  = TC_POP(vm);
+      int32_t name_ci = TC_POP(vm);
+#ifndef USE_BINPLUGINS
+      (void)b_bits; (void)a_bits; (void)name_ci;
+      TC_PUSH(vm, 0);                 // 0.0f bits — BinPlugins not in this build
+      break;
+    }
+#else
+      const char *name = tc_get_const_str(vm, name_ci);
+      if (!name) { TC_PUSH(vm, 0); break; }
+      TC_BLIB_REG_ENTRY *r = tc_blib_lookup(name);
+      if (!r) { TC_PUSH(vm, 0); break; }
+      // Require the (FLOAT, FLOAT) -> FLOAT shape.
+      if (r->argc != 2 ||
+          r->arg_types[0] != TC_ARG_FLOAT ||
+          r->arg_types[1] != TC_ARG_FLOAT ||
+          r->ret_type != TC_RET_FLOAT) {
+        TC_PUSH(vm, 0);
+        break;
+      }
+      // Issue via an INTEGER-ABI cast so the two float args travel as raw bits
+      // in a0/a1 and the result returns as bits in a0 — exactly what the
+      // soft-float _32r plugin expects. On the hard-float P4 VM this keeps the
+      // bits out of fa0/fa1 (the mirror of the PFB jumptable wrappers, which do
+      // the same for the plugin->firmware direction). The stack already holds
+      // float bits, so no i2f/f2i is needed on this path.
+      typedef int32_t (*tc_blib_ff_f_fn)(int32_t, int32_t);
+      int32_t ret_bits = ((tc_blib_ff_f_fn)r->fn)(a_bits, b_bits);
+      TC_PUSH(vm, ret_bits);          // float bits; compiler tagged fcall returnFloat
+      break;
+    }
+#endif  // USE_BINPLUGINS
 
     // ── TWAI / CAN-bus syscalls (380..386) ────────────
     // ESP32-only with TWAI peripheral. ESP8266 + ESP32 variants without
@@ -14923,7 +15083,17 @@ static void tc_persist_demote(TcVM *vm) {
 #endif
 }
 
-static void tc_persist_load(TcVM *vm) {
+// TWO-PHASE load. heap_phase=false (phase 0, called pre-main right after tc_vm_load):
+// restore GLOBAL persist vars and rotate the file on a layout/legacy mismatch.
+// heap_phase=true (phase 1, called from tc_vm_task the moment main() returns):
+// restore HEAP persist arrays (idx 0x8000|handle). The heap entries CANNOT load in
+// phase 0 because the program allocates those arrays IN main(), so the heap handle
+// isn't alive yet (tc_persist load's alive-check below dropped them silently) — which
+// left any heap-persist array (e.g. a charted history buffer) reset to 0 on every
+// restart, even though it was saved fine. Phase 1 re-reads the same .pvs and applies
+// only the heap entries, now that the arrays exist. Phase 1 never rotates (phase 0
+// already did, if the layout changed).
+static void tc_persist_load(TcVM *vm, bool heap_phase) {
   if (vm->persist_count == 0 || vm->persist_file[0] == '\0') return;
 #ifdef USE_UFILESYS
   File f;
@@ -14943,19 +15113,23 @@ static void tc_persist_load(TcVM *vm) {
   if (buf[2] != 'H') {
     // Legacy format (pre-layout-hash) — raw indexes can't be safely mapped
     // across layout changes. Discard rather than risk corrupting state.
-    AddLog(LOG_LEVEL_INFO, PSTR("TCC: legacy persist file — rotating %s"), vm->persist_file);
+    if (!heap_phase) {   // only phase 0 rotates; phase 1 bails (already handled)
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: legacy persist file — rotating %s"), vm->persist_file);
+      tc_persist_demote(vm);
+    }
     free(buf);
-    tc_persist_demote(vm);
     return;
   }
   uint32_t stored_hash = (uint32_t)buf[3] | ((uint32_t)buf[4] << 8)
                        | ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 24);
   uint32_t expected_hash = tc_persist_layout_hash(vm);
   if (stored_hash != expected_hash) {
-    AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist layout changed (%08X->%08X) — rotating %s"),
-           stored_hash, expected_hash, vm->persist_file);
+    if (!heap_phase) {   // phase 0 rotates the stale file; phase 1 just bails
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist layout changed (%08X->%08X) — rotating %s"),
+             stored_hash, expected_hash, vm->persist_file);
+      tc_persist_demote(vm);
+    }
     free(buf);
-    tc_persist_demote(vm);
     return;
   }
   uint8_t count = buf[7];
@@ -14967,6 +15141,9 @@ static void tc_persist_load(TcVM *vm) {
     pos += 2;
     uint16_t slotCount = buf[pos] | (buf[pos + 1] << 8);
     pos += 2;
+    // Two-phase split: GLOBAL entries (no 0x8000 bit) load in phase 0; HEAP entries
+    // (idx 0x8000|handle) load in phase 1, once main() has allocated the arrays.
+    if (((idx & 0x8000) != 0) != heap_phase) { pos += slotCount * 4; continue; }
     // Find matching persist entry
     for (uint8_t j = 0; j < vm->persist_count; j++) {
       if (vm->persist[j].index == idx) {
@@ -15005,7 +15182,8 @@ static void tc_persist_load(TcVM *vm) {
   }
 
   free(buf);
-  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: persist loaded from %s"), vm->persist_file);
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: persist %s-loaded from %s"),
+         heap_phase ? "heap" : "vars", vm->persist_file);
 #endif
 }
 
@@ -16574,6 +16752,14 @@ static void tc_vm_task(void *param) {
 
   slot->main_done = true;   // Phase 1 (main) finished — unblocks the serial autoexec loader
 
+  // Phase-1 persist restore: main() has now allocated the program's heap arrays, so
+  // re-apply the heap-persist entries (idx 0x8000|handle) from the .pvs — the pre-main
+  // phase-0 load had to skip them (handle not alive yet), which silently reset any
+  // heap-persist array (e.g. a charted history buffer) to 0 on every restart. Globals
+  // were already restored in phase 0. Only when main() halted cleanly (a crash/abort
+  // leaves the heap state suspect).
+  if (vm->halted && vm->error == TC_OK) { tc_persist_load(vm, true); }
+
   // Cleanup after main() exits
   tc_free_all_frames(vm);
   tc_close_all_files();
@@ -16937,9 +17123,11 @@ static bool TinyCStartVM(TcSlot *s) {
   // for the dev loop: every script reload needs hardware re-init).
   s->boot_init_pending = true;
 
-  // Set persist filename and load saved values
+  // Set persist filename and load saved values (phase 0: globals; heap-persist
+  // arrays aren't allocated until main() runs, so they're restored in phase 1 —
+  // tc_persist_load(vm,true) right after main_done in tc_vm_task).
   TinyCSetPersistFile(s, s->filename);
-  tc_persist_load(&s->vm);
+  tc_persist_load(&s->vm, false);
 
   // Register UDP global variables (V5: auto-update from packets)
   if (s->vm.udp_global_count > 0) {

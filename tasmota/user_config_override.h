@@ -188,6 +188,11 @@
 #define USE_SML_M
 #define USE_SML_CRC       //enables CRC support for binary SML. Must still be enabled via line like "1,=soC,1024,15". https://tasmota.github.io/docs/Smart-Meter-Interface/#special-commands
 #define USE_SML_AUTHKEY   //selten genutzt, M,=so5
+//-- SML-Script-Cmds (SML_SetBaud / SML_Write / SML_SetOptions, sml[X]-Zugriff).
+//-- Im TAS-Build wuerde xdrv_10_scripter.ino das eh automatisch setzen, im TC-Build
+//-- (kein Scripter) nicht. Daher hier gemeinsam fuer BEIDE explizit definiert —
+//-- der Scripter macht im TAS-Build #undef+#define (idempotent, kein Konflikt).
+#define USE_SML_SCRIPT_CMD
 
 //-- Home Assistant + HTTPS-Client (gemeinsam)
 #define USE_HOME_ASSISTANT  //HA API (+12k code, +6 bytes mem)
@@ -305,12 +310,9 @@
   //-- Meter-Descriptor liegt unter /sml_meter.def im Filesystem.
   #undef USE_RULES
 
-  //-- SML_SetBaud / SML_Write in xsns_53_sml.ino sind hinter USE_SML_SCRIPT_CMD
-  //-- gegated. Normalerweise setzt xdrv_10_scripter.ino dieses Macro — ohne
-  //-- Scripter müssen wir es selbst definieren, sonst gibt's beim TinyC-VM-
-  //-- Aufruf (mscr SML_BAUD / SML_HEX Opcodes) einen "not declared in this scope"
-  //-- Fehler. Die Funktionen selbst haben keine Scripter-Abhängigkeit.
-  #define USE_SML_SCRIPT_CMD
+  //-- (USE_SML_SCRIPT_CMD steht jetzt im gemeinsamen SML-Bereich oben — gilt fuer
+  //--  beide Varianten. Im TC-Build wird es fuer die TinyC-mscr-Opcodes SML_BAUD/
+  //--  SML_HEX gebraucht, da hier kein Scripter es automatisch setzt.)
 
   //-- TinyC VM + selbstgehostete Browser-IDE
   //-- https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc

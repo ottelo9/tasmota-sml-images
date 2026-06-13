@@ -815,6 +815,9 @@ static const char TC_NOT_INIT[] PROGMEM = "Not initialized";
 
 void CmndCheckPartition(void);
 void CmndTinyCIde(void);
+#ifdef ESP32
+void CmndTinyCStack(void);
+#endif
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -825,7 +828,7 @@ void CmndMatterCryptoTest(void);
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
   "|Run|Stop|Reset|Exec|Info|Ide"
 #ifdef ESP32
-  "|Chkpt"
+  "|Chkpt|Stack"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
@@ -839,7 +842,7 @@ void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
   &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde
 #ifdef ESP32
-  , &CmndCheckPartition
+  , &CmndCheckPartition, &CmndTinyCStack
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
@@ -1985,7 +1988,11 @@ static void HandleTinyCPage(void) {
     "</script>"));
 
 #ifdef USE_DISPLAY
-  if (renderer && (((uintptr_t)renderer->framebuffer >= 0x3C000000) || ((uintptr_t)renderer->rgb_fb >= 0x3C000000))) {
+  bool tc_show_mirror = renderer && (((uintptr_t)renderer->framebuffer >= 0x3C000000) || ((uintptr_t)renderer->rgb_fb >= 0x3C000000));
+#ifdef USE_TINYC_LVGL
+  if (renderer && tc_lvgl_active()) { tc_show_mirror = true; }   // LVGL mirrors via on-demand snapshot (no panel framebuffer)
+#endif
+  if (tc_show_mirror) {
     WSContentSend_P(PSTR(
       "<fieldset><legend><b> Display </b></legend>"
       "<p style='text-align:center'>"
@@ -2289,9 +2296,10 @@ void TinyCPrefixReheal(void) {
 // Fetch the TinyC IDE (tinyc_ide.html.gz) from `url` and replace the on-FS
 // /tinyc_ide.html.gz that the /ide handler serves — lets the IDE be self-updated
 // from the console (TinyCIde) without the Tasmota file-manager upload page.
-// Safety: stream to a .tmp first, validate the gzip magic + a sane size, and
-// only then rename over the live IDE (a failed/short fetch must NOT brick the
-// served IDE). The ~150-190 KB LittleFS write is bracketed by TinyCFsWritePause
+// Safety: stream to a .tmp first, validate the gzip magic + the persisted on-disk
+// size (not just the byte counter — an SD/FAT backend can short-write), and only
+// then rename over the live IDE (a failed/short fetch must NOT brick the served
+// IDE). The ~150-190 KB LittleFS/SD write is bracketed by TinyCFsWritePause
 // (stops VM tasks so none touch flash during the cache-disabled close) + a
 // loop-WDT hold, mirroring the /ufsu big-write path. Returns bytes (>0) or <0.
 static int tc_fetch_ide(const char *url) {
@@ -2318,7 +2326,7 @@ static int tc_fetch_ide(const char *url) {
   }
   TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
   File f = ufsp->open(tmp, "w");
-  int written = 0; bool magic = false;
+  int written = 0; bool magic = false; bool write_err = false;
   if (f) {
     WiFiClient *stream = http.getStreamPtr();
     int32_t len = http.getSize();
@@ -2335,7 +2343,16 @@ static int tc_fetch_ide(const char *url) {
           int rd = stream->readBytes(buf, avail);
           if (rd <= 0) break;
           if (first) { magic = (rd >= 2 && buf[0] == 0x1f && buf[1] == 0x8b); first = false; }
-          f.write(buf, rd);
+          // Write the full chunk. An SD/FAT backend can short-write a big file, so
+          // retry the remainder; if the backend stalls (write returns 0) bail —
+          // a partial write must NOT silently truncate the .tmp (Andreas: brick).
+          int off = 0;
+          while (off < rd) {
+            size_t wr = f.write(buf + off, rd - off);
+            if (wr == 0) { write_err = true; break; }
+            off += (int)wr;
+          }
+          if (write_err) break;
           written += rd;
           if (!unknown) len -= rd;
         } else {
@@ -2358,6 +2375,19 @@ static int tc_fetch_ide(const char *url) {
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — kept old"), written, magic);
     ufsp->remove(tmp);
     return -5;
+  }
+  // `written` counts what was DOWNLOADED, not what the FS actually persisted — an
+  // SD/FAT backend can short-write a big file (return < requested, or even a wrong
+  // count). Reopen the .tmp and require the on-disk size to match before renaming
+  // over the live IDE; a truncated-but-gzip-magic file would otherwise pass the
+  // check above and brick the served IDE (Andreas, S3-ETH SD/FAT, cut at 12-37 KB).
+  uint32_t on_disk = 0;
+  { File vf = ufsp->open(tmp, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
+  if (write_err || on_disk != (uint32_t)written) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE write incomplete (%u/%d B on disk%s) — kept old"),
+           on_disk, written, write_err ? ", short-write" : "");
+    ufsp->remove(tmp);
+    return -7;
   }
   // Atomically replace the live IDE. Try a direct rename first — LittleFS
   // overwrites atomically, so there is no window where the served IDE is
@@ -2675,7 +2705,17 @@ static void HandleTinyCApi(void) {
       result += json;
     }
     result += F("],\"heap\":");
-    result += String(ESP_getFreeHeap());
+    {
+      // free heap + fragmentation %% (0 = healthy, ->100 = badly fragmented).
+      // frag = 100 - largest_free_block*100/free_heap. Computed here (the stock
+      // Status JSON never exposes it); works on ESP32 + ESP8266 (both provide
+      // ESP_getMaxAllocHeap/ESP_getFreeHeap). Used by the device-scanner Frag column.
+      uint32_t fh = ESP_getFreeHeap();
+      result += String(fh);
+      int frag = fh ? (int)(100 - (uint64_t)ESP_getMaxAllocHeap() * 100 / fh) : 0;
+      result += F(",\"frag\":");
+      result += String(frag);
+    }
     result += '}';
     Webserver->send(200, F("application/json"), result);
     return;
@@ -3866,6 +3906,43 @@ static void HandleTinyCDisplayRaw(void) {
   tc_global_pause = true;   // pause VM during framebuffer read
   delay(0);  // yield to let VM finish current cycle
 
+#ifdef USE_TINYC_LVGL
+  // LVGL active: mirror the LVGL screen via an on-demand RGB565 snapshot. LVGL
+  // renders in PARTIAL mode (no full panel framebuffer) and renderer->framebuffer
+  // is null on HW-DMA panels, so lv_snapshot of the active screen is the only way.
+  if (tc_lvgl_active()) {
+    uint8_t *sdata; uint16_t sw, sh; void *shandle;
+    if (tc_lvgl_snapshot(&sdata, &sw, &sh, &shandle)) {
+      uint32_t lv_fb_size = (uint32_t)sw * sh * 2;   // RGB565, 2 bytes/px
+      uint8_t lh[8];
+      lh[0] = sw & 0xFF; lh[1] = (sw >> 8) & 0xFF;
+      lh[2] = sh & 0xFF; lh[3] = (sh >> 8) & 0xFF;
+      lh[4] = 16;        // bpp 16 (RGB565)
+      lh[5] = 0;         // swap=0, rot=0 — snapshot is already in logical orientation
+      lh[6] = 0; lh[7] = 0;
+      Webserver->sendHeader(F("Connection"), F("close"));
+      Webserver->setContentLength(8 + lv_fb_size);
+      Webserver->send(200, F("application/octet-stream"), "");
+      WiFiClient lc = Webserver->client();
+      lc.setNoDelay(true); lc.setTimeout(5);
+      lc.write(lh, 8);
+      uint32_t lsent = 0;
+      while (lsent < lv_fb_size) {
+        if (!lc.connected()) break;
+        uint32_t chunk = lv_fb_size - lsent; if (chunk > 512) chunk = 512;
+        lc.write(sdata + lsent, chunk);
+        lsent += chunk; yield();
+      }
+      lc.flush(); delay(50); lc.stop();
+      tc_lvgl_snapshot_free(shandle);
+      tc_mirror_busy = false;
+      tc_global_pause = false;
+      return;
+    }
+    // snapshot failed — fall through to the framebuffer path below
+  }
+#endif
+
   int8_t bpp = renderer->disp_bpp;
   uint8_t *fb = renderer->framebuffer;
   uint16_t *rgb = renderer->rgb_fb;
@@ -4054,6 +4131,7 @@ static void HandleTinyCDisplayHTML(void) {
     "<option value='2' selected>2x</option>"
     "<option value='4'>4x</option>"
     "</select></label>"
+    "<button onclick='dl()'>Save PNG</button>"
     "</div>"
   ));
 
@@ -4064,6 +4142,15 @@ static void HandleTinyCDisplayHTML(void) {
     "function rsc(){"
     "if(cv.width&&cv.height){var s=+document.getElementById('sc').value;"
     "cv.style.width=(cv.width*s)+'px';cv.style.height=(cv.height*s)+'px';}}"
+    "function dl(){try{"
+    "if(!cv.width){return;}"
+    "var s=+document.getElementById('sc').value;"
+    "var t=document.createElement('canvas');t.width=cv.width*s;t.height=cv.height*s;"
+    "var tx=t.getContext('2d');tx.imageSmoothingEnabled=false;"
+    "tx.drawImage(cv,0,0,t.width,t.height);"
+    "var a=document.createElement('a');a.download='display.png';"
+    "a.href=t.toDataURL('image/png');a.click();"
+    "}catch(e){document.getElementById('st').textContent='Save failed: '+e;}}"
   ));
 
   // Pixel decoders per bpp
@@ -4160,7 +4247,11 @@ static void HandleTinyCDisplay(void) {
   uint16_t *rgb = r->rgb_fb;
   bool fb_ok = fb && ((uintptr_t)fb >= 0x3C000000);
   bool rgb_ok = rgb && ((uintptr_t)rgb >= 0x3C000000);
-  if (!fb_ok && !rgb_ok) {
+  bool lvgl_on = false;
+#ifdef USE_TINYC_LVGL
+  lvgl_on = tc_lvgl_active();   // LVGL mirrors via an on-demand screen snapshot
+#endif
+  if (!fb_ok && !rgb_ok && !lvgl_on) {
     Webserver->send(503, "text/plain", "No framebuffer (display uses HW DMA)");
     return;
   }
@@ -5183,6 +5274,29 @@ static void tc_spawn_pool_lock(void) {
 }
 static void tc_spawn_pool_unlock(void) {
   if (tc_spawn_pool_mutex) xSemaphoreGive(tc_spawn_pool_mutex);
+}
+
+// TinyCStack — list every live spawnTask worker with its FreeRTOS stack high-water
+// mark (uxTaskGetStackHighWaterMark = the minimum free stack ever seen) so worker
+// stacks can be sized from data instead of guessed (Andreas's wish). Reports the
+// configured VM-task stack too.
+// NB the high-water mark is in StackType_t units. On ESP-IDF (both Xtensa and RISC-V)
+// StackType_t is uint8_t, so the value is already BYTES — do NOT multiply by 4 (the
+// vanilla-FreeRTOS "words*4" assumption, which over-reported a 10 KB worker as 23 KB
+// free; Andreas caught it). xTaskCreate's stack arg is likewise in bytes on ESP-IDF,
+// so VmTaskStack/stack_bytes and this number are the same unit and directly comparable.
+void CmndTinyCStack(void) {
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Stack\":{\"VmTaskStack\":%d"), (int)TC_VM_TASK_STACK);
+  tc_spawn_pool_lock();
+  for (int i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    TcSpawnTask *e = &tc_spawn_pool[i];
+    if (!e->running || !e->handle || !e->name[0]) { continue; }
+    uint32_t freeb = (uint32_t)uxTaskGetStackHighWaterMark(e->handle);  // already bytes on ESP-IDF
+    ResponseAppend_P(PSTR(",\"%s\":{\"Slot\":%d,\"StackFreeMin\":%u}"),
+                     e->name, e->slot_idx, freeb);
+  }
+  tc_spawn_pool_unlock();
+  ResponseAppend_P(PSTR("}}"));
 }
 
 // FreeRTOS task body — executes the user function to completion or stop-request.

@@ -1119,7 +1119,7 @@ void dump2log(void) {
             	// new packet, plot last one
             	sml_globs.log_data[sml_globs.sml_logindex] = 0;
             	AddLogData(LOG_LEVEL_INFO, sml_globs.log_data);
-            	strcpy(&sml_globs.log_data[0], ": aa ");
+            	strlcpy(sml_globs.log_data, ": aa ", sml_globs.logsize);   // log_data is a char* — sizeof() would be the pointer size (4) and truncate ": aa "->": a"
             	sml_globs.sml_logindex = 5;
           	}
           	continue;
@@ -1656,19 +1656,80 @@ void sml_empty_receiver(uint32_t meters) {
 
 void SML_Decode(uint8_t index);
 
+#ifdef USE_SML_EBUS_ARB
+// sensor53 d<n> raw-sniff for an arb (soF) eBUS meter. In arb mode the onReceive
+// RX-event task is the SOLE UART reader (see the comment at Eba_RxTask below), so
+// dump2log()'s SML_SAVAILABLE path — driven from SML_Poll on the main task — sees an
+// empty buffer and prints nothing: the wire is invisible exactly when you most want it
+// (Andreas, .104, d1 blind since soF). ebus_feed_byte() is the single choke point every
+// arb byte passes through, INCLUDING frames the CRC gate later discards (the broken /
+// escape / arbitration-remnant bytes an ebusd `grab` never shows), so mirror each raw
+// byte into the dump log here. Same per-telegram ": aa <hex>" format as dump2log()'s
+// case 'e', flushed on the SYNC (telegram) boundary. Runs on the RX-event task — same
+// task that already AddLog()s the "ebus crc error" line, so the logging path is proven.
+void ebus_dump_arb_byte(uint8_t iob) {
+  if (!sml_globs.log_data) return;
+  if (iob == EBUS_SYNC) {
+    if (sml_globs.sml_logindex > 5) {          // a telegram accumulated -> emit it
+      sml_globs.log_data[sml_globs.sml_logindex] = 0;
+      AddLogData(LOG_LEVEL_INFO, sml_globs.log_data);
+    }
+    strlcpy(sml_globs.log_data, ": aa ", sml_globs.logsize);   // restart the line on the SYNC
+    sml_globs.sml_logindex = 5;
+    return;
+  }
+  if (sml_globs.sml_logindex < sml_globs.logsize - 7) {
+    sprintf_P(&sml_globs.log_data[sml_globs.sml_logindex], PSTR("%02x "), iob);
+    sml_globs.sml_logindex += 3;
+  }
+}
+#endif // USE_SML_EBUS_ARB
+
 // Passive eBUS frame accumulator (refactored out of case 'e' so the enhanced-protocol
 // de-framer can feed it too). Returns 1 when iob was a SYNC (frame boundary), else 0.
 uint8_t ebus_feed_byte(uint32_t meters, uint8_t iob) {
   struct METER_DESC *mp = &meter_desc[meters];
+#ifdef USE_SML_EBUS_ARB
+  // d<n> raw-sniff: in arb mode dump2log() is blind (event task is the sole UART reader),
+  // so dump the wire from this choke point instead. Gated on ebm_arb so a normal passive
+  // 'e' meter's dump stays with dump2log() (byte-identical, no double-dump).
+  if (mp->ebm_arb && sml_globs.dump2log && (uint8_t)(sml_globs.dump2log & 7) == meters + 1) {
+    ebus_dump_arb_byte(iob);
+  }
+#endif
   if (iob == EBUS_SYNC) {
     // should be end of telegram: QQ,ZZ,PB,SB,NN ..... CRC, ACK SYNC
     if (mp->spos > 5 && mp->spos > mp->sbuff[4] + 5) {
-      uint16_t tlen = mp->sbuff[4] + 5 + check_ebus_esc(mp->sbuff, mp->spos);
-      if (mp->sbuff[tlen] == ebus_CalculateCRC(mp->sbuff, tlen)) {
+      // Locate the master CRC in the RAW (still-escaped) buffer: an a9 escape plus
+      // its next byte is ONE logical byte, so consume (NN+5) logical bytes to reach
+      // it. The old code counted escapes over the WHOLE buffer (incl. the ACK + the
+      // slave reply), so any a9/aa in the slave part shifted tlen one past the CRC,
+      // the check failed, and the whole telegram was silently dropped — content-
+      // dependent, ~42 of ~150 telegram types at any time (Andreas, .104).
+      uint16_t need = mp->sbuff[4] + 5;        // QQ ZZ PB SB NN + NN data (logical)
+      uint16_t tlen = 0;
+      for (uint16_t l = 0; l < need && tlen < mp->spos; l++) {
+        tlen += (mp->sbuff[tlen] == EBUS_ESC) ? 2 : 1;
+      }
+      // the master CRC byte itself is escaped on the wire when its value is a9/aa
+      uint8_t wcrc = 0;
+      if (tlen < mp->spos) {
+        wcrc = (mp->sbuff[tlen] == EBUS_ESC && tlen + 1 < mp->spos)
+               ? (uint8_t)(EBUS_ESC + mp->sbuff[tlen + 1]) : mp->sbuff[tlen];
+      }
+      uint8_t ccrc = (tlen < mp->spos) ? ebus_CalculateCRC(mp->sbuff, tlen) : 0xff;
+      if (tlen < mp->spos && wcrc == ccrc) {
         ebus_esc(mp->sbuff, mp->spos);
         SML_Decode(meters);
       } else {
-        AddLog(LOG_LEVEL_INFO, PSTR("ebus crc error"));
+        // Enriched so a reject can be pinned to one telegram (Andreas eBUS debugging):
+        // QQ ZZ PB SB + NN, where the master CRC was read (tlen) vs the buffer end
+        // (spos), and the wire-CRC (de-escaped) vs the computed CRC. If a telegram a
+        // descriptor expects NEVER shows up here, its master CRC passed and the value
+        // is decoded — so a still-zero slot is then a descriptor/offset issue, not CRC.
+        AddLog(LOG_LEVEL_INFO, PSTR("ebus crc error QQ=%02x ZZ=%02x PB=%02x SB=%02x NN=%u tlen=%u spos=%u wcrc=%02x calc=%02x"),
+               mp->sbuff[0], mp->sbuff[1], mp->sbuff[2], mp->sbuff[3], mp->sbuff[4],
+               tlen, mp->spos, wcrc, ccrc);
       }
     }
 #ifdef USE_SML_EBUS_MASTER
@@ -2015,11 +2076,11 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
     if (cp->telestartpos==-1)  {
       //check start of buffer for start sequence
       if(cp->crcbuff_pos>=8) {
-        if (memcmp(&cp->crcbuff[0], "\x1B\x1B\x1B\x1B\x01\x01\x01\x01", 8) == 0 ) {
+        if (memcmp(cp->crcbuff, "\x1B\x1B\x1B\x1B\x01\x01\x01\x01", 8) == 0 ) {
           //found start sequence
           cp->telestartpos=0;
         } else {
-          memmove(&cp->crcbuff[0], &cp->crcbuff[1], cp->crcbuff_pos-1);
+          memmove(cp->crcbuff, &cp->crcbuff[1], cp->crcbuff_pos-1);
           cp->crcbuff_pos--;
         }
 
@@ -2037,7 +2098,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
           uint16_t len=cp->teleendpos + 1;
           //testing: fake some error for testing 
           //if (random(0, 50) < 30) {cp->crcbuff[12]=99;}
-          uint16_t calculated_crc = calculateSMLbinCRC(&cp->crcbuff[0], len-2, cp->crcmode);
+          uint16_t calculated_crc = calculateSMLbinCRC(cp->crcbuff, len-2, cp->crcmode);
           if (calculated_crc == extracted_crc) {
             cp->crcfinecnt++;
             //AddLog(LOG_LEVEL_INFO, PSTR("SML: CRC ok"));
@@ -2193,7 +2254,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
         mp->spos = 0;
       } else if (iob == 0x0d) {
         uint8_t index = 0;
-        uint8_t *ucp = &mp->sbuff[0];
+        uint8_t *ucp = mp->sbuff;
         for (uint16_t cnt = 0; cnt < mp->spos; cnt++) {
           uint8_t iob = mp->sbuff[cnt] ;
           if (iob == 0x1b) {
@@ -2204,7 +2265,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
           }
           index++;
         }
-        uint16_t crc = KS_calculateCRC(&mp->sbuff[0], index);
+        uint16_t crc = KS_calculateCRC(mp->sbuff, index);
         if (!crc) {
           SML_Decode(meters);
         }
@@ -2232,7 +2293,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
           uint8_t tlen = (mp->sbuff[4] << 8) | mp->sbuff[5];
           if (mp->spos == 6 + tlen) {
             mp->spos = 0;
-            memmove(&mp->sbuff[0], &mp->sbuff[6], mp->sbsiz - 6);
+            memmove(mp->sbuff, &mp->sbuff[6], mp->sbsiz - 6);
 #ifdef MODBUS_DEBUG
             AddLog(LOG_LEVEL_INFO, PSTR("meter %d, receive index >> %d"), meters, mp->index);
             Hexdump(mp->sbuff, 10);
@@ -3413,7 +3474,15 @@ void SML_Show(boolean json) {
   char name[24];
   char unit[8];
   char jname[24];
-  int8_t index = 0, mid = 0;
+  // index walks one decode line per loop up to maxvars-1 (line ~3605). maxvars is
+  // uint8_t (up to 255), so an int8_t index overflows to -128 at the 128th line and
+  // meter_vars[index]/dvalid[index] become wild OOB reads; the garbage double then
+  // overflows tpowstr[32] in DOUBLE2CHAR, smashing the return address with ASCII
+  // digits -> "Instruction access fault EPC=30303030". Andreas hit this at 131 lines
+  // (118/124 fine, 131 crash — the 128 cliff). uint16_t can address the full uint8_t
+  // maxvars range with margin.
+  uint16_t index = 0;
+  int8_t mid = 0;
   char *mp = (char*)sml_globs.meter_p;
   char *cp, nojson = 0;
   bool group_open = false;
@@ -4250,6 +4319,11 @@ void SML_Init(void) {
           sml_globs.script_meter = (uint8_t*)calloc(mlen, 1);
 					memory += mlen;
           if (!sml_globs.script_meter) {
+            // Loud-fail: a `sensor53 r` live reload on a fragmented heap can't grab
+            // this (multi-KB) buffer and used to bail SILENTLY -> "meters: 0" with no
+            // clue (Andreas: 131-line def reload n=0 at 69 KB heap, fresh boot fine).
+            AddLog(LOG_LEVEL_INFO, PSTR("SML: meter def alloc failed (%u bytes, heap %u — too low/fragmented) — SML not started"),
+                   (unsigned)mlen, (unsigned)ESP_getFreeHeap());
             goto dddef_exit;
           }
           tp = sml_globs.script_meter;
@@ -4553,8 +4627,13 @@ next_line:
       mp->sbuff = (uint8_t*)calloc(mp->sbsiz, 1);
       // SECURITY: the entire RX path writes mp->sbuff[...] unconditionally; on a
       // failed alloc (likely on RAM-tight ESP8266 with a large sbsiz) that's a
-      // NULL deref. Disable the meter rather than crash.
-      if (!mp->sbuff) { mp->type = 0; mp->sbsiz = 0; continue; }
+      // NULL deref. Disable the meter rather than crash — but say so (used to be a
+      // silent continue -> a meter just vanished from the output with no clue).
+      if (!mp->sbuff) {
+        AddLog(LOG_LEVEL_INFO, PSTR("SML: meter %u sbuff alloc failed (%u bytes) — meter disabled"),
+               (unsigned)meters, (unsigned)mp->sbsiz);
+        mp->type = 0; mp->sbsiz = 0; continue;
+      }
 			memory += mp->sbsiz;
     }
   }
@@ -5021,7 +5100,7 @@ uint32_t SML_Read(int32_t meter, char *str, uint32_t slen) {
   mp->sbuff[mp->spos] = 0;
 
   if (!hflg) {
-    strlcpy(str, (char*)&mp->sbuff[0], slen);
+    strlcpy(str, (char*)mp->sbuff, slen);
   } else {
     uint32_t index = 0;
     for (uint32_t cnt = 0; cnt < mp->spos; cnt++) {
@@ -5493,9 +5572,9 @@ int32_t sml_tcp_init(struct METER_DESC *mp) {
     int32_t err = mp->client->connect(mp->ip_addr, mp->params);
     char ipa[32];
 #ifdef USE_SML_TCP_IP_STR
-    strcpy(ipa, mp->ip_addr);
+    strlcpy(ipa, mp->ip_addr, sizeof(ipa));
 #else
-    strcpy(ipa, mp->ip_addr.toString().c_str());
+    strlcpy(ipa, mp->ip_addr.toString().c_str(), sizeof(ipa));
 #endif
     if (!err) {
       AddLog(LOG_LEVEL_INFO, PSTR("SML: could not connect TCP to %s:%d"),ipa, mp->params);

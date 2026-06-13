@@ -12689,7 +12689,7 @@ const char SML_SCRIPT_TEXT[] PROGMEM =
   "}}});"
   "function smlp(txt,index){"
   "x=new XMLHttpRequest();"
-  "x.open('POST', '/ta?smlsav=%s');"
+  "x.open('POST', '/smld?smlsav=%s');"
   "x.setRequestHeader('Accept','application/text');"
   "x.setRequestHeader('Content-Type','application/text');"
   "x.send(txt);"
@@ -15085,6 +15085,16 @@ bool Xdrv10(uint32_t function) {
     case FUNC_WEB_ADD_HANDLER:
       Webserver->on("/" WEB_HANDLE_SCRIPT, HandleScriptConfiguration);
       Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration, HandleScriptUpload);
+#ifdef USE_SML_SCRIPT_CMD
+      // SML-descriptor save (smlpd dropdown) POSTs the descriptor as a RAW
+      // application/text body, read via Webserver->arg("plain"). The upload handler
+      // on /ta (HandleScriptUpload, for streamed script saves) makes the WebServer
+      // parse every /ta POST body as a multipart upload, so a raw body never lands
+      // in arg("plain") and the descriptor is silently not saved. Give the
+      // descriptor save its own handler-only route (no upload handler) — behaves
+      // exactly like /ta did before the streaming change. (Hans regression 2026-06-13.)
+      Webserver->on("/smld",HTTP_POST, HandleScriptTextareaConfiguration);
+#endif
       Webserver->on("/exs", HTTP_POST,[]() { Webserver->sendHeader("Location","/exs");Webserver->send(303);}, script_upload_start);
       Webserver->on("/exs", HTTP_GET, ScriptExecuteUploadSuccess);
 #if defined(USE_UFILESYS) && defined(USE_SCRIPT_WEB_DISPLAY)
