@@ -12,7 +12,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 
 **Wichtig — Varianten-Suffix:** Jedes ESP32-Image gibt es in zwei Varianten (ESP8266 nur `_tas`):
 - `_tas` → klassischer **Tasmota-Scripter** + Google Charts (wie bisher)
-- `_tc`  → **TinyC VM** + Browser-IDE (kein Scripter, Meter-Descriptor unter `/sml_meter.def`, SML wird im TinyC-Programm mit `tasm_rule = 1;` aktiviert)
+- `_tc`  → **TinyC VM** + Browser-IDE (kein Scripter)
 
 | Imagename | Beschreibung |
 | ------------- | ------------- |
@@ -43,24 +43,23 @@ Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas findet ihr im [ESP8266 Ordner](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266/pvakku-powermeter-emulator/komprimiert)). Die Scripte findet ihr direkt auf euren ESP in Tasmota (DropDown) oder [hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
 ## TinyC - Alternative zum Scripting/Berry (ESP32 / ESP8266 4M+)
-- **TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry. Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
+**TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry. Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
 
-**Image-Variante wählen:** Ab dieser Release gibt es pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. ESP8266 (1M + 4M) gibt es nur als `_tas`.
+**Image-Variante wählen:**  
+Ab dieser Release gibt es pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. ESP8266 (1M + 4M) gibt es nur als `_tas`.
 
-**SML in `_tc`-Builds aktivieren:** Im TinyC-Programm einmalig `tasm_rule = 1;` setzen (in `main()` oder `BootInit()`). Das öffnet den SML-Init-Gate (`Settings->rule_enabled` Bit 0), der Treiber lädt dann den Meter-Descriptor aus `/sml_meter.def`. Boot-festes Pattern siehe [`marstek_emu.tc`](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/examples/marstek_emu.tc):
+**SML in `_tc`-Builds aktivieren:**  
+Wenn ihr eins der [sml Beispielprogramme von gemus Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc/examples) verwendet (sml_..tc), dann müsst ihr einmal SML aktivieren via Checkbox (erreichbar via Button Einstellungen / Daten). Damit ihr die Beispielprogramme selbst kompilieren könnt müsst ihr vorher übrigens sml_chart_common.tc und sml_descriptor.tc via Manage File System hochladen!  
+Wenn ihr ein eigenes Programm schreiben wollt, dann muss in eurem Code einmalig `tasm_rule = 1;` gesetzt werden (in `main()` oder `BootInit()`). Der Treiber lädt dann den Meter-Descriptor aus `/sml_meter.def`. Boot-festes Pattern siehe [`marstek_emu.tc`](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/examples/marstek_emu.tc):
 ```c
-persist watch int sml_activ;   // Checkbox in der WebUI
-
 int main() {
-    if (sml_activ != tasm_rule) {
-        tasm_rule = sml_activ;   // Sync beim Boot
-    }
+tasm_rule = 1;
     return 0;
 }
 ```
 
-=> hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
-=> Die IDE ist nicht vorinstalliert und muss 1x geladen werden. Das geht nun (31.5.26) direkt in Tasmota Tools > TinyC Console > Update IDE. Oder ihr lädt sie selbst hoch, Download der [tinyc_ide.html.gz](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)  
+**=>** hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
+**=>** Die IDE ist nicht vorinstalliert und muss 1x via Manage File System hochgeladen werden. Da die IDE immer weiter von gemu angepasst wird solltet ihr immer nur die IDE von meiner Repo verwenden, da diese für mein erzeugtes Images passt. Ansonsten gibt es ein Versions Hinweis in der IDE. Download der [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tinyc/tinyc_ide.html.gz) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)  
 <img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
 <img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
 
