@@ -166,7 +166,14 @@ bool TasmotaSerial::freeUart(void) {
     return true;
   } else {
     // Find a free UART which may end up as UART0
-    for (uint32_t i = SOC_UART_HP_NUM -1; i >= 0; i--) {
+    // NOTE (fork fix): the counter MUST be signed. With `uint32_t i` the test
+    // `i >= 0` is always true, so when no UART is free the loop never ends — i
+    // wraps to ~4e9, freeUart() returns a garbage m_uart, and new
+    // HardwareSerial(garbage) freezes the chip (seen on a single-core ESP32-C3
+    // with both UARTs taken: ~10 s lockup that starves the web server + tasks).
+    // Signed counter -> the loop terminates and we `return false` cleanly so the
+    // caller can fail fast instead of hanging.
+    for (int i = SOC_UART_HP_NUM -1; i >= 0; i--) {
       if (0 == bitRead(tasmota_serial_uart_bitmap, i)) {
         m_uart = uart_port_t(i);
         bitSet(tasmota_serial_uart_bitmap, m_uart);

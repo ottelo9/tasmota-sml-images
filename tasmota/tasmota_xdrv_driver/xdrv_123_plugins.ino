@@ -61,7 +61,7 @@ extern "C" {
 
 #define MAX_MOD_STORES 4
 // this descriptor is in flash so only 32 bit access allowed
-#pragma pack(4)
+#pragma pack(push, 4)   // push/pop: sonst leakt pack(4) in xdrv_124+ (Struct-Größen-Mismatch .ino<->lib -> Heap-Korruption; Andreas-Befund 2026-07-16)
 typedef struct {
   MD_TYPE sync;
   MD_TYPE arch;
@@ -84,6 +84,7 @@ typedef struct {
   // 56
   MODULE_STORE ms[];
 } FLASH_MODULE;
+#pragma pack(pop)
 
 #define EXEC_OFFSET ((FLASH_MODULE*)mt->mod_addr)->execution_offset
 
@@ -3255,7 +3256,7 @@ void Module_Execute(uint32_t sel) {
   }
 }
 
-uint32_t Plugin_Query(uint16_t index, uint8_t sel, char *params) {
+uint32_t Plugin_Query(uint16_t index, uint16_t sel, char *params) {
 uint32_t result = 0;
   for (uint8_t cnt = 0; cnt < MAX_PLUGINS; cnt++) {
     if (modules[cnt].mod_addr) {
@@ -4450,6 +4451,7 @@ typedef struct {
         AddLog(LOG_LEVEL_INFO, "partition table is valid: %d entries", num_partitions);
         bool custom = false;
         int8_t hasspiffs = -1;
+        int8_t hascustom = -1;        // index of the "custom" partition (for chkpt r migration)
         esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
         for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
           AddLog(LOG_LEVEL_INFO,PSTR("partition addr: 0x%06x; size: 0x%06x; label: %s"), peptr->pos.offset, peptr->pos.size, peptr->label);
@@ -4460,6 +4462,7 @@ typedef struct {
           if (!strcmp((char*)peptr->label, "custom")) {
             //AddLog(LOG_LEVEL_INFO,PSTR("custom partition found!"));
             custom = true;
+            hascustom = cnt;
           }
           peptr++;
           if (peptr->magic != ESP_PARTITION_MAGIC) {
@@ -4566,16 +4569,32 @@ typedef struct {
             }
           }
         } else if (custom == true) {
-          if (remove && hasspiffs > 0) {
-            AddLog(LOG_LEVEL_INFO,PSTR("may remove custom!"));
-            // assuming custom directly after spiffs
-            esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
-            peptr += hasspiffs;
-            esp_partition_info_t *peptr_custom = peptr + 1;
-            peptr->pos.size += peptr_custom->pos.size;
-            memset(peptr_custom, 0, sizeof(esp_partition_info_t));
-            memset(peptr_custom + 1, 0xff, sizeof(esp_partition_info_t));
+          // Remove the "custom" partition and hand its flash space to spiffs. The
+          // custom may sit directly AFTER spiffs (current layout) or directly BEFORE
+          // it (old layout, e.g. .117). The old code blindly merged spiffs+1, which
+          // for a before-spiffs custom read past the table end and DROPPED spiffs from
+          // the count -> a corrupt table on reboot. Handle both adjacencies by index.
+          esp_partition_info_t *pe = (esp_partition_info_t*)mp;
+          if (remove && hasspiffs >= 0 && hascustom == hasspiffs + 1) {
+            // custom directly AFTER spiffs: spiffs grows by custom.size, offset unchanged
+            AddLog(LOG_LEVEL_INFO, PSTR("chkpt: remove custom (after spiffs)"));
+            pe[hasspiffs].pos.size += pe[hascustom].pos.size;
+            memmove(&pe[hascustom], &pe[hascustom + 1], (num_partitions - hascustom - 1) * sizeof(esp_partition_info_t));
+            memset(&pe[num_partitions - 1], 0, sizeof(esp_partition_info_t));
             num_partitions--;
+          } else if (remove && hasspiffs >= 0 && hascustom == hasspiffs - 1) {
+            // custom directly BEFORE spiffs (old layout): move spiffs DOWN to absorb it
+            AddLog(LOG_LEVEL_INFO, PSTR("chkpt: remove custom (before spiffs); spiffs 0x%06x->0x%06x +%dk"),
+                   pe[hasspiffs].pos.offset, pe[hascustom].pos.offset, pe[hascustom].pos.size / 1024);
+            pe[hasspiffs].pos.offset = pe[hascustom].pos.offset;
+            pe[hasspiffs].pos.size += pe[hascustom].pos.size;
+            memmove(&pe[hascustom], &pe[hascustom + 1], (num_partitions - hascustom - 1) * sizeof(esp_partition_info_t));
+            memset(&pe[num_partitions - 1], 0, sizeof(esp_partition_info_t));
+            num_partitions--;
+          } else if (remove) {
+            // custom not adjacent to spiffs -> can't cleanly reclaim; refuse (no write)
+            AddLog(LOG_LEVEL_INFO, PSTR("chkpt: custom (idx %d) not adjacent to spiffs (idx %d) - remove refused"), hascustom, hasspiffs);
+            remove = 0;
           }
         } else {
           if (hasspiffs < 0) {

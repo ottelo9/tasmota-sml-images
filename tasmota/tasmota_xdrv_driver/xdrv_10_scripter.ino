@@ -220,7 +220,19 @@ char *Get_esc_char(char *cp, char *esc_chr);
 #undef SUPPORT_MQTT_EVENT
 #define SUPPORT_MQTT_EVENT
 #undef USE_SCRIPT_WEB_DISPLAY
+#ifndef USE_TINYC
+// TinyC replaces the Scripter's web UI. TinyC widgets POST numeric ?sv= ids
+// (e.g. seva(1,4113)); the Scripter's HTML setvar handler tries to resolve them
+// as Scripter variables and null-derefs in Run_script_sub (LoadProhibited,
+// EXCVADDR 0). It fires whenever the Scripter is compiled in next to TinyC and
+// Rule1 is on: script_ram already points at Settings->rules[0], and a TinyC SML
+// slot enables Rule1 via sml_activ->tasm_rule -> the guard passes -> crash (hence
+// Rolf's "multi-slot only"). SML itself does NOT need the Scripter (file-based
+// /sml_meter.def; smlScripterLoad uses TinyC's own tc_mscr, not script_ram), so
+// the rest of the Scripter is irrelevant here -- just compile out its web display
+// on every TinyC build. (gemu 2026-06-24)
 #define USE_SCRIPT_WEB_DISPLAY
+#endif
 #undef SCRIPT_FULL_WEBPAGE
 #define SCRIPT_FULL_WEBPAGE
 #undef USE_WEBSEND_RESPONSE
@@ -825,7 +837,7 @@ typedef struct {
 
 SCRIPT_MEM glob_script_mem;
 
-uint32_t Plugin_Query(uint16_t, uint8_t, char *);
+uint32_t Plugin_Query(uint16_t, uint16_t, char *);
 
 void script_setaflg(uint8_t flg) {
   glob_script_mem.tasm_cmd_activ = flg;

@@ -178,7 +178,7 @@
      */
     #define LV_DRAW_SW_SUPPORT_RGB565       1
     #define LV_DRAW_SW_SUPPORT_RGB565_SWAPPED       0   // TASMOTA
-    #define LV_DRAW_SW_SUPPORT_RGB565A8     0       // TASMOTA
+    #define LV_DRAW_SW_SUPPORT_RGB565A8     1       // enable RGB565 image scale/rotate (cam view): gates the only RGB565 transform case in lv_draw_sw_transform.c
     #define LV_DRAW_SW_SUPPORT_RGB888       1
     #define LV_DRAW_SW_SUPPORT_XRGB8888     0       // TASMOTA
     #define LV_DRAW_SW_SUPPORT_ARGB8888     1
@@ -1163,7 +1163,7 @@
 /* Documentation for several of the below items can be found here: https://docs.lvgl.io/master/auxiliary-modules/index.html . */
 
 /** 1: Enable API to take snapshot for object */
-#define LV_USE_SNAPSHOT 0
+#define LV_USE_SNAPSHOT 1       // TASMOTA — used by the /tc_display LVGL screen mirror
 
 /** 1: Enable system monitor component */
 #define LV_USE_SYSMON   0

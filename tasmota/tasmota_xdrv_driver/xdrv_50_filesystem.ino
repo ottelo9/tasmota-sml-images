@@ -98,6 +98,7 @@ FS *dfsp;
 
 char ufs_path[UFS_FILENAME_SIZE];
 File ufs_upload_file;
+char ufs_upload_path[UFS_FILENAME_SIZE];   // full path of the in-progress upload (for cleanup on abort)
 #ifndef UFS_BIG_WRITE
 #define UFS_BIG_WRITE 16384      // bytes: uploads >= this (or undeclared size) get the WDT bound
 #endif                          // + SML serial quiesce around the blocking LittleFS close().
@@ -244,6 +245,15 @@ void UfsCheckSDCardInit(void) {
 #ifdef ESP32
       AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "SDCard mounted (SPI bus%d) with %d kB free"), spi_bus +1, UfsInfo(1, 0));
 #endif // ESP32
+    } else {
+      // SPI SD mount failed — was previously silent (only the SDMMC branch logged).
+      // cardType discriminates: 0 = no SPI response (reseat/contacts/CS/wiring or a
+      // bus conflict this boot); !=0 = card seen but FAT mount failed (fsck/reformat).
+#ifdef ESP32
+      AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "SDCard SPI mount failed cs=%d bus%d cardType=%d"), cs, spi_bus, (int)SD.cardType());
+#else
+      AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "SDCard SPI mount failed cs=%d bus%d"), cs, spi_bus);
+#endif
     }
   }
 #if defined(ESP32) && defined(SOC_SDMMC_HOST_SUPPORTED)     // ESP32 and SDMMC supported (not Esp32C3)
@@ -272,6 +282,8 @@ void UfsCheckSDCardInit(void) {
       if (ffsp) {ufs_dir = 1;}
       // make sd card the global filesystem
       AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UFS "SDCard mounted (SDIO %i-bit) with %d kB free"), bit_4_mode ? 4 : 1, UfsInfo(1, 0));
+    } else {
+      AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_UFS "SDCard SDIO mount failed (%i-bit clk=%i cmd=%i d0=%i)"), bit_4_mode ? 4 : 1, sdio_clk, sdio_cmd, sdio_d0);
     }
   }
 #endif
@@ -1300,6 +1312,40 @@ const char UFS_FORM_FILE_UPGc1[] PROGMEM =
 const char UFS_FORM_FILE_UPGc2[] PROGMEM =
   "</div>";
 
+#ifdef USE_TINYC
+// Redirect threshold. A file larger than this is POSTed to the port-83 raw
+// upload server (its own FreeRTOS task, off loopTask) via fetch() instead of the
+// /ufsu multipart path on loopTask, which panics + reboots on large files. The
+// crash point scales with the CHIP, not free heap (the upload is chunked, not
+// buffered): a SINGLE-core chip (C3/C6/S2) holds loopTask through the whole write
+// with no second core for relief and dies ~200 KB (Andreas's C6); DUAL-core
+// (ESP32/S3/P4) tolerate ~900 KB. So the base threshold is core-count driven, and
+// gets floored further when free heap is genuinely low (a crowded device of any
+// class). The port-83 reply carries Access-Control-Allow-Origin so this cross-
+// port fetch can read the result; a text/plain Blob body keeps it a CORS "simple
+// request" (no OPTIONS preflight). In the flash view (dir=2) the /ffs/ prefix
+// routes the file to flash. Small files keep the fast, universally-reachable
+// native path (works even where port 83 is blocked — proxy/VBox/partial forward).
+#if CONFIG_FREERTOS_UNICORE
+  #define TC_UFSU_REDIR_BASE 131072   // 128 KB — single-core (C3/C6/S2), crash ~200 KB
+#else
+  #define TC_UFSU_REDIR_BASE 262144   // 256 KB — dual-core (ESP32/S3/P4), crash ~900 KB
+#endif
+const char UFS_FORM_FILE_UPG[] PROGMEM =
+  "<form id='uff' method='post' action='ufsu?fsz=' enctype='multipart/form-data'>"
+  "<br><input type='file' name='ufsu'><br>"
+  "<br><button type='submit' onclick='return tcuf(this)'>" D_UPLOAD "</button></form>"
+  "<script>function tcuf(b){var fo=b.form,f=fo['ufsu'].files[0];if(!f)return false;"
+  "eb('f1').style.display='none';eb('but6').style.display='none';eb('f2').style.display='block';"
+  "if(f.size>%d){var d=(location.search.match(/dir=(\\d+)/)||[])[1]||'1';"
+  "var p=(d=='2'?'/ffs/':'/')+f.name;"
+  "eb('f2').innerHTML='uploading '+(f.size>>10)+' kB via :83 ...';"
+  "fetch(location.protocol+'//'+location.hostname+':83/ufs'+p,{method:'POST',body:new Blob([f],{type:'text/plain'})})"
+  ".then(r=>r.text()).then(t=>{eb('f2').innerHTML=t;setTimeout(function(){location.href='/ufsd?dir='+d;},1500);})"
+  ".catch(e=>{eb('f2').innerHTML='upload failed: '+e;});return false;}"
+  "fo.action+=f.size;fo.submit();return false;}</script>"
+  "<br><hr>";
+#else
 const char UFS_FORM_FILE_UPG[] PROGMEM =
   "<form method='post' action='ufsu?fsz=' enctype='multipart/form-data'>"
   "<br><input type='file' name='ufsu'><br>"
@@ -1307,6 +1353,7 @@ const char UFS_FORM_FILE_UPG[] PROGMEM =
   "onclick='eb(\"f1\").style.display=\"none\";eb(\"but6\").style.display=\"none\";eb(\"f2\").style.display=\"block\";this.form.action+=this.form[\"ufsu\"].files[0].size;this.form.submit();'"
   ">" D_UPLOAD "</button></form>"
   "<br><hr>";
+#endif
 const char UFS_FORM_SDC_DIRa[] PROGMEM =
   "<div style='text-align:left;overflow:auto;height:250px;'>";
 const char UFS_FORM_SDC_DIRc[] PROGMEM =
@@ -1486,7 +1533,15 @@ void UfsDirectory(void) {
   }
   WSContentSend_P(UFS_FORM_FILE_UPGc2);
 
+#ifdef USE_TINYC
+  // Inject the upload-redirect threshold live: core-count base, floored to 64 KB
+  // when free heap is tight (< 96 KB) so a heap-crowded device is protected too.
+  uint32_t tc_redir = TC_UFSU_REDIR_BASE;
+  if (ESP.getFreeHeap() < 96 * 1024 && tc_redir > 65536) { tc_redir = 65536; }
+  WSContentSend_P(UFS_FORM_FILE_UPG, (unsigned)tc_redir);
+#else
   WSContentSend_P(UFS_FORM_FILE_UPG);
+#endif
 
   if (isdir){
     // if a folder, show 'folder: xxx' if not '/'
@@ -1761,6 +1816,7 @@ void download_task(void *path) {
 bool UfsUploadFileOpen(const char* upload_filename) {
   char npath[UFS_FILENAME_SIZE];
   snprintf_P(npath, sizeof(npath), PSTR("%s/%s"), ufs_path, upload_filename);
+  strlcpy(ufs_upload_path, npath, sizeof(ufs_upload_path));   // remember for abort cleanup
   // Declared upload size (?fsz= arg). 0 == undeclared (direct POST) -> assume large.
   // A large internal-flash (LittleFS) write blocks the single-core loop for several
   // seconds with the flash cache disabled; "big" gates the WDT bound (Close) and the
@@ -1793,6 +1849,9 @@ bool UfsUploadFileWrite(uint8_t *upload_buf, size_t current_size) {
     // Fail the upload loudly so the client gets an error instead of a corrupt one.
     if (ufs_upload_file.write(upload_buf, current_size) != current_size) {
       ufs_upload_file.close();
+      // Don't leave a truncated torso behind (Andreas: a 45 KB partial tinyc_ide.html.gz
+      // killed the IDE until repaired). Mirror the port-83 uploader's remove-on-fail.
+      if (ufs_upload_path[0]) { dfsp->remove(ufs_upload_path); }
       return false;
     }
   } else {

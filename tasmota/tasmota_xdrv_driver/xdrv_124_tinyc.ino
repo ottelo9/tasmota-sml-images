@@ -64,6 +64,7 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 
 // UriGlob for port 82 download server wildcard routes
 #include <uri/UriGlob.h>
+#include <new>            // std::nothrow — port-82 download/IDE client-handoff (TcDlReq)
 
 // Raw socket API for SO_LINGER setsockopt() in HandleTinyCDisplayRaw —
 // pulls in struct linger, SOL_SOCKET, SO_LINGER on ESP32's lwIP.
@@ -94,8 +95,19 @@ static void (*const TinyCWebOnHandlers[])(void) = {
   extern "C" void *matter_special_malloc(size_t n) { return special_malloc(n); }
 #endif
 
+// Fork-owned TinyC-controlled MIPI-CSI camera (ESP32-P4). Included BEFORE the VM
+// header so its WcCsiCaptureJpeg / tcam_init / tcam_deinit / tcam_sensor_pid are
+// visible to the camControl dispatch. Compiles to nothing unless
+// USE_TINYC_CAMERA && !USE_CSI_WEBCAM on P4 — so the upstream xdrv_81 webcam driver
+// stays untouched and Tasmota initializes the camera at no point.
+#include "include/xdrv_124_tinyc_camera.h"
+
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
 #include "include/xdrv_124_tinyc_vm.h"
+#ifdef ESP8266
+#include <coredecls.h>   // can_yield() — used to skip the VM tick in a can't-yield
+                         // (ctx:sys / re-entrant) context, avoiding a __yield panic
+#endif
 
 /*********************************************************************************************\
  * Email body callback — called from script_send_email_body() when TinyC initiated the send
@@ -421,6 +433,32 @@ static uint8_t tc_qpc_counter(void) {
 #endif
 }
 
+// Fix C: detect a fresh firmware image (an OTA flash). The running app's ELF
+// SHA-256 changes on every build, so a mismatch vs the recorded id means we
+// just flashed. Records the new id and returns true exactly once per new image.
+static bool tc_fresh_firmware_boot(void) {
+#ifdef ESP32
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return false;
+  uint32_t cur = 0;
+  esp_app_desc_t info;
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  if (run && esp_ota_get_partition_description(run, &info) == ESP_OK) {
+    memcpy(&cur, info.app_elf_sha256, sizeof(cur));
+  }
+  if (cur == 0) return false;            // couldn't read app id -> stay conservative
+  uint32_t stored = 0;
+  File f = fs->open("/.tc_fwid", "r");
+  if (f) { f.read((uint8_t*)&stored, sizeof(stored)); f.close(); }
+  if (stored == cur) return false;       // same image already booted -> normal detection
+  File w = fs->open("/.tc_fwid", "w");   // record the new image id
+  if (w) { w.write((const uint8_t*)&cur, sizeof(cur)); w.close(); }
+  return true;                           // fresh flash (OTA)
+#else
+  return false;
+#endif
+}
+
 static void tc_bootloop_marker_delete(void);           // fwd (defined below)
 
 static bool tc_bootloop_detected(void) {
@@ -433,6 +471,17 @@ static bool tc_bootloop_detected(void) {
   // can never disable autoexec. Crash resets (PANIC/WDT/BROWNOUT) and
   // power-on (handled by the QPC counter) still go through detection.
   if (esp_reset_reason() == ESP_RST_SW) {
+    tc_bootloop_marker_delete();
+    return false;
+  }
+  // Fix C: a fresh firmware image (OTA) is several quick reboots (Upgrade ->
+  // safeboot -> new app, each <8 s) that inflate Tasmota's QPC flash counter
+  // even though it is NOT a crash loop. On the first boot of a new image, clear
+  // that inflation and don't trip. A genuine post-OTA crash loop (e.g. a slot
+  // touching the net before WiFi is up -> heap corruption -> unlogged reset)
+  // still trips on the following same-image boots.
+  if (tc_fresh_firmware_boot()) {
+    UpdateQuickPowerCycle(false);                      // clear the OTA's QPC inflation
     tc_bootloop_marker_delete();
     return false;
   }
@@ -689,6 +738,11 @@ static void TinyCInit(void) {
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Memory allocation failed (%d bytes)"), needed);
     return;
   }
+#ifdef ESP32
+  // Create the file-handle reservation mutex ONCE here (loopTask, before any VM task
+  // spawns) so tc_alloc_file_handle() has no lazy first-call race across slot tasks.
+  if (!tc_file_handle_mutex) tc_file_handle_mutex = xSemaphoreCreateMutex();
+#endif
   // calloc() zeroes memory but doesn't call C++ constructors for embedded objects.
   // WiFiUDP (NetworkUDP) needs proper construction or begin() crashes (NULL deref).
   new (&Tinyc->udp) WiFiUDP();
@@ -747,6 +801,12 @@ static void TinyCEvery50ms(void) {
   }
 #else
   // ESP8266: slice-based execution in 50ms tick (no FreeRTOS task support)
+  // Skip the whole tick when the cont stack can't yield (e.g. this tick was
+  // re-entered while a /cm web request is in flight — ctx:sys). Running the VM
+  // here would reach a bare yield()/delay() (the slice WDT-feed below, or a
+  // delay() syscall inside the program) and panic __yield (core_esp8266_main.cpp:
+  // 133). The slice just resumes on the next clean tick. (gemu's 8266 TinyC test.)
+  if (!can_yield()) return;
   // Only slot 0 on ESP8266
   TcSlot *s = Tinyc->slots[0];
   if (s && s->loaded && s->running) {
@@ -771,11 +831,16 @@ static void TinyCEvery50ms(void) {
         s->running = false;
       }
     } else {
-      yield();  // Feed WDT before VM execution
+      // Feed the WDT around the slice. MUST be optimistic_yield, NOT bare yield():
+      // this 8266 VM tick can run RE-ENTRANTLY while a /cm web request is in flight
+      // (HandleHttpCommand yields -> loop -> FUNC_EVERY_50ms -> here). A bare yield()
+      // in that nested can't-yield context panics __yield (core_esp8266_main.cpp:133,
+      // "ctx: sys"). optimistic_yield() yields only when can_yield() is true.
+      optimistic_yield(1000);  // feed WDT before VM execution (skipped if can't yield)
       tc_current_slot = s;
       int err = tc_vm_run_slice(&s->vm, Tinyc->instr_per_tick);
       tc_current_slot = nullptr;
-      yield();  // Feed WDT after VM execution
+      optimistic_yield(1000);  // feed WDT after VM execution
 
       if (err != TC_OK && err != TC_ERR_PAUSED) {
         tc_free_all_frames(&s->vm);
@@ -786,17 +851,59 @@ static void TinyCEvery50ms(void) {
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Runtime error: %s (PC=%d, instr=%u)"),
           tc_error_str(err), s->vm.pc - s->vm.code_offset, s->vm.instruction_count);
         s->running = false;
+      } else if (s->vm.halted) {
+        // Clean halt DURING this slice (main() returned: the slice returns
+        // TC_OK, so the error branch above does NOT catch it). Finalize the halt
+        // HERE, in the SAME tick — do not leave the slot "halted-but-still-
+        // running" until the next tick's top-of-tick halt branch. That one-tick
+        // window is the ESP8266 WDT wedge: loop()'s SleepDelay() then runs
+        // against a halted slot that just queued console output (print/addLog)
+        // and hangs — which is why every OUTPUT-producing program HW-WDT'd while
+        // no-output ones (which also halt, but quietly) survived to the next
+        // tick. Mirrors the top-of-tick clean-halt branch: free frames, flush
+        // output, clear running. Heap is kept — event-driven callbacks key on
+        // vm.halted (not running), so EverySecond/WebCall still fire after this.
+        tc_free_all_frames(&s->vm);
+        tc_current_slot = s;
+        tc_output_flush();
+        tc_current_slot = nullptr;
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Program halted after %u instructions, %d callbacks"),
+          s->vm.instruction_count, s->vm.callback_count);
+        s->running = false;
       }
     }
   }
 #endif  // ESP32 vs ESP8266
 
-  // Execute deferred commands (audio etc.) only when VM is halted and idle
-  // Must not run while VM task is active -- concurrent SD access causes crashes
-  // Check slot 0 for deferred exec (shared infrastructure)
-  {
-    TcSlot *s0 = Tinyc->slots[0];
-    if (s0 && s0->loaded && s0->vm.halted && s0->vm.error == TC_OK) {
+  // Execute deferred commands (audio etc.) only when NO slot is actively executing --
+  // running a blocking command (SD/audio) concurrently with a VM callback or a TaskLoop
+  // task causes crashes. (Previously gated on slot 0 being vm.halted, which is NEVER true
+  // for an event-driven slot -- one with EverySecond/WebCall callbacks -- nor when slot 0
+  // is empty; so deferred commands from such slots stalled forever, e.g. an alarm's
+  // I2STTS never fired. Scan every slot's running + task_running instead of trusting slot 0.)
+  if (Tinyc->deferred_pending) {
+    bool busy = false;
+    for (uint32_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      // task_running = the FreeRTOS TaskLoop flag; ESP32-only (ESP8266 has no TaskLoop task).
+      if (s && s->loaded && (s->running
+#ifdef ESP32
+            || s->task_running
+#endif
+          )) { busy = true; break; }
+    }
+    // Starvation-timeout fallback: a slot with an infinite main() loop (task_running
+    // stays true forever -- e.g. an esf37_scale BLE poller) would keep `busy` true
+    // forever and starve the GLOBAL deferred queue, so an event-driven slot's
+    // tasmDefer'd command (e.g. webradio I2SWR) never dispatches. Once a command has
+    // waited past TC_DEFER_MAX_WAIT_MS, run it anyway -- the deferring slot is idle and
+    // the still-busy slot is doing unrelated work; the main-loop exec already avoids
+    // the task-context crash that tasmDefer guards against.
+    if (!busy || (uint32_t)(millis() - Tinyc->deferred_since) > TC_DEFER_MAX_WAIT_MS) {
+      if (busy) {
+        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: deferred '%s' forced after %ums (slot busy)"),
+          Tinyc->deferred_cmd, (uint32_t)(millis() - Tinyc->deferred_since));
+      }
       tc_deferred_exec();
     }
   }
@@ -1219,8 +1326,16 @@ void CmndTinyC(void) {
     return;
   }
 
-  // Show status for all slots
+  // Show status for all slots. MaxBlk = largest contiguous INTERNAL-DRAM block
+  // (the metric the share-table heap fix lifts ~31->~120 KB); PsrFree = free PSRAM.
+#ifdef ESP32
+  Response_P(PSTR("{\"TinyC\":{\"Heap\":%d,\"MaxBlk\":%d,\"PsrFree\":%d,\"Slots\":["),
+    ESP_getFreeHeap(),
+    (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+    (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#else
   Response_P(PSTR("{\"TinyC\":{\"Heap\":%d,\"Slots\":["), ESP_getFreeHeap());
+#endif
   bool first = true;
   for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
     TcSlot *s = Tinyc->slots[i];
@@ -1406,6 +1521,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
     }
   }
   TcSlot *s = Tinyc->slots[slot_num];
+  TC_HEAPLOG("loadfile.in");
 
   File file;
   if (ufsp) file = ufsp->open(path, "r");
@@ -1441,8 +1557,29 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   }
 #endif
   if (!s->program) { file.close(); return false; }
-  file.read(s->program, fsize);
+  // VERIFY the read — under SD bus contention (e.g. .135: LVGL display flushes
+  // starving the SD while VM tasks run) file.read() can return short or fail
+  // outright; the old unchecked read handed a part-garbage buffer to
+  // tc_vm_load, which could "succeed" into a broken slot or leave the slot
+  // silently empty while the command reported Done. One re-read after a short
+  // pause rides out a transient stall; a second failure is LOUD and fatal.
+  size_t rd = file.read(s->program, fsize);
+  if (rd != fsize) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: %s short read (%u/%u) — retrying"),
+           path, (unsigned)rd, (unsigned)fsize);
+    delay(50);
+    file.seek(0);
+    rd = file.read(s->program, fsize);
+  }
   file.close();
+  if (rd != fsize) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load %s FAILED: read %u of %u bytes (SD busy/faulty?)"),
+           path, (unsigned)rd, (unsigned)fsize);
+    free(s->program);
+    s->program = nullptr;
+    s->program_size = 0;
+    return false;
+  }
   s->program_size = fsize;
   int err = tc_vm_load(&s->vm, s->program, fsize);
   if (err == TC_OK) {
@@ -1451,6 +1588,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
     strlcpy(Tinyc->slot_config[slot_num].filename, path, sizeof(Tinyc->slot_config[slot_num].filename));
     TinyCSetPersistFile(s, path);
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Loaded %s (%d bytes) into slot %d"), path, fsize, slot_num);
+    TC_HEAPLOG("loadfile.out");
     return true;
   }
   AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load %s failed: %s"), path, tc_error_str(err));
@@ -1519,79 +1657,6 @@ static void HandleTinyCPage(void) {
       if (cs) cs->autoexec = Tinyc->slot_config[cmd_slot].autoexec;
       TinyCSaveSettings();
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d autoexec=%d"), cmd_slot, Tinyc->slot_config[cmd_slot].autoexec ? 1 : 0);
-    } else if (cmd == "download" && Webserver->hasArg(F("rfile"))) {
-#ifdef USE_UFILESYS
-      // Download .tcb from remote repository
-      String rfile = Webserver->arg(F("rfile"));
-      if (rfile.length() > 0) {
-        // Read base URL from /tinyc_repo.cfg, fall back to default repo
-        char repo_url[200] = {};
-        File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
-        if (rcfg) {
-          int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
-          rcfg.close();
-          while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
-        }
-        if (!repo_url[0]) {
-          strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
-        }
-        if (repo_url[0]) {
-          // Build full URL: base_url/filename
-          String url = String(repo_url);
-          if (!url.endsWith("/")) url += "/";
-          url += rfile;
-          // Download to filesystem
-          char fpath[48];
-          snprintf(fpath, sizeof(fpath), "/%s", rfile.c_str());
-#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-          HTTPClientLight http;
-#else
-          WiFiClient http_client;
-          HTTPClient http;
-#endif
-          http.setTimeout(10000);
-#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-          bool begun = http.begin(url);
-#else
-          bool begun = http.begin(http_client, url);
-#endif
-          if (begun) {
-            int httpCode = http.GET();
-            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-              File f = ufsp->open(fpath, "w");
-              if (f) {
-                WiFiClient *stream = http.getStreamPtr();
-                int32_t len = http.getSize();
-                if (len < 0) len = 999999;
-                uint8_t *dbuf = (uint8_t *)malloc(512);
-                if (dbuf) {
-                  while (http.connected() && (len > 0)) {
-                    size_t avail = stream->available();
-                    if (avail) {
-                      if (avail > 512) avail = 512;
-                      int rd = stream->readBytes(dbuf, avail);
-                      f.write(dbuf, rd);
-                      len -= rd;
-                    }
-                    delay(1);
-                  }
-                  free(dbuf);
-                }
-                int fsize = (int)f.size();
-                f.close();
-                AddLog(LOG_LEVEL_INFO, PSTR("TCC: Downloaded %s (%d bytes)"), fpath, fsize);
-                // Load into selected slot
-                TinyCLoadFile(fpath, cmd_slot);
-                TinyCSaveSettings();
-              }
-            } else {
-              AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Download failed HTTP %d"), httpCode);
-            }
-            http.end();
-          }
-        }
-      }
-#endif
     } else if (cmd == "delall") {
 #ifdef USE_UFILESYS
       // Delete all .tcb files from both filesystems
@@ -1758,154 +1823,71 @@ static void HandleTinyCPage(void) {
         "Delete All .tcb</button>"
         "</div></form></p></fieldset>"));
 
-      // --- Remote repository selector ---
-      // Read repo URL from /tinyc_repo.cfg, fall back to default repo.
-      //
-      // The HTTPS GET to fetch index.txt runs synchronously on the loop
-      // task — on weak WiFi (RSSI worse than ~-75 dBm) it has been
-      // observed to take 50+ seconds, starving Tasmota's main loop and
-      // crashing the device via the RTC watchdog. Two safeguards:
-      //
-      //   1. Cache the index across visits (TC_REPO_CACHE_MS, default
-      //      60 s). Re-rendering from cache is instant; only the first
-      //      visit per minute hits the network. Force a refresh by
-      //      adding ?refresh=1 to /tc.
-      //   2. Cap any single fetch at TC_REPO_FETCH_MS (default 2000 ms).
-      //      `setTimeout()` is interpreted differently across
-      //      Arduino-ESP32 versions (sometimes seconds, sometimes ms);
-      //      `setConnectTimeout()` is the unambiguous one. We set both,
-      //      narrow, so the worst-case loop-task block is bounded.
-      //
-      // Override at build time: -DTC_REPO_CACHE_MS=N -DTC_REPO_FETCH_MS=N
-      #ifndef TC_REPO_CACHE_MS
-      #define TC_REPO_CACHE_MS  60000
-      #endif
-      #ifndef TC_REPO_FETCH_MS
-      // 2026-05-07: bumped 2000 → 5000. The 2 s cap was too tight for github's
-      // TLS handshake from devices with moderate WiFi (RSSI ~-66 dBm) — fetch
-      // silently timed out, repo section vanished from /tc. 5 s is still well
-      // under the ESP32 task watchdog (which is 5 s by default but bumpable).
-      #define TC_REPO_FETCH_MS   5000
-      #endif
-      static String   tc_repo_index;        // last successful index.txt body
-      static uint32_t tc_repo_index_ms = 0; // millis() of last successful fetch
+      // --- Remote repository selector (fetched CLIENT-SIDE; see the <script> below) ---
       {
         char repo_url[200] = {};
+        bool cfg_present = false;
         File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
         if (rcfg) {
+          cfg_present = true;
           int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
           rcfg.close();
           while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
         }
-        if (!repo_url[0]) {
+        // No cfg file -> default repo. An EMPTY /tinyc_repo.cfg = repo sync OFF
+        // (repo_url stays empty -> the fetch below is skipped entirely).
+        if (!repo_url[0] && !cfg_present) {
           strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
         }
         if (repo_url[0]) {
-          bool cache_fresh = tc_repo_index.length() > 0 &&
-                             (millis() - tc_repo_index_ms) < TC_REPO_CACHE_MS;
-          bool force_refresh = Webserver->hasArg(F("refresh"));
-          if (!cache_fresh || force_refresh) {
-            // Fetch index.txt from repo (bounded by TC_REPO_FETCH_MS)
-            String idx_url = String(repo_url);
-            if (!idx_url.endsWith("/")) idx_url += "/";
-            idx_url += "index.txt";
-#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-            HTTPClientLight http;
-#else
-            WiFiClient http_client;
-            HTTPClient http;
-#endif
-#ifdef ESP32
-            // ESP32 HTTPClient + HTTPClientLight both expose setConnectTimeout
-            // (bounds the TCP connect + TLS handshake phase). ESP8266's
-            // ESP8266HTTPClient class doesn't have it, so we rely on
-            // setTimeout alone there — sufficient since ESP8266 builds
-            // generally use plain HTTP (no TLS handshake to bound).
-            http.setConnectTimeout(TC_REPO_FETCH_MS);
-#endif
-            http.setTimeout(TC_REPO_FETCH_MS);
-#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
-            bool begun = http.begin(idx_url);
-#else
-            bool begun = http.begin(http_client, idx_url);
-#endif
-            uint32_t fetch_t0 = millis();
-            int httpCode = -1;
-            int body_len = 0;
-            if (begun) {
-              httpCode = http.GET();
-              if (httpCode == HTTP_CODE_OK) {
-                String body = http.getString();
-                body_len = body.length();
-                if (body_len > 0) {
-                  tc_repo_index    = body;
-                  tc_repo_index_ms = millis();
-                }
-              }
-              http.end();
-            }
-            uint32_t fetch_dt = millis() - fetch_t0;
-            // Log whenever the fetch fails OR took longer than the cap +
-            // some slack — so silent "Repository section disappeared from
-            // /tc" cases are diagnosable from the serial log.
-            if (!begun) {
-              AddLog(LOG_LEVEL_INFO,
-                PSTR("TCC: repo index.txt fetch — http.begin() failed for %s"),
-                idx_url.c_str());
-            } else if (httpCode != HTTP_CODE_OK) {
-              AddLog(LOG_LEVEL_INFO,
-                PSTR("TCC: repo index.txt fetch — HTTP %d after %u ms (cap %u, %s)"),
-                httpCode, (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS,
-                (httpCode < 0) ? "timeout/conn err" : "non-200");
-            } else if (body_len == 0) {
-              AddLog(LOG_LEVEL_INFO,
-                PSTR("TCC: repo index.txt fetch — empty body after %u ms"),
-                (unsigned)fetch_dt);
-            } else if (fetch_dt > TC_REPO_FETCH_MS + 500) {
-              AddLog(LOG_LEVEL_INFO,
-                PSTR("TCC: repo index.txt fetch took %u ms (cap %u) — slow link?"),
-                (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS);
-            }
+          // Repo index + .tcb download run CLIENT-SIDE (in the browser): the device
+          // does ZERO remote I/O for the repository. A synchronous HTTPS GET on the
+          // loop task here (index.txt, on every /tc render) blocked the whole device
+          // for minutes when DNS/TLS was slow -- worst on a multi-slot C3 with a
+          // fragmented heap, since setConnectTimeout/setTimeout don't bound DNS -- and
+          // the loop block didn't trip the watchdog, so the device went dead-but-not-
+          // rebooting. GitHub raw sends access-control-allow-origin:* so the browser
+          // fetches index.txt + each .tcb directly; the .tcb is POSTed to /tc_upload
+          // (local FS only). (gemu 2026-06-24)
+          WSContentSend_P(PSTR(
+            "<fieldset><legend><b> Repository </b></legend>"
+            "<div style='display:flex;gap:8px;align-items:center'>"
+            "<select id='tcrf' style='flex:1'><option>loading...</option></select>"
+            "<select id='tcrs' style='width:auto'>"));
+          for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+            WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
           }
-          // Render from cache (whether just-fetched or older). If empty
-          // (first-ever visit failed), the section is silently omitted —
-          // a subsequent visit will retry and populate it.
-          if (tc_repo_index.length() > 0) {
-            WSContentSend_P(PSTR(
-              "<fieldset><legend><b> Repository </b></legend>"
-              "<p><form action='/tc' method='get'>"
-              "<div style='display:flex;gap:8px;align-items:center'>"
-              "<select name='rfile' style='flex:1'>"));
-            // Parse index.txt: one filename per line
-            int pos = 0;
-            while (pos < (int)tc_repo_index.length()) {
-              int nl = tc_repo_index.indexOf('\n', pos);
-              if (nl < 0) nl = tc_repo_index.length();
-              String line = tc_repo_index.substring(pos, nl);
-              line.trim();
-              if (line.length() > 0 && line.endsWith(".tcb")) {
-                WSContentSend_P(PSTR("<option value='%s'>%s</option>"),
-                  line.c_str(), line.c_str());
-              }
-              pos = nl + 1;
-            }
-            WSContentSend_P(PSTR(
-              "</select>"
-              "<select name='slot' style='width:auto'>"));
-            for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-              WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
-            }
-            // Include a "Refresh" button so the user can force a fresh
-            // GET when they've added a new .tcb to the repo.
-            uint32_t age_s = (millis() - tc_repo_index_ms) / 1000;
-            WSContentSend_P(PSTR(
-              "</select></div>"
-              "<br><button name='cmd' value='download' class='button bgrn'>"
-              "Download &amp; Load</button>"
-              " <a href='/tc?refresh=1' class='button' style='background:#888;padding:4px 10px'>"
-              "&#x21bb; Refresh list (cached %us)</a>"
-              "</form></p></fieldset>"), (unsigned)age_s);
-          }
+          WSContentSend_P(PSTR(
+            "</select></div>"
+            "<br><button id='tcdlb' class='button bgrn' onclick='tcDl()'>Download &amp; Load</button>"
+            " <button class='button' style='background:#888' onclick='tcFill(1)'>&#x21bb; Refresh list</button>"
+            "<div id='tcrmsg' style='font-size:.85em;opacity:.7;margin-top:4px'></div>"
+            "</fieldset>"));
+          WSContentSend_P(PSTR(
+            "<script>var TCREPO='%s';"
+            "function tcB(){var b=TCREPO;return b.charAt(b.length-1)=='/'?b.slice(0,-1):b}"
+            "function tcFill(f){var s=document.getElementById('tcrf');"
+            "fetch(tcB()+'/index.txt',{cache:f?'reload':'default'}).then(function(r){"
+            "if(!r.ok)throw r.status;return r.text()}).then(function(t){"
+            "var ls=t.split(String.fromCharCode(10)).map(function(x){return x.trim()})"
+            ".filter(function(x){return x.slice(-4)=='.tcb'});s.innerHTML='';"
+            "if(!ls.length){s.innerHTML='<option>(empty)</option>';return}"
+            "ls.forEach(function(n){var o=document.createElement('option');"
+            "o.value=n;o.textContent=n;s.appendChild(o)})}).catch(function(e){"
+            "s.innerHTML='<option>(list failed)</option>';"
+            "document.getElementById('tcrmsg').textContent='Repo list fetch failed: '+e})}"
+            "function tcDl(){var f=document.getElementById('tcrf').value,"
+            "sl=document.getElementById('tcrs').value,b=document.getElementById('tcdlb'),"
+            "m=document.getElementById('tcrmsg');if(!f||f.charAt(0)=='('){return}"
+            "b.disabled=1;b.textContent='Downloading...';m.textContent='';"
+            "fetch(tcB()+'/'+f).then(function(r){if(!r.ok)throw r.status;return r.arrayBuffer()})"
+            ".then(function(buf){var fd=new FormData();fd.append('file',new Blob([buf]),f);"
+            "return fetch('/tc_upload?api=1&slot='+sl+'&fsz='+buf.byteLength,{method:'POST',body:fd})})"
+            ".then(function(r){if(!r.ok)throw r.status;"
+            "m.textContent='Loaded '+f+' to slot '+sl+', reloading...';"
+            "setTimeout(function(){location.reload()},900)}).catch(function(e){"
+            "b.disabled=0;b.textContent='Download & Load';m.textContent='Failed: '+e})}"
+            "tcFill(0);</script>"), repo_url);
         }
       }
     }
@@ -2289,7 +2271,18 @@ void TinyCPrefixReheal(void) {
     }
   }
   // Flush the durable prefix change once, on the main task (never the VM task).
+#ifndef ESP8266
   if (tc_cfg_prefix_dirty) { tc_cfg_prefix_dirty = false; TinyCSaveSettings(); }
+#else
+  // ESP8266: do NOT persist the durable command prefix. TinyCSaveSettings() writes
+  // the 4 KB Tasmota Settings block to flash; doing that on the addCommand() that
+  // every program with a Command() handler runs (via the reheal LEARN above) WDT-
+  // reset the 8266 (rst cause:4) — the blocking flash write in the tick context tips
+  // LoadAvg over. The LIVE cmd_prefix (set directly by SYS_ADD_COMMAND) handles
+  // command dispatch and the RAM-sticky cmd_prefix_saved handles re-registration; only
+  // the cross-reboot durable copy (an ESP32 multi-slot robustness feature) is dropped.
+  tc_cfg_prefix_dirty = false;  // clear so it doesn't linger set
+#endif
 }
 
 #ifdef USE_UFILESYS
@@ -2507,6 +2500,7 @@ static void HandleTinyCUpload(void) {
     }
     Tinyc->upload_received = 0;
     Tinyc->upload_active = true;
+    TC_HEAPLOG("upload.start");
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
     // If a prior phase (malloc fail, slot fail) already marked this upload
@@ -2583,6 +2577,7 @@ static void HandleTinyCUpload(void) {
     } else {
       if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
     }
+    TC_HEAPLOG("upload.end");
     Tinyc->upload_active = false;
   }
 }
@@ -2711,10 +2706,13 @@ static void HandleTinyCApi(void) {
       // Status JSON never exposes it); works on ESP32 + ESP8266 (both provide
       // ESP_getMaxAllocHeap/ESP_getFreeHeap). Used by the device-scanner Frag column.
       uint32_t fh = ESP_getFreeHeap();
+      uint32_t maxblk = ESP_getMaxAllocHeap();   // largest contiguous free block (the number that actually matters)
       result += String(fh);
-      int frag = fh ? (int)(100 - (uint64_t)ESP_getMaxAllocHeap() * 100 / fh) : 0;
+      int frag = fh ? (int)(100 - (uint64_t)maxblk * 100 / fh) : 0;
       result += F(",\"frag\":");
       result += String(frag);
+      result += F(",\"maxblk\":");               // absolute largest block; frag% is only maxblk/free, so this is what to watch
+      result += String(maxblk);
     }
     result += '}';
     Webserver->send(200, F("application/json"), result);
@@ -3718,10 +3716,25 @@ static void HandleTinyCIde(void) {
     // instead. Bug: gemu's setup AND Andreas's VBox setup both saw
     // `Location: http://_I:-1883461440/ide` with the regression
     // introduced by commit bb72b46f7.
-    IPAddress ip = WiFi.localIP();
-    char loc[80];
-    snprintf_P(loc, sizeof(loc), PSTR("http://%u.%u.%u.%u:%d/ide"),
-               ip[0], ip[1], ip[2], ip[3], TC_DLPORT);
+    // Prefer the Host header the browser already used to reach us. On
+    // Ethernet-only devices — or when WiFi is in AP-fallback with the STA
+    // side unconfigured — WiFi.localIP() returns 0.0.0.0, which produced an
+    // unreachable http://0.0.0.0:82/ide redirect. The Host header carries the
+    // IP or mDNS name the client actually connected on, so it is correct
+    // across Ethernet, WiFi-STA and reverse-proxy setups alike. Strip any
+    // :port before re-appending the dedicated download port. (Andreas, ETH-only.)
+    String host = Webserver->hostHeader();
+    int colon = host.indexOf(':');
+    if (colon >= 0) { host = host.substring(0, colon); }
+    char loc[128];
+    if (host.length()) {
+      snprintf_P(loc, sizeof(loc), PSTR("http://%s:%d/ide"),
+                 host.c_str(), TC_DLPORT);
+    } else {
+      IPAddress ip = WiFi.localIP();  // last-resort fallback
+      snprintf_P(loc, sizeof(loc), PSTR("http://%u.%u.%u.%u:%d/ide"),
+                 ip[0], ip[1], ip[2], ip[3], TC_DLPORT);
+    }
     Webserver->sendHeader(F("Location"), loc);
     WSSend_P(302, PSTR("text/plain"), PSTR("Redirecting to background IDE server"));
     return;
@@ -3851,13 +3864,17 @@ static void TinyC_WebSetVar(uint8_t slot_idx) {
   String sv = Webserver->arg(F("sv"));
   int sep = sv.indexOf('_');
   if (sep > 0) {
-    int32_t gidx = sv.substring(0, sep).toInt();
+    int32_t gidx = sv.substring(0, sep).toInt() & 0x0FFF;   // strip slot bits 12-14 (tc_widget_id)
     String val = sv.substring(sep + 1);
-    if (gidx >= 0 && gidx < TC_MAX_GLOBALS) {
+    // Bound to the slot's ACTUAL globals array (max(64, script's global_size)),
+    // NOT TC_MAX_GLOBALS (512). globals is calloc'd to globals_size, so an out-of-
+    // range widget id (crafted/stale ?sv=) would otherwise write past the array
+    // -> heap corruption. (gemu 2026-06-24)
+    if (gidx >= 0 && gidx < (int32_t)s->vm.globals_size) {
       if (val.startsWith("s_")) {
         // String value: write chars as int32 into globals[gidx..]
         const char *str = val.c_str() + 2;
-        int32_t maxLen = TC_MAX_GLOBALS - gidx - 1;
+        int32_t maxLen = (int32_t)s->vm.globals_size - gidx - 1;
         int i;
         for (i = 0; i < maxLen && str[i]; i++) {
           s->vm.globals[gidx + i] = (int32_t)(uint8_t)str[i];
@@ -3892,6 +3909,87 @@ static void TinyC_WebSetVar(uint8_t slot_idx) {
 // Serve raw framebuffer binary: 8-byte header + raw pixel data
 static bool tc_mirror_busy = false;
 
+// The JPEG mirror needs esp32-camera's software encoder (fmt2jpg_cb / jpge, RGB565).
+// That encoder builds on the Xtensa ESP32 family (classic / S2 / S3) WITHOUT the
+// camera driver — so gate by ARCHITECTURE, not by USE_WEBCAM/USE_TINYC_CAMERA. A
+// camera-less display node (e.g. ILI9488p16) gets a real JPEG mirror this way;
+// verified on .135. Excluded: P4 (has HW jpeg, handled separately) and C3/C6
+// (RISC-V — the SW encoder isn't built there), whose callers fall back to raw.
+#if defined(ESP32) && !defined(CONFIG_IDF_TARGET_ESP32P4) && \
+    !defined(CONFIG_IDF_TARGET_ESP32C3) && !defined(CONFIG_IDF_TARGET_ESP32C6)
+#ifndef TC_MIRROR_JPEG        // allow a user_config_override.h to force it elsewhere
+#define TC_MIRROR_JPEG 1
+#endif
+#endif
+
+#ifdef TC_MIRROR_JPEG
+// JPEG sink: fmt2jpg_cb streams encoded chunks here (into a caller-owned PSRAM
+// buffer) so a big RGB565 frame leaves as a ~50-150KB JPEG instead of 1-2MB of
+// raw that the fragmented internal pbuf pool can't push out (the raw send stalled
+// at ~5% on the 85%-frag RA8876). index = running offset.
+struct TcJpgSink { uint8_t *buf; uint32_t cap; uint32_t len; };
+static size_t tc_jpg_sink_cb(void *arg, size_t index, const void *data, size_t len) {
+  TcJpgSink *s = (TcJpgSink *)arg;
+  if (data && len && (index + len) <= s->cap) {
+    memcpy(s->buf + index, data, len);
+    s->len = index + len;
+  }
+  return len;
+}
+// Encode an RGB565 buffer to JPEG (q85) and stream it as image/jpeg — used by both
+// the LVGL snapshot mirror and the internal framebuffer mirror (the latter drops
+// its old 2:1 downscale for a full-res JPEG). swap=true byte-swaps a PSRAM scratch
+// copy first (little-endian source; never mutate a live framebuffer in place).
+// rot(0..3) is sent as X-Rot so the viewer re-orients the decoded image.
+// (P4 has no SW jpeg encoder -> compiled out; callers fall back to raw/downscale.)
+static void tc_mirror_send_jpeg(const uint8_t *rgb565, uint16_t w, uint16_t h, bool swap, uint8_t rot) {
+  uint32_t npx = (uint32_t)w * h;
+  const uint8_t *src = rgb565;
+  uint8_t *scratch = nullptr;
+  if (swap) {
+    scratch = (uint8_t *)heap_caps_malloc(npx * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scratch) { Webserver->send(503, F("text/plain"), "No PSRAM (swap)"); return; }
+    const uint16_t *si = (const uint16_t *)rgb565; uint16_t *di = (uint16_t *)scratch;
+    for (uint32_t i = 0; i < npx; i++) { uint16_t v = si[i]; di[i] = (uint16_t)((v >> 8) | (v << 8)); }
+    src = scratch;
+  }
+  uint32_t jcap = 384 * 1024;
+  uint8_t *jbuf = (uint8_t *)heap_caps_malloc(jcap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!jbuf) { if (scratch) heap_caps_free(scratch); Webserver->send(503, F("text/plain"), "No PSRAM (jpeg)"); return; }
+  TcJpgSink jsink = { jbuf, jcap, 0 };
+  OsWatchLoop();
+  bool jok = fmt2jpg_cb((uint8_t *)src, npx * 2, w, h, PIXFORMAT_RGB565, 85, tc_jpg_sink_cb, &jsink);
+  OsWatchLoop();
+  if (scratch) heap_caps_free(scratch);
+  if (jok && jsink.len > 0 && jsink.len <= jcap) {
+    char rs[2] = { (char)('0' + (rot & 3)), 0 };
+    Webserver->sendHeader(F("X-Rot"), rs);
+    Webserver->sendHeader(F("Connection"), F("close"));
+    Webserver->setContentLength(jsink.len);
+    Webserver->send(200, F("image/jpeg"), "");
+    WiFiClient lc = Webserver->client();
+    lc.setNoDelay(true); lc.setTimeout(5);
+    uint32_t lsent = 0; uint32_t t0 = millis();
+    while (lsent < jsink.len) {
+      if (!lc.connected()) break;
+      if ((uint32_t)(millis() - t0) > 35000) break;
+      uint32_t chunk = jsink.len - lsent; if (chunk > 1460) chunk = 1460;
+      int n = lc.write(jbuf + lsent, chunk);
+      if (n <= 0) { delay(2); continue; }
+      lsent += (uint32_t)n; yield();
+    }
+    lc.flush(); delay(50);
+    struct linger lin = {1, 0};
+    setsockopt(lc.fd(), SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+    lc.stop();
+  } else {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: mirror JPEG encode failed (%dx%d)"), w, h);
+    Webserver->send(500, F("text/plain"), "JPEG encode failed");
+  }
+  heap_caps_free(jbuf);
+}
+#endif
+
 static void HandleTinyCDisplayRaw(void) {
   // Reject if a previous transfer is still in progress
   if (tc_mirror_busy) {
@@ -3913,27 +4011,33 @@ static void HandleTinyCDisplayRaw(void) {
   if (tc_lvgl_active()) {
     uint8_t *sdata; uint16_t sw, sh; void *shandle;
     if (tc_lvgl_snapshot(&sdata, &sw, &sh, &shandle)) {
-      uint32_t lv_fb_size = (uint32_t)sw * sh * 2;   // RGB565, 2 bytes/px
-      uint8_t lh[8];
-      lh[0] = sw & 0xFF; lh[1] = (sw >> 8) & 0xFF;
-      lh[2] = sh & 0xFF; lh[3] = (sh >> 8) & 0xFF;
-      lh[4] = 16;        // bpp 16 (RGB565)
-      lh[5] = 0;         // swap=0, rot=0 — snapshot is already in logical orientation
-      lh[6] = 0; lh[7] = 0;
+#ifdef TC_MIRROR_JPEG
+      // snapshot is little-endian + already in logical orientation -> swap, rot 0
+      tc_mirror_send_jpeg((uint8_t *)sdata, sw, sh, true, 0);
+#else
+      // no SW JPEG encoder (P4 HW jpeg / C3 / C6 / ...) -> send raw RGB565 (bounded resilient loop)
+      uint32_t lv_fb_size = (uint32_t)sw * sh * 2;
+      uint8_t lh[8] = { (uint8_t)(sw & 0xFF), (uint8_t)(sw >> 8), (uint8_t)(sh & 0xFF), (uint8_t)(sh >> 8), 16, 0, 0, 0 };
       Webserver->sendHeader(F("Connection"), F("close"));
       Webserver->setContentLength(8 + lv_fb_size);
       Webserver->send(200, F("application/octet-stream"), "");
       WiFiClient lc = Webserver->client();
       lc.setNoDelay(true); lc.setTimeout(5);
       lc.write(lh, 8);
-      uint32_t lsent = 0;
+      uint32_t lsent = 0; uint32_t t0 = millis();
       while (lsent < lv_fb_size) {
         if (!lc.connected()) break;
-        uint32_t chunk = lv_fb_size - lsent; if (chunk > 512) chunk = 512;
-        lc.write(sdata + lsent, chunk);
-        lsent += chunk; yield();
+        if ((uint32_t)(millis() - t0) > 35000) break;
+        uint32_t chunk = lv_fb_size - lsent; if (chunk > 1460) chunk = 1460;
+        int n = lc.write(sdata + lsent, chunk);
+        if (n <= 0) { delay(2); continue; }
+        lsent += (uint32_t)n; yield();
       }
-      lc.flush(); delay(50); lc.stop();
+      lc.flush(); delay(50);
+      struct linger lin = {1, 0};
+      setsockopt(lc.fd(), SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+      lc.stop();
+#endif
       tc_lvgl_snapshot_free(shandle);
       tc_mirror_busy = false;
       tc_global_pause = false;
@@ -4002,6 +4106,15 @@ static void HandleTinyCDisplayRaw(void) {
   // Scale factor: 2=half (400x240=192KB), 1=full (800x480=768KB)
   #define DISPLAY_MIRROR_SCALE 2
   if (abs_bpp == 16 && rgb && fb_size > 32768) {
+#ifdef TC_MIRROR_JPEG
+    // Full-res JPEG (no downscale) — sharper AND smaller than the old 2:1 raw.
+    // swap derived from the panel's swap_color (verify on-device; flip the '!' if
+    // red/blue come out wrong); rot so the viewer re-orients it.
+    tc_mirror_send_jpeg((uint8_t *)rgb, rw, rh, !(renderer->lvgl_param.swap_color), rot);
+    tc_mirror_busy = false;
+    tc_global_pause = false;
+    return;
+#endif
     uint16_t dw = rw / DISPLAY_MIRROR_SCALE;
     uint16_t dh = rh / DISPLAY_MIRROR_SCALE;
     uint32_t line_bytes = dw * 2;
@@ -4127,8 +4240,8 @@ static void HandleTinyCDisplayHTML(void) {
     "<div class='ctrl'>"
     "<button onclick='go()'>Refresh</button>"
     "<label>Scale: <select id='sc' onchange='rsc()'>"
-    "<option value='1'>1x</option>"
-    "<option value='2' selected>2x</option>"
+    "<option value='1' selected>1x</option>"
+    "<option value='2'>2x</option>"
     "<option value='4'>4x</option>"
     "</select></label>"
     "<button onclick='dl()'>Save PNG</button>"
@@ -4201,10 +4314,23 @@ static void HandleTinyCDisplayHTML(void) {
     "document.getElementById('st').textContent='Loading...';"
     "try{"
     "var ac=new AbortController();"
-    "var to=setTimeout(function(){ac.abort();},30000);"
+    "var to=setTimeout(function(){ac.abort();},40000);"
     "var r=await fetch('/tc_display?raw=1',{signal:ac.signal});"
     "clearTimeout(to);"
     "if(!r.ok)throw 'HTTP '+r.status;"
+    "var ct=r.headers.get('content-type')||'';"
+    "if(ct.indexOf('jpeg')>=0){"            // LVGL / RGB panels stream a JPEG — browser decodes it
+    "var rt=parseInt(r.headers.get('x-rot')||'0');"
+    "var bmp=await createImageBitmap(await r.blob());var bw=bmp.width,bh=bmp.height;"
+    "if(rt==1||rt==3){cv.width=bh;cv.height=bw;}else{cv.width=bw;cv.height=bh;}"
+    "cx.save();"
+    "if(rt==1){cx.translate(bh,0);cx.rotate(Math.PI/2);}"
+    "else if(rt==2){cx.translate(bw,bh);cx.rotate(Math.PI);}"
+    "else if(rt==3){cx.translate(0,bw);cx.rotate(-Math.PI/2);}"
+    "cx.drawImage(bmp,0,0);cx.restore();"
+    "rsc();"
+    "document.getElementById('st').textContent=cv.width+'x'+cv.height+' jpeg';"
+    "}else{"                                  // EPD/OLED panels send raw: 8-byte header + pixels
     "var ab=await r.arrayBuffer(),dv=new DataView(ab);"
     "var w=dv.getUint16(0,1),h=dv.getUint16(2,1),"
     "bpp=dv.getInt8(4),fl=dv.getUint8(5);"
@@ -4222,6 +4348,7 @@ static void HandleTinyCDisplayHTML(void) {
     "rsc();"
     "document.getElementById('st').textContent="
     "dw+'x'+dh+' bpp='+bpp;"
+    "}"
     "}catch(e){"
     "document.getElementById('st').textContent='Error: '+e;}}"
     "go();"
@@ -4320,7 +4447,7 @@ static void HandleTinyCWebOn(uint8_t handler_num) {
   // a kept-alive TCP socket — Jackery Homepower 2000 Ultra and friends.
   // Existing webOn scripts that just call webSend() see byte-identical
   // wire format vs. the old eager-WSContentBegin path.
-  tc_slot_callback(s, "WebOn");
+  tc_slot_callback(s, "WebOn", TC_WEB_CB_WAIT);
 
   if (Tinyc->web_content_begun) {
     WSContentEnd();
@@ -4421,8 +4548,8 @@ static void TC_CamStreamTask(void) {
 
 void TC_CamStreamInit(void) {
   if (tc_cam_stream.server) return;  // already running
-  // Defer if WiFi not ready (early boot autoexec)
-  if (!WifiHasIP()) {
+  // Defer if no routable IP yet (early boot autoexec) -- WiFi OR Ethernet
+  if (!HasIP()) {
     tc_cam_stream.pending = 1;
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server deferred (no WiFi)"));
     return;
@@ -4454,8 +4581,8 @@ void TC_CamStreamStop(void) {
 }
 
 static void TC_CamStreamLoop(void) {
-  // Deferred init: create server once WiFi is ready
-  if (tc_cam_stream.pending && !tc_cam_stream.server && WifiHasIP()) {
+  // Deferred init: create server once we have a routable IP (WiFi OR Ethernet)
+  if (tc_cam_stream.pending && !tc_cam_stream.server && HasIP()) {
     TC_CamStreamInit();
   }
   if (tc_cam_stream.server) {
@@ -4552,8 +4679,26 @@ static void HandleTinyCUI(void) {
   }
   Tinyc->current_page = page;
 
-  // Find the slot that registered this page
-  uint8_t si = (page < Tinyc->page_count) ? Tinyc->page_slot[page] : 0;
+  // Pick the slot for this page. Prefer the slot that registered it; but if no page
+  // is registered (page_count==0) or that slot is gone/unloaded/has no WebUI, fall
+  // back to the first LOADED slot that actually has a WebUI callback — never a
+  // hardcoded slot 0, which may be empty and would 503 the generic "TinyC UI" button
+  // (the common case: one or more label-less WebUI slots, none of them slot 0).
+  uint8_t si = (page < Tinyc->page_count) ? Tinyc->page_slot[page] : 0xFF;
+  {
+    TcSlot *cand = (si < TC_MAX_VMS) ? Tinyc->slots[si] : nullptr;
+    if (!(cand && cand->loaded && cand->vm.error == TC_OK && tc_has_callback(&cand->vm, "WebUI"))) {
+      si = 0xFF;
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TcSlot *c = Tinyc->slots[i];
+        if (c && c->loaded && c->vm.error == TC_OK && tc_has_callback(&c->vm, "WebUI")) { si = i; break; }
+      }
+    }
+  }
+  if (si >= TC_MAX_VMS) {     // no loaded slot has a WebUI -> nothing to render
+    Webserver->send(503, "text/plain", "TinyC not ready");
+    return;
+  }
   TcSlot *s = Tinyc->slots[si];
   if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
     Webserver->send(503, "text/plain", "TinyC not ready");
@@ -4580,7 +4725,7 @@ static void HandleTinyCUI(void) {
   // AJAX mode (m=1): just re-render widgets via WebUI() callback
   if (Webserver->hasArg(F("m"))) {
     WSContentBegin(200, CT_HTML);
-    tc_slot_callback(s, "WebUI");
+    tc_slot_callback(s, "WebUI", TC_WEB_CB_WAIT);
     WSContentEnd();
     return;
   }
@@ -4626,7 +4771,7 @@ static void HandleTinyCUI(void) {
     "</script>"
   ), page);
   WSContentSend_P(PSTR("<div id='ui'>"));
-  tc_slot_callback(s, "WebUI");
+  tc_slot_callback(s, "WebUI", TC_WEB_CB_WAIT);
   WSContentSend_P(PSTR("</div>"));
   WSContentSpaceButton(BUTTON_MAIN);
   WSContentEnd();
@@ -4677,7 +4822,7 @@ static void TinyCShow(bool json) {
       // problem, address it via xSemaphoreTake-with-timeout in tc_slot_callback
       // rather than by removing the pre-check.
       if (s->loaded && s->vm.halted && s->vm.error == TC_OK && s != tc_sensor_get_slot) {
-        tc_slot_callback(s, "JsonCall");
+        tc_slot_callback(s, "JsonCall", TC_WEB_CB_WAIT);
       }
     }
   }
@@ -4704,8 +4849,22 @@ static void TinyCShow(bool json) {
       // Call user's WebCall() on this slot — pre-check restored 2026-05-07,
       // see JsonCall comment above. The /?m=1 polling path is the primary
       // trigger for the multi-slot hang regression introduced by 7be97b97b.
+      // Each script's WebCall output is framed in its own card (a fieldset in a
+      // full-width cell, with its own nested table so the 2-column layout is
+      // preserved) so multiple scripts on the main page are visually separated
+      // with a gap. webCard(0) opts a slot out (s->web_nocard) -> bare rows.
       if (s->loaded && s->vm.halted && s->vm.error == TC_OK) {
-        tc_slot_callback(s, "WebCall");
+        bool card = (!s->web_nocard) && tc_has_callback(&s->vm, "WebCall");
+        if (card) {
+          WSContentSend_P(PSTR(
+            "<tr><td colspan='2' style='padding:0'>"
+            "<fieldset style='border:1px solid rgba(150,150,150,.4);border-radius:8px;"
+            "margin:5px 2px;padding:2px 9px 5px'>"
+            "<legend style='font-size:11px;opacity:.55;padding:0 5px'>slot %d</legend>"
+            "<table style='width:100%%'>"), i);
+        }
+        tc_slot_callback(s, "WebCall", TC_WEB_CB_WAIT);
+        if (card) { WSContentSend_P(PSTR("</table></fieldset></td></tr>")); }
       }
     }
   }
@@ -4721,8 +4880,26 @@ static void TinyCShow(bool json) {
 #ifdef ESP32
 
 // Background task: streams file to client then exits
+// Download request handed from the port-82 handler to its background task.
+// CRITICAL: the WiFiClient (NetworkClient — a shared_ptr to the connection) is
+// copied IN THE HANDLER, while WebServer::_currentClient still owns the socket.
+// The handler returns without send(), so handleClient() immediately does
+// `_currentClient = NetworkClient()` — dropping the server's reference. On S3
+// the SD hangs on SPI (polling), so the spawned task keeps the CPU through
+// ufsp->open() and grabbed dl_server->client() before that reset (worked). On
+// the P4 the SD is native SDMMC/SDIO: open() blocks on a semaphore, loopTask
+// resumes and clears _currentClient first, and the task then grabbed an already
+// closed socket -> "Empty reply from server" (Andreas, P4/ETH). Holding our own
+// copy here keeps the socket alive scheduling-independently. (client is a full
+// member, not a pointer, so the copy's refcount is what matters.)
+struct TcDlReq {
+  WiFiClient client;
+  char path[128];
+};
+
 static void tc_download_task(void *param) {
-  char *path = (char*)param;
+  TcDlReq *req = (TcDlReq*)param;
+  char *path = req->path;
 
   // Parse @from_to time range from path
   uint32_t cmp_from = 0, cmp_to = 0;
@@ -4739,10 +4916,24 @@ static void tc_download_task(void *param) {
     }
   }
 
-  File file = ufsp->open(path, "r");
+  // Resolve target FS from the path prefix, same as the port-83 upload server:
+  // "/ufs/ffs/backup.csv" -> flash, "/ufs/sdfs/x" -> SD, else ufsp. Lets a Flash
+  // backup be downloaded back for md5-verify without a global dir switch. (Done
+  // AFTER the @-range split so the prefix sees the clean path.)
+  FS *fsp = tc_file_path(path);
+  if (!fsp) fsp = ufsp;
+  File file = fsp->open(path, "r");
   if (!file) {
+    // Previously the task just returned here — no HTTP response at all, so even
+    // on S3 a missing file gave "Empty reply" instead of a 404. Send a real 404
+    // over the held client now.
+    req->client.print(F("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n\r\nNot found\r\n"));
+    delay(20);
+    req->client.stop();
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: DL file not found: %s"), path);
-    free(path);
+    delete req;
     Tinyc->dl_busy = false;
     vTaskDelete(NULL);
     return;
@@ -4760,8 +4951,14 @@ static void tc_download_task(void *param) {
     strcpy_P(ctype, PSTR("application/octet-stream"));
   }
 
-  WiFiClient client = Tinyc->dl_server->client();
+  WiFiClient &client = req->client;   // the copy grabbed in the handler (see TcDlReq)
   uint32_t fsize = file.size();
+
+  // Bound client.write() with a send timeout so a stalled or vanished peer (e.g. a
+  // curl that gave up during a slow scan) can't block this task forever — that would
+  // leave dl_busy stuck true and every future /ufs download would return 503.
+  { struct timeval _tv; _tv.tv_sec = 3; _tv.tv_usec = 0;
+    setsockopt(client.fd(), SOL_SOCKET, SO_SNDTIMEO, &_tv, sizeof(_tv)); }
 
   // Extract just the filename for Content-Disposition
   char *fname = strrchr(path, '/');
@@ -4771,6 +4968,7 @@ static void tc_download_task(void *param) {
     // -- Time-filtered download --
     client.printf_P(PSTR("HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
       "Content-Disposition: attachment; filename=\"%s\"\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
       "Transfer-Encoding: chunked\r\n"
       "Connection: close\r\n\r\n"), ctype, fname);
 
@@ -4800,27 +4998,37 @@ static void tc_download_task(void *param) {
         if (dot) strcpy(dot, ".ind");
         else strcat(indpath, ".ind");
 
-        File ind = ufsp->open(indpath, "r");
+        File ind = fsp->open(indpath, "r");   // same FS as the data file
         if (ind) {
-          // Skip header
-          while (ind.available()) {
-            uint8_t c; ind.read(&c, 1);
-            if (c == '\n') break;
-          }
+          // Buffered scan: a byte-at-a-time read of a multi-MB .ind is ~25 s on SD,
+          // long enough that the client times out mid-scan -> hung write -> stuck
+          // dl_busy. Read in 1 KB blocks and accumulate lines in lbuf; a header line
+          // (cmp==0) is skipped naturally. Find the last index entry BEFORE cmp_from.
           uint32_t last_good_pos = 0;
-          while (ind.available()) {
-            li = 0;
-            while (ind.available() && li < 510) {
-              uint8_t c; ind.read(&c, 1);
-              lbuf[li++] = c;
-              if (c == '\n') break;
+          uint8_t *blk = (uint8_t*)malloc(1024);
+          if (blk) {
+            uint32_t li2 = 0;
+            bool done = false;
+            while (!done) {
+              int got = ind.read(blk, 1024);
+              if (got <= 0) break;
+              for (int bi = 0; bi < got; bi++) {
+                uint8_t c = blk[bi];
+                if (c == '\n') {
+                  lbuf[li2] = 0;
+                  uint32_t cmp = tc_ts_cmp(lbuf);
+                  if (cmp != 0) {
+                    if (cmp >= cmp_from) { done = true; break; }
+                    char *tab = strchr(lbuf, '\t');
+                    if (tab) last_good_pos = strtoul(tab + 1, NULL, 10);
+                  }
+                  li2 = 0;
+                } else if (li2 < 510) {
+                  lbuf[li2++] = c;
+                }
+              }
             }
-            lbuf[li] = 0;
-            uint32_t cmp = tc_ts_cmp(lbuf);
-            if (cmp == 0) continue;
-            if (cmp >= cmp_from) break;
-            char *tab = strchr(lbuf, '\t');
-            if (tab) last_good_pos = strtoul(tab + 1, NULL, 10);
+            free(blk);
           }
           seek_pos = last_good_pos;
           ind.close();
@@ -4875,6 +5083,7 @@ static void tc_download_task(void *param) {
       else file.seek(header_end, SeekSet);
 
       while (file.available()) {
+        if (!client.connected()) break;   // peer gave up -> stop so cleanup clears dl_busy
         li = 0;
         while (file.available() && li < 510) {
           uint8_t c; file.read(&c, 1);
@@ -4904,13 +5113,18 @@ static void tc_download_task(void *param) {
     }
   } else {
     // -- Full file download --
+    // Access-Control-Allow-Origin lets a page on port 80 (e.g. Andreas's SD<->Flash
+    // sync/restore UI) READ this body via a cross-port fetch(), the download twin of
+    // the port-83 upload CORS header — so a Flash restore needs no /ufsd?dir switch.
     client.printf_P(PSTR("HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
       "Content-Disposition: attachment; filename=\"%s\"\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
       "Content-Length: %d\r\n"
       "Connection: close\r\n\r\n"), ctype, fname, fsize);
 
     uint8_t buf[512];
     while (fsize > 0) {
+      if (!client.connected()) break;   // peer gave up -> stop so cleanup clears dl_busy
       uint16_t len = (fsize < sizeof(buf)) ? fsize : sizeof(buf);
       file.read(buf, len);
       client.write(buf, len);
@@ -4921,7 +5135,7 @@ static void tc_download_task(void *param) {
 
   file.close();
   client.stop();
-  free(path);
+  delete req;                 // frees the held WiFiClient copy + path buffer
   Tinyc->dl_busy = false;
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: DL task done"));
   vTaskDelete(NULL);
@@ -4948,14 +5162,23 @@ static void TC_DLServeFile(void) {
   }
 
   Tinyc->dl_busy = true;
-  char *path = (char*)malloc(128);
-  if (!path) {
+  // Grab the client HERE (handler context) — _currentClient is still valid.
+  // See TcDlReq: deferring this into the task races handleClient()'s client
+  // reset and loses deterministically on the P4 (SDMMC open() blocks).
+  TcDlReq *req = new (std::nothrow) TcDlReq();
+  if (!req) {
     Tinyc->dl_busy = false;
     Tinyc->dl_server->send(500, F("text/plain"), F("Out of memory"));
     return;
   }
-  strlcpy(path, cp, 128);
-  xTaskCreatePinnedToCore(tc_download_task, "TCDL", 6000, (void*)path, 3, NULL, 1);
+  req->client = Tinyc->dl_server->client();
+  strlcpy(req->path, cp, sizeof(req->path));
+  if (xTaskCreatePinnedToCore(tc_download_task, "TCDL", 6000, (void*)req, 3, NULL, 1) != pdPASS) {
+    delete req;
+    Tinyc->dl_busy = false;
+    Tinyc->dl_server->send(500, F("text/plain"), F("Task spawn failed"));
+    return;
+  }
 }
 
 // Root handler
@@ -4980,11 +5203,14 @@ static void TC_DLRoot(void) {
 static bool tc_ide_busy = false;
 
 static void tc_ide_serve_task(void *param) {
-  // Match the tc_download_task pattern: take the client from the dl_server
-  // INSIDE the task, not before spawning. This is what the existing /ufs/*
-  // path does and is known to work — the framework keeps the client alive
-  // after the handler returns since no send() was called.
-  WiFiClient client = Tinyc->dl_server->client();
+  // The client is copied in the HANDLER (TC_DLServeIDE) and handed over here,
+  // same as tc_download_task/TcDlReq. Grabbing it inside the task raced
+  // handleClient()'s _currentClient reset and lost on the P4 (SDMMC open()
+  // blocks the task, loopTask closes the socket first). We now own a copy from
+  // the handler, so the socket survives regardless of scheduling.
+  WiFiClient *cp = (WiFiClient*)param;
+  WiFiClient client = *cp;
+  delete cp;
 
   // Locate the file: try ufsp (SD/user) first then ffsp (flash). Prefer .gz.
   bool gzipped = false;
@@ -5056,15 +5282,230 @@ static void TC_DLServeIDE(void) {
     return;
   }
   tc_ide_busy = true;
+  // Grab the client in the handler (see tc_ide_serve_task / TcDlReq).
+  WiFiClient *cp = new (std::nothrow) WiFiClient(Tinyc->dl_server->client());
+  if (!cp) {
+    tc_ide_busy = false;
+    Tinyc->dl_server->send(500, F("text/plain"), F("Out of memory"));
+    return;
+  }
   BaseType_t rc = xTaskCreatePinnedToCore(
-      tc_ide_serve_task, "TCIDE", 4096, NULL, 3, NULL, 1);
+      tc_ide_serve_task, "TCIDE", 4096, (void*)cp, 3, NULL, 1);
   if (rc != pdPASS) {
+    delete cp;
     tc_ide_busy = false;
     Tinyc->dl_server->send(500, F("text/plain"), F("Task spawn failed"));
     return;
   }
   // Note: NOT calling send() — the task writes its own response directly
   // to the client. This matches the existing tc_download_task pattern.
+}
+
+/*********************************************************************************************\
+ * Port 83 Upload Server -- raw-socket large-file upload on its OWN FreeRTOS task
+ *
+ * Large uploads through the port-80 file manager (/ufsu) run the ENTIRE multipart body
+ * (network read + LittleFS write) inside ONE WebServer handleClient() call on loopTask,
+ * so a ~400 KB file blocks loopTask long enough to trip the task WDT -> truncation +
+ * reboot (Andreas / Gerhard both hit this uploading a ~420 KB MP3).
+ *
+ * This is an INDEPENDENT raw-TCP listener on its own task. loopTask is never touched, so
+ * arbitrarily large files stream in at task priority while the main loop stays live. It is
+ * ADDITIVE — the port-82 download WebServer is left completely untouched.
+ *
+ * Protocol (curl-friendly, NO multipart):
+ *   POST /ufs/<path> HTTP/1.1
+ *   Content-Length: <nbytes>            (or ?fsz=<nbytes> in the URL as a fallback)
+ *   <raw file bytes>
+ * Reply: "200 OK ... OK <n> bytes"  or  4xx/5xx with a one-line reason.
+ *
+ *   curl --data-binary @big.mp3 "http://<ip>:83/ufs/SND/big.mp3"
+\*********************************************************************************************/
+
+#ifndef TC_ULPORT
+#define TC_ULPORT 83
+#endif
+
+static WiFiServer *tc_ul_server = nullptr;
+
+// Minimal one-shot HTTP reply on the raw socket (Content-Length + close so curl
+// reads the whole body and tears down cleanly).
+static void tc_ul_reply(WiFiClient &client, const char *status, const char *body) {
+  // Access-Control-Allow-Origin: * lets a page served on port 80 (the file
+  // manager, or a user's own settings page) READ this reply after a CROSS-ORIGIN
+  // fetch() upload — a large file is POSTed here (own task, off loopTask) instead
+  // of to the panic-prone /ufsu on port 80. A text/plain body keeps the fetch a
+  // CORS "simple request" (no OPTIONS preflight to answer).
+  client.printf_P(PSTR("HTTP/1.1 %s\r\nContent-Type: text/plain\r\n"
+                       "Access-Control-Allow-Origin: *\r\n"
+                       "Connection: close\r\nContent-Length: %u\r\n\r\n%s"),
+                  status, (unsigned)strlen(body), body);
+}
+
+// Service one accepted upload connection. Runs on the upload task, never loopTask.
+static void tc_ul_handle(WiFiClient &client) {
+  // Bound the whole exchange with a socket recv timeout so a stalled peer can't
+  // pin the task forever.
+  { struct timeval _tv; _tv.tv_sec = 15; _tv.tv_usec = 0;
+    setsockopt(client.fd(), SOL_SOCKET, SO_RCVTIMEO, &_tv, sizeof(_tv)); }
+
+  // --- read the request line + headers into a bounded buffer, stopping EXACTLY at
+  // the blank line so any body bytes that arrived in the same TCP segment stay in
+  // the socket for the body loop below. ---
+  char hdr[600];
+  int hlen = 0;
+  bool have_hdr = false;
+  uint32_t idle = 0;
+  while (hlen < (int)sizeof(hdr) - 1) {
+    int c = client.read();
+    if (c < 0) {
+      if (!client.connected() && client.available() <= 0) break;
+      delay(3);
+      if ((idle += 3) > 15000) break;
+      continue;
+    }
+    idle = 0;
+    hdr[hlen++] = (char)c;
+    if (hlen >= 4 && hdr[hlen-1] == '\n' && hdr[hlen-2] == '\r'
+                  && hdr[hlen-3] == '\n' && hdr[hlen-4] == '\r') { have_hdr = true; break; }
+  }
+  hdr[hlen] = 0;
+  if (!have_hdr) { tc_ul_reply(client, "400 Bad Request", "headers too large or timeout"); return; }
+
+  // --- method must be POST ---
+  if (strncmp_P(hdr, PSTR("POST "), 5) != 0) {
+    tc_ul_reply(client, "405 Method Not Allowed", "POST /ufs/<path> only"); return;
+  }
+
+  // --- request target (between "POST " and " HTTP/..") ---
+  char target[160];
+  { char *ts = hdr + 5;
+    char *te = strchr(ts, ' ');
+    int tl = te ? (int)(te - ts) : 0;
+    if (tl <= 0 || tl >= (int)sizeof(target)) { tc_ul_reply(client, "400 Bad Request", "bad target"); return; }
+    memcpy(target, ts, tl); target[tl] = 0; }
+
+  // --- optional ?fsz= (fallback size), then strip the query ---
+  uint32_t fsz_url = 0;
+  { char *q = strchr(target, '?');
+    if (q) {
+      char *fp = strstr_P(q, PSTR("fsz="));
+      if (fp) fsz_url = (uint32_t)strtoul(fp + 4, nullptr, 10);
+      *q = 0;
+    } }
+
+  // --- require /ufs/ prefix; keep the leading '/' of the fs path ---
+  if (strncmp_P(target, PSTR("/ufs/"), 5) != 0) {
+    tc_ul_reply(client, "404 Not Found", "path must be /ufs/<file>"); return;
+  }
+  char *path = target + 4;          // "/ufs/SND/x.mp3" -> "/SND/x.mp3"
+  // Resolve the TARGET filesystem from the path prefix, same convention the VM
+  // file syscalls use (tc_file_path): "/ufs/ffs/backup.csv" -> flash (ffsp),
+  // "/ufs/sdfs/x" -> SD (ufsp), anything else -> ufsp (active/SD). This gives a
+  // Flash-backup target WITHOUT a global /ufsd?dir switch (Andreas's wish) — the
+  // prefix is stripped in place, so `path` is the on-fs path after this call.
+  FS *fsp = tc_file_path(path);
+
+  // --- Content-Length (case-insensitive) ---
+  uint32_t clen = 0;
+  for (char *p = hdr; *p; p++) {
+    if ((*p == 'C' || *p == 'c') && 0 == strncasecmp(p, "content-length:", 15)) {
+      p += 15; while (*p == ' ' || *p == '\t') p++;
+      clen = (uint32_t)strtoul(p, nullptr, 10);
+      break;
+    }
+  }
+  uint32_t fsize = clen ? clen : fsz_url;
+  if (fsize == 0) { tc_ul_reply(client, "411 Length Required", "need Content-Length or ?fsz="); return; }
+  if (!fsp)       { tc_ul_reply(client, "500 No Filesystem", "no target fs"); return; }
+  // No arbitrary size cap (plain Tasmota /ufsu has none) — reject ONLY if the file
+  // won't fit the TARGET filesystem, leaving a small margin for FS metadata.
+  // UfsInfo(1, type) reports free kB for either fs (type 0 = ufsp/SD, 1 = ffsp/
+  // flash), so the pre-check follows the resolved destination — not just the
+  // active UFS. A 0 reading means "unknown" -> don't block; also naturally
+  // rejects a garbage Content-Length.
+  extern uint32_t UfsInfo(uint32_t sel, uint32_t type);
+  uint32_t free_kb = UfsInfo(1, (fsp == ffsp) ? 1 : 0);
+  if (free_kb && (fsize / 1024 + 16) > free_kb) {
+    char m[64]; snprintf_P(m, sizeof(m), PSTR("no space: need %u kB, free %u kB"),
+                           (unsigned)(fsize / 1024), (unsigned)free_kb);
+    tc_ul_reply(client, "507 Insufficient Storage", m); return;
+  }
+
+  // Honor Expect: 100-continue (curl sends it for bodies > 1 KB) AFTER validation, so
+  // a rejected request gets its final error instead — otherwise the client stalls ~1 s.
+  if (strstr_P(hdr, PSTR("100-continue"))) {
+    client.print(F("HTTP/1.1 100 Continue\r\n\r\n"));
+  }
+
+  // --- quiesce the VM tasks around the big flash write (same proven coordination
+  // as /ufsu: on a heap-tight device it stops+restarts the slots; on healthy PSRAM
+  // it keeps them live). Balanced with the single Resume below on every exit. ---
+  extern void TinyCFsWritePause(uint32_t);
+  extern void TinyCFsWriteResume(void);
+  TinyCFsWritePause(fsize);
+
+  File f = fsp->open(path, "w");
+  bool ok = false;
+  const char *err = "open failed";
+  uint32_t written = 0;
+  if (f) {
+    uint8_t *buf = (uint8_t *)malloc(2048);
+    if (!buf) { err = "oom"; }
+    else {
+      ok = true;
+      idle = 0;
+      while (written < fsize) {
+        uint32_t want = fsize - written; if (want > 2048) want = 2048;
+        // Read DIRECTLY -- do NOT gate on client.available(). After the peer's FIN, ESP32's
+        // available() can report 0 while read()/recv() still returns the last buffered bytes;
+        // gating on available() dropped the tail (Andreas: reproducible -175 B on an SD-backed
+        // device, timing-dependent so a fast LittleFS test missed it). read() drains all
+        // buffered data first and only returns <=0 at a genuine timeout (SO_RCVTIMEO) or EOF.
+        int got = client.read(buf, want);
+        if (got > 0) {
+          if ((uint32_t)f.write(buf, got) != (uint32_t)got) { ok = false; err = "write failed (fs full?)"; break; }
+          written += got;
+          idle = 0;
+          if ((written & 0x1FFF) == 0) vTaskDelay(1);   // yield ~every 8 KB so loopTask + WDT breathe
+          continue;
+        }
+        // got <= 0: nothing readable this instant. If the peer has closed, that's real EOF
+        // (the buffer is now fully drained, since read() would have returned it above).
+        if (!client.connected()) { ok = false; err = "peer closed (short body)"; break; }
+        delay(3);
+        if ((idle += 3) > 15000) { ok = false; err = "recv timeout"; break; }
+      }
+      free(buf);
+      if (ok && written != fsize) { ok = false; err = "short body"; }
+    }
+    f.close();
+    if (!ok) fsp->remove(path);   // don't leave a truncated file behind
+  }
+
+  TinyCFsWriteResume();
+
+  if (ok) {
+    char msg[48]; snprintf_P(msg, sizeof(msg), PSTR("OK %u bytes"), (unsigned)written);
+    tc_ul_reply(client, "200 OK", msg);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: upload %s <- %u bytes OK"), path, (unsigned)written);
+  } else {
+    char msg[96]; snprintf_P(msg, sizeof(msg), PSTR("FAIL %s (%u/%u)"), err, (unsigned)written, (unsigned)fsize);
+    tc_ul_reply(client, "500 Upload Failed", msg);
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: upload %s FAILED: %s (%u/%u)"), path, err, (unsigned)written, (unsigned)fsize);
+  }
+}
+
+// Dedicated task: accept + service upload connections. WiFiServer serializes them
+// (one accepted client at a time), so uploads never overlap.
+static void tc_upload_server_task(void *param) {
+  for (;;) {
+    WiFiClient client = tc_ul_server->available();
+    if (!client) { vTaskDelay(pdMS_TO_TICKS(25)); continue; }
+    tc_ul_handle(client);
+    delay(30);          // let the reply drain before FIN
+    client.stop();
+  }
 }
 
 // Initialize port 82 download server
@@ -5077,6 +5518,17 @@ static void TC_DLServerInit(void) {
     Tinyc->dl_server->on("/", HTTP_GET, TC_DLRoot);
     Tinyc->dl_server->begin();
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Download server started on port %d"), TC_DLPORT);
+  }
+  // Raw-socket large-file upload server on its OWN task (port 83) — additive, keeps
+  // the whole upload off loopTask (see the Port 83 Upload Server block above).
+  if (!tc_ul_server) {
+    tc_ul_server = new WiFiServer(TC_ULPORT);
+    if (tc_ul_server) {
+      tc_ul_server->begin();
+      tc_ul_server->setNoDelay(true);
+      xTaskCreatePinnedToCore(tc_upload_server_task, "TCUL", 8192, NULL, 3, NULL, 1);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload server started on port %d"), TC_ULPORT);
+    }
   }
 }
 
@@ -5263,6 +5715,9 @@ struct TcSpawnTask {
   uint8_t       slot_idx;         // 0..TC_MAX_VMS-1
   volatile uint8_t stop_requested;
   volatile uint8_t running;       // 1 while FreeRTOS task alive
+#ifdef USE_TINYC_WORKER_VM
+  TcVM         *worker_vm;        // Option 2: the worker's OWN VM (NULL = borrow shared VM)
+#endif
 };
 
 static TcSpawnTask tc_spawn_pool[TC_MAX_SPAWN_TASKS];
@@ -5274,6 +5729,20 @@ static void tc_spawn_pool_lock(void) {
 }
 static void tc_spawn_pool_unlock(void) {
   if (tc_spawn_pool_mutex) xSemaphoreGive(tc_spawn_pool_mutex);
+}
+
+// True if the current FreeRTOS task is a live spawnTask worker (any slot). The
+// blocking-net-syscall guard (tc_net_blocked_from_callback in vm.h) uses this to
+// allow a worker's OWN httpGet/httpPost/mailSend while blocking the same call from
+// a loopTask callback that stacked on the worker during its delay(). Lock-free:
+// plain atomic pointer compare; a freed entry has handle=nullptr (won't match a
+// valid current handle), and `running` guards against a stale handle value.
+bool tc_current_is_spawn_worker() {
+  TaskHandle_t cur = xTaskGetCurrentTaskHandle();
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (tc_spawn_pool[i].running && tc_spawn_pool[i].handle == cur) return true;
+  }
+  return false;
 }
 
 // TinyCStack — list every live spawnTask worker with its FreeRTOS stack high-water
@@ -5355,6 +5824,9 @@ static void tc_spawn_task_body(void *param) {
     vm->running = true;
     TcFrame *frame = &vm->frames[vm->frame_count];
     frame->return_pc = 0;
+    frame->saved_sp = vm->sp;   // consistency: every other frame ctor sets this
+                                // (tc_vm_call_callback_idx / OP_CALL / tc_vm_task);
+                                // without it the RET leak-check compares vs garbage.
     if (!tc_frame_alloc(frame)) {
       vm->halted = true; vm->running = false;
       tc_current_slot = nullptr;
@@ -5455,6 +5927,136 @@ static void tc_spawn_task_body(void *param) {
   vTaskDelete(NULL);
 }
 
+#ifdef USE_TINYC_WORKER_VM
+// Option 2 task body: runs the spawnTask entry function on the worker's OWN TcVM (which
+// aliases the primary's globals/code) so the primary VM keeps dispatching callbacks. Meets
+// the primary only in globals[], serialised via slot->vm_mutex (released during delay()).
+// NEVER sets worker_borrowed — the primary's frame stack is untouched, so no PC=0.
+static void tc_worker_vm_body(void *param) {
+  TcSpawnTask *entry = (TcSpawnTask *)param;
+  TcSlot *slot = entry->slot;
+  TcVM   *pvm  = &slot->vm;          // primary VM — main() runs here, owns globals
+  TcVM   *vm   = entry->worker_vm;   // the worker's OWN VM
+  const char *name = entry->name;
+
+  do {
+    // Wait for the primary main() to halt so globals are fully initialised.
+    uint32_t waited = 0;
+    while (!entry->stop_requested && slot->loaded && !pvm->halted && waited < TC_SPAWN_WAIT_MAIN) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      waited += 10;
+    }
+    if (entry->stop_requested || !slot->loaded) break;
+    if (!pvm->halted) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: workerVM('%s') aborted — main never halted"), name);
+      break;
+    }
+
+    int cb_idx = -1;
+    for (uint8_t i = 0; i < vm->callback_count; i++) {
+      if (strcmp(vm->callbacks[i].name, name) == 0) { cb_idx = i; break; }
+    }
+    if (cb_idx < 0) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: workerVM('%s') — function gone after wait"), name);
+      break;
+    }
+
+    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    tc_current_slot = slot;
+
+    // Fresh frame on the worker VM (frame_count starts at 0 — its own stack).
+    vm->halted = false; vm->running = true; vm->error = TC_OK;
+    vm->sp = 0; vm->fp = 0; vm->frame_count = 0;
+    TcFrame *frame = &vm->frames[0];
+    frame->return_pc = 0;
+    frame->saved_sp = 0;
+    if (!tc_frame_alloc(frame)) {
+      vm->halted = true; vm->running = false;
+      tc_current_slot = nullptr;
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: workerVM('%s') stack alloc fail"), name);
+      break;
+    }
+    vm->fp = 0;
+    vm->frame_count = 1;
+    vm->pc = vm->code_offset + vm->callbacks[cb_idx].address;
+
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: workerVM('%s') running on slot %d (own VM)"), name, entry->slot_idx);
+
+    uint32_t count = 0;
+    while (vm->frame_count > 0
+           && !vm->halted
+           && vm->error == TC_OK
+           && !entry->stop_requested
+           && slot->loaded) {
+      int err = tc_vm_step(vm);
+      if (err == TC_ERR_PAUSED) {
+        if (vm->delayed) {
+          // Release the mutex during the sleep so primary callbacks run.
+          vm->halted = true; vm->running = false;
+          tc_current_slot = nullptr;
+          if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+          int32_t remaining = (int32_t)(vm->delay_until - millis());
+          while (remaining > 0 && !entry->stop_requested && slot->loaded) {
+            int32_t chunk = (remaining > 50) ? 50 : remaining;
+            vTaskDelay(pdMS_TO_TICKS(chunk));
+            remaining = (int32_t)(vm->delay_until - millis());
+          }
+          vm->delayed = false;
+          if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+          tc_current_slot = slot;
+          if (entry->stop_requested || !slot->loaded) break;
+          vm->halted = false; vm->running = true;
+        }
+        continue;
+      }
+      if (err != TC_OK) {
+        vm->error = err;
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: workerVM('%s') err %d at PC=%u"), name, err, vm->pc);
+        tc_crash_log(err, vm->pc, vm->instruction_count, name);
+        break;
+      }
+      count++;
+      vm->instruction_count++;
+      if ((count & 0xFFFF) == 0) {
+        vm->halted = true; vm->running = false;
+        if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+        vTaskDelay(1);
+        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        tc_current_slot = slot;
+        if (entry->stop_requested || !slot->loaded) break;
+        vm->halted = false; vm->running = true;
+      }
+    }
+
+    while (vm->frame_count > 0) {
+      tc_frame_free(&vm->frames[--vm->frame_count]);
+    }
+    vm->halted = true; vm->running = false;
+    tc_output_flush();
+    tc_current_slot = nullptr;
+    if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+  } while (0);
+
+  // Tear down the worker VM (private stack/frames/heap only; aliased arrays untouched).
+  slot->has_worker_vm = false;
+  tc_free_worker_vm(vm);
+  entry->worker_vm = nullptr;
+
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: workerVM('%s') finished%s"),
+         name, entry->stop_requested ? " (killed)" : "");
+  tc_spawn_pool_lock();
+  entry->handle = nullptr;
+  entry->running = 0;
+  entry->stop_requested = 0;
+  entry->slot = nullptr;
+  entry->slot_idx = 0xFF;
+  entry->name[0] = 0;
+  tc_spawn_pool_unlock();
+  vTaskDelete(NULL);
+}
+#endif  // USE_TINYC_WORKER_VM
+
 // Called from SYS_SPAWN_TASK / SYS_SPAWN_TASK_STACK syscalls.
 // stack_kb=0 → use default. Returns pool index (0..N-1) or -1.
 int tc_spawn_task_create(const char *name, uint16_t stack_kb) {
@@ -5488,13 +6090,22 @@ int tc_spawn_task_create(const char *name, uint16_t stack_kb) {
   }
 
   tc_spawn_pool_lock();
-  // Already running on same slot? Refuse — user must killTask first.
+  // ONE worker per slot. The slot's single vm_mutex / VM can't drive two parallel spawnTask
+  // workers: the second runs but the FIRST silently freezes after one loop (no error/log) —
+  // Andreas hit exactly this with a timer-worker + an arm-worker on one slot. So refuse ANY
+  // second spawn on the same slot (not just a same-named one); the script must keep to a single
+  // spawnTask and do the rest in TaskLoop().
   for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
-    if (tc_spawn_pool[i].running
-        && tc_spawn_pool[i].slot_idx == sidx
-        && strcmp(tc_spawn_pool[i].name, name) == 0) {
+    if (tc_spawn_pool[i].running && tc_spawn_pool[i].slot_idx == sidx) {
+      bool same_name = (strcmp(tc_spawn_pool[i].name, name) == 0);
+      char other[TC_SPAWN_NAME_LEN];
+      strlcpy(other, tc_spawn_pool[i].name, sizeof(other));
       tc_spawn_pool_unlock();
-      AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') already running on slot %d"), name, sidx);
+      if (same_name) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') already running on slot %d"), name, sidx);
+      } else {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') refused — slot %d already runs worker '%s'; only ONE spawnTask per slot, do the rest in TaskLoop()"), name, sidx, other);
+      }
       return -1;
     }
   }
@@ -5516,19 +6127,40 @@ int tc_spawn_task_create(const char *name, uint16_t stack_kb) {
   entry->stop_requested = 0;
   entry->running = 1;
   entry->handle = nullptr;
+#ifdef USE_TINYC_WORKER_VM
+  entry->worker_vm = nullptr;
+#endif
   tc_spawn_pool_unlock();
+
+  TaskFunction_t body = tc_spawn_task_body;   // default: borrow the shared VM (headless)
+#ifdef USE_TINYC_WORKER_VM
+  // Option 2: give the worker its OWN VM so the primary VM keeps dispatching callbacks
+  // (worker + local UI on one slot). On OOM, worker_vm stays NULL -> fall back to borrow.
+  entry->worker_vm = tc_alloc_worker_vm(tc_current_slot, cb_idx);
+  if (entry->worker_vm) {
+    tc_current_slot->has_worker_vm = true;
+    body = tc_worker_vm_body;
+  }
+#endif
 
   uint16_t stack_bytes = (stack_kb ? stack_kb : TC_SPAWN_STACK_DEF) * 1024;
   char tname[24];
   snprintf(tname, sizeof(tname), "tc_spawn_%u", (unsigned)free_idx);
   BaseType_t rc = xTaskCreatePinnedToCore(
-    tc_spawn_task_body, tname, stack_bytes, entry,
+    body, tname, stack_bytes, entry,
     tskIDLE_PRIORITY + 1, &entry->handle, 1);
   if (rc != pdPASS) {
     tc_spawn_pool_lock();
     entry->running = 0;
     entry->handle = nullptr;
     entry->name[0] = 0;
+#ifdef USE_TINYC_WORKER_VM
+    if (entry->worker_vm) {
+      tc_free_worker_vm(entry->worker_vm);
+      entry->worker_vm = nullptr;
+      tc_current_slot->has_worker_vm = false;
+    }
+#endif
     tc_spawn_pool_unlock();
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: xTaskCreate failed"));
     return -1;
@@ -5754,8 +6386,9 @@ bool Xdrv124(uint32_t function) {
       // Poll UDP multicast for incoming variables
       tc_udp_poll();
 #ifdef ESP32
-      // Lazy-init port 82 download server once WiFi is connected
-      if (!Tinyc->dl_server && WifiHasIP()) {
+      // Lazy-init port 82 download + port 83 upload servers once we have a
+      // routable IP -- WiFi OR Ethernet (Ethernet-only devices have no WiFi IP)
+      if (!Tinyc->dl_server && HasIP()) {
         TC_DLServerInit();
       }
       // Poll port 82 download server for incoming file requests
@@ -5797,6 +6430,19 @@ bool Xdrv124(uint32_t function) {
       TinyCCheckBootStable();
       TinyCFsRestartRetry();   // (B) re-start any slot whose post-write restart failed
       TinyCPrefixReheal();     // re-arm a loaded slot's command prefix if it was lost without a main() re-run
+#ifdef ESP32
+      // lwIP TCP-PCB census every ~10 s: warn when the 16-slot pool is filling. A TIME_WAIT
+      // pile-up from socket churn (web auto-refresh / un-RST-closed connects) exhausts the pool
+      // and wedges the whole net stack (no ping/HTTP) until it ages out — the self-healing freeze.
+      { static uint8_t tc_pcb_tick = 0;
+        if (++tc_pcb_tick >= 10) { tc_pcb_tick = 0;
+          uint8_t _a, _tw; tc_pcb_census(&_a, &_tw);
+          if (_a + _tw >= 12) {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: lwIP TCP PCBs active=%u time_wait=%u (pool=16) - net-wedge risk, check socket churn"), _a, _tw);
+          }
+        }
+      }
+#endif
 #ifdef USE_MATTER_C
 #ifdef TC_MATTER_AUTOSTART
       mtrc_want_start = true;   // compile-time opt-in: start Matter without a script
@@ -5911,13 +6557,20 @@ bool Xdrv124(uint32_t function) {
       TinyCShow(true);
       break;
 #ifdef USE_WEBSERVER
-    case FUNC_WEB_GET_ARG:
-      // Process sv= widget value updates from main page AJAX. The main
-      // page renders WebPage() for all slots; slot 0 remains the write
-      // target here (pre-existing multi-slot main-page assumption — the
-      // /tc_ui path above is slot-accurate).
-      TinyC_WebSetVar(0);
+    case FUNC_WEB_GET_ARG: {
+      // Process sv= widget value updates from main-page AJAX. The widget id
+      // (sv=<id>_<value>) now encodes the rendering slot in bits 12-14 (see
+      // tc_widget_id), so route the write to that slot instead of a hardcoded
+      // slot 0 — main-page widgets now work from any slot, not just slot 0.
+      uint8_t wslot = 0;
+      if (Webserver->hasArg(F("sv"))) {
+        String sva = Webserver->arg(F("sv"));
+        int wsep = sva.indexOf('_');
+        if (wsep > 0) { wslot = (uint8_t)((sva.substring(0, wsep).toInt() >> 12) & 0x07); }
+      }
+      TinyC_WebSetVar(wslot);
       break;
+    }
     case FUNC_WEB_SENSOR:
       TinyCShow(false);
       break;
@@ -5957,7 +6610,7 @@ bool Xdrv124(uint32_t function) {
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
         TcSlot *s = Tinyc->slots[i];
         if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) continue;
-        tc_slot_callback(s, "WebPage");
+        tc_slot_callback(s, "WebPage", TC_WEB_CB_WAIT);
       }
       WSContentSend_P(PSTR("</div>"));
       // Inject JavaScript for widget interactions on main page (all slots)
@@ -5986,18 +6639,18 @@ bool Xdrv124(uint32_t function) {
             has_webui = true;
           }
         }
-        // Add buttons to /tc_ui pages if any slot has WebUI callback
-        if (has_webui) {
-          if (Tinyc->page_count > 0) {
-            for (uint8_t p = 0; p < Tinyc->page_count; p++) {
-              if (Tinyc->page_label[p][0]) {
-                WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'>"
-                  "<input type='hidden' name='p' value='%d'>"
-                  "<button>%s</button></form>"), p, Tinyc->page_label[p]);
-              }
+        // /tc_ui sub-page buttons — ONLY for slots that explicitly registered a page
+        // via webPageLabel(). A bare WebUI() (no label) gets NO button: its controls
+        // are expected inline on the main page (raw HTML in WebCall, like wallbox/
+        // marstek). This kills the old generic "TinyC UI" button that appeared for any
+        // WebUI slot (and 503'd when it resolved to an empty slot 0).
+        if (has_webui && Tinyc->page_count > 0) {
+          for (uint8_t p = 0; p < Tinyc->page_count; p++) {
+            if (Tinyc->page_label[p][0]) {
+              WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'>"
+                "<input type='hidden' name='p' value='%d'>"
+                "<button>%s</button></form>"), p, Tinyc->page_label[p]);
             }
-          } else {
-            WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'><button>TinyC UI</button></form>"));
           }
         }
       }
@@ -6070,6 +6723,17 @@ bool Xdrv124(uint32_t function) {
       // disable autoexec. Real loops (no FUNC_SAVE_BEFORE_RESTART)
       // still leave the marker.
       tc_bootloop_marker_delete();
+      // Andreas 2026-07-01: also zero the QPC + fast-reboot counters, not just
+      // the marker. tc_should_skip_autoexec() checks those counters INDEPENDENTLY
+      // of the marker (qpc >= thr / fast_reboot_count >= thr), so a burst of
+      // *legitimate* reboots (an OTA + a couple of Restarts + a DeviceName/config
+      // save) can still cross the threshold on a later boot and skip autoexec.
+      // A commanded restart is graceful by definition — clear the counters so it
+      // can never be read as a crash loop. (Andreas .107, 2026-07-01.)
+      RtcReboot.fast_reboot_count = 0;
+#ifdef ESP32
+      UpdateQuickPowerCycle(false);
+#endif
       // Call user's CleanUp() callback on all active slots (like scripter's >R section)
       tc_all_callbacks_id(TC_CB_CLEAN_UP);
       // Save persist variables for all loaded slots

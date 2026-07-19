@@ -12,6 +12,7 @@
   },
   "build": {
     "srcDir": "src",
-    "includeDir": "include"
+    "includeDir": "include",
+    "extraScript": "test/prebuild_creds.py"
   }
 }

@@ -796,6 +796,10 @@ int8_t index;
 };
 
 #define SML_OPTIONS_JSON_ENABLE 1
+// bit 1 (2) = obis_line_mode (see the `smlj` variable docs)
+#define SML_OPTIONS_NO_WEB      4   // suppress the SML driver's own web (FUNC_WEB_SENSOR) rendering. A TinyC/Scripter program can
+                                    // then read the descriptor and render the values inside its OWN card (one card, no duplicate).
+                                    // Set from a script via `smlj |= 4` (Scripter) or `tasm_smlj = tasm_smlj | 4` (TinyC).
 
 struct SML_GLOBS {
   uint8_t sml_send_blocks;
@@ -2167,6 +2171,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
 					len = mp->sbsiz;
 				}
 				memmove(mp->sbuff, payload, len);
+				mp->spos = len;   // expose the decrypted block to the script (sml(-1,2)/SML_Read); SML_Decode/OBIS ignore spos
 				AddLog(LOG_LEVEL_DEBUG, PSTR("SML: decrypted block: %d bytes"), len);
 				SML_Decode(meters);
 			}
@@ -4191,6 +4196,27 @@ void SML_Init(void) {
       ef.read((uint8_t*)file_md, fsiz);
       ef.close();
       file_md[fsiz] = 0;
+      // Strip ';' comment lines and blank lines in-place so a hand-written
+      // /sml_meter.def can carry comments and blank spacers. The SML descriptor
+      // parser itself has no comment syntax — Scripter's >M section is pre-stripped
+      // before we see it, but a raw file is not. A line is a comment when its first
+      // non-blank char is ';'. Also drops '\r' so CRLF-saved files parse. (No-op for
+      // the Scripter path below, which never reaches this file branch.)
+      {
+        char *rd = file_md, *wr = file_md;
+        while (*rd) {
+          char *le = rd;
+          while (*le && *le != '\n') le++;                 // end of physical line
+          char *fc = rd;
+          while (fc < le && (*fc == ' ' || *fc == '\t' || *fc == '\r')) fc++;
+          if (fc < le && *fc != ';') {                     // keep: non-blank, non-comment
+            for (char *c = rd; c < le; c++) { if (*c != '\r') *wr++ = *c; }
+            *wr++ = '\n';
+          }
+          rd = (*le == '\n') ? le + 1 : le;
+        }
+        *wr = 0;
+      }
       lp = strstr_P(file_md, PSTR(">M"));
       if (!lp) {
         goto nfd;
@@ -5557,8 +5583,9 @@ MODBUS_TCP_HEADER tcph;
 }
 
 #ifdef USE_SML_TCP
-int32_t sml_tcp_init(struct METER_DESC *mp) {  
-  if (!TasmotaGlobal.global_state.wifi_down) {
+int32_t sml_tcp_init(struct METER_DESC *mp) {
+  //if (!TasmotaGlobal.global_state.wifi_down) {
+  if (!TasmotaGlobal.global_state.wifi_down || !TasmotaGlobal.global_state.eth_down) {
     if (!mp->client) {
       // tcp mode
 #ifdef USE_SML_TCP_SECURE
@@ -5583,6 +5610,11 @@ int32_t sml_tcp_init(struct METER_DESC *mp) {
     }
   } else {
     AddLog(LOG_LEVEL_INFO, PSTR("SML: could not connect TCP since wifi is down"));
+    // Free an existing client instead of just dropping the pointer — otherwise every
+    // wifi/eth-down pass through here (sml_tcp_check re-inits a disconnected meter)
+    // leaks the WiFiClient and its lwIP resources, slowly exhausting the TCP PCB pool
+    // (port-80 web + new Modbus connects then fail while established MQTT survives).
+    if (mp->client) { mp->client->stop(); delete mp->client; }
     mp->client = nullptr;
     return -1;
   }
@@ -6029,7 +6061,11 @@ bool Xsns53(uint32_t function) {
         break;
 #ifdef USE_WEBSERVER
       case FUNC_WEB_SENSOR:
-        if (sml_globs.ready) {
+        // The smlj/tasm_smlj bit SML_OPTIONS_NO_WEB suppresses the driver's own web
+        // rendering, so a TinyC/Scripter program can read the descriptor and render the
+        // values inside its OWN card -- avoids a duplicate SML block next to the script's
+        // card on the main page. (gemu 2026-06-23)
+        if (sml_globs.ready && !(sml_globs.sml_options & SML_OPTIONS_NO_WEB)) {
           SML_Show(0);
         }
         break;

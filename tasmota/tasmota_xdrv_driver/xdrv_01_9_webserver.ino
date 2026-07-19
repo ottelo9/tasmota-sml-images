@@ -424,10 +424,7 @@ const char HTTP_COUNTER[] PROGMEM =
   "<br><div id='t' style='text-align:center;'></div>";
 
 const char HTTP_END[] PROGMEM =
-  "<p></p><div style='text-align:center;font-size:11px;'><hr>"
-  "<a href='https://ottelo.jimdofree.com' target='_blank' style='color:#aaa;'>Tasmota %s %s</a><br>"
-  "<a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota developed " D_BY " Theo Arends</a>"
-  "</div>"
+  "<p></p><div style='text-align:right;font-size:11px;'><hr><a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota %s %s " D_BY " Theo Arends</a></div>"
   "</div>"
   "</body>"
   "</html>";
@@ -474,7 +471,8 @@ const char kEmulationOptions[] PROGMEM = D_NONE "|" D_BELKIN_WEMO "|" D_HUE_BRID
 
 const char kUploadErrors[] PROGMEM =
 //  D_UPLOAD_ERR_1 "|" D_UPLOAD_ERR_2 "|" D_UPLOAD_ERR_3 "|" D_UPLOAD_ERR_4 "|" D_UPLOAD_ERR_5 "|" D_UPLOAD_ERR_6 "|" D_UPLOAD_ERR_7 "|" D_UPLOAD_ERR_8 "|" D_UPLOAD_ERR_9;
-  D_UPLOAD_ERR_1 "|" D_UPLOAD_ERR_2 "|" D_UPLOAD_ERR_3 "|" D_UPLOAD_ERR_4 "| |" D_UPLOAD_ERR_6 "|" D_UPLOAD_ERR_7 "|" D_UPLOAD_ERR_8 "|" D_UPLOAD_ERR_9;
+  D_UPLOAD_ERR_1 "|" D_UPLOAD_ERR_2 "|" D_UPLOAD_ERR_3 "|" D_UPLOAD_ERR_4 "| |" D_UPLOAD_ERR_6 "|" D_UPLOAD_ERR_7 "|" D_UPLOAD_ERR_8 "|" D_UPLOAD_ERR_9 "|"
+  "File write failed - filesystem full or faulty";   // err 10 (English only; distinct from err 9 "too large")
 
 const uint16_t DNS_PORT = 53;
 enum HttpOptions { HTTP_OFF, HTTP_USER, HTTP_ADMIN, HTTP_MANAGER, HTTP_MANAGER_RESET_ONLY };
@@ -853,8 +851,34 @@ void WSSend(int code, int ctype, const String& content)
  * HTTP Content Chunk handler
 \*********************************************************************************************/
 
+#ifdef ESP32
+// Bound how long the loopTask can block pushing one chunked response to a slow /
+// non-draining client. Without this, sendContent() blocks indefinitely on a stalled
+// TCP send buffer; the per-chunk feedLoopWDT() in _WSContentSend then keeps the WDT
+// fed, so the old self-healing Task-WDT reboot never happens -> PERMANENT web wedge
+// under repeated reloads of a big page on a contended single core (Andreas .144
+// /zeiten, tips after 6-12 sequential reloads, stays dead until power-cycle).
+#ifndef WS_SEND_BUDGET_MS
+#define WS_SEND_BUDGET_MS 8000      // total per-response send budget (ms)
+#endif
+static uint32_t ws_send_t0 = 0;     // millis() at chunked-response start
+#include <lwip/sockets.h>   // setsockopt / SOL_SOCKET / SO_SNDTIMEO for the per-send cap in
+                            // WSContentBegin -- self-sufficient (not every device config pulls
+                            // lwip sockets in transitively; e.g. a build without USE_FTP)
+#endif
+
 void WSContentBegin(int code, int ctype) {
   Webserver->client().flush();
+#ifdef ESP32
+  // Per-write cap: SO_SNDTIMEO makes each send() give up after 2 s instead of blocking
+  // forever on a full send buffer. ws_send_t0 anchors the total-budget check below.
+  int _wsfd = Webserver->client().fd();
+  if (_wsfd >= 0) {
+    struct timeval _wstv = { 2, 0 };
+    setsockopt(_wsfd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&_wstv, sizeof(_wstv));
+  }
+  ws_send_t0 = millis();
+#endif
   WSHeaderSend();
   Webserver->setContentLength(CONTENT_LENGTH_UNKNOWN);
   WSSend(code, ctype, "");                         // Signal start of chunked content
@@ -864,6 +888,24 @@ void WSContentBegin(int code, int ctype) {
 /*-------------------------------------------------------------------------------------------*/
 
 void _WSContentSend(const char* content, size_t size) {  // Lowest level sendContent for all core versions
+#ifdef ESP32
+  // Feed the loop Task-WDT per chunk. A large page (e.g. /zeiten ~59 KB) is built and
+  // chunk-sent inside ONE handleClient() call (one loop() iteration), so on a slow or
+  // contended client (eBUS master stealing CPU on a single core) the loopTask never
+  // returns to reset the 5 s loop WDT during the send -> Task-WDT panic reboot
+  // (Andreas .144, addr2line = esp_vApplicationIdleHook). Resetting here per chunk keeps a
+  // long send under the WDT without disabling it (a genuine stall between chunks still trips).
+  feedLoopWDT();
+  // Total-send budget: if pushing this response has already blocked the loopTask too
+  // long (slow/stalled client), drop the connection and stop -- the loop is freed
+  // within the budget instead of wedging forever. SO_SNDTIMEO (set in WSContentBegin)
+  // bounds each individual write; this bounds the sum. Inert for normal fast clients
+  // (a full page sends in well under the budget, so this never fires).
+  if ((uint32_t)(millis() - ws_send_t0) > WS_SEND_BUDGET_MS) {
+    Webserver->client().stop();
+    return;
+  }
+#endif
   Webserver->sendContent(content, size);
 
   SHOW_FREE_MEM(PSTR("WSContentSend"));
@@ -3484,7 +3526,7 @@ void HandleUploadDone(void) {
   if (Web.upload_error) {
     WSContentSend_P(PSTR("%06x'>" D_FAILED "</font></b><br><br>"), WebColor(COL_TEXT_WARNING));
     char error[100];
-    if (Web.upload_error < 10) {
+    if (Web.upload_error < 11) {
       GetTextIndexed(error, sizeof(error), Web.upload_error -1, kUploadErrors);
     } else {
       snprintf_P(error, sizeof(error), PSTR(D_UPLOAD_ERROR_CODE " %d"), Web.upload_error);
@@ -3688,7 +3730,7 @@ void HandleUploadLoop(void) {
 #ifdef USE_UFILESYS
     else if (!Web.upload_error && UPL_UFSFILE == Web.upload_file_type) {
       if (!UfsUploadFileWrite(upload.buf, upload.currentSize)) {
-        Web.upload_error = 9;  // File too large
+        Web.upload_error = 10;  // File write failed (short write) -- FS full or faulty, NOT "too large"
         return;
       }
     }
