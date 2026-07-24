@@ -12663,7 +12663,7 @@ const char SCRIPT_MSG_RADIOa[] PROGMEM =
 const char SCRIPT_MSG_RADIOa0[] PROGMEM =
   "%s<fieldset><legend>%s</legend>";
 const char SCRIPT_MSG_RADIOb[] PROGMEM =
-  "<div align='left'><input type='radio' name='%s' onclick='seva(%d%,\"%s\")'%s>"
+  "<div align='left'><input type='radio' name='%s' onclick='seva(%d,\"%s\")'%s>"
 	"<label>%s</label></div>";
 const char SCRIPT_MSG_RADIOc[] PROGMEM =
   "</fieldset>";

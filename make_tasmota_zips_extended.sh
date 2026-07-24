@@ -48,16 +48,55 @@ create_zip() {
     fi
 }
 
+# --- Toleranter ZIP-Helfer: packt alle VORHANDENEN Dateien, ueberspringt
+#     einzeln fehlende (nur Warnung). Fuers Bundle sinnvoll, damit eine fehlende
+#     .bin nicht das ganze Archiv verhindert. ---
+create_zip_optional() {
+    local zip_name="$1"
+    shift
+    local present=()
+
+    echo ""
+    echo "=== Erstelle $zip_name (tolerant) ==="
+
+    for f in "$@"; do
+        if [ -f "$f" ]; then
+            present+=("$f")
+        else
+            echo "HINWEIS: uebersprungen (fehlt): $f"
+        fi
+    done
+
+    if [ "${#present[@]}" -eq 0 ]; then
+        echo "ZIP wird NICHT erstellt (keine Datei vorhanden): $zip_name"
+        return 1
+    fi
+
+    if zip -9 "$OUTPUT_DIR/$zip_name" "${present[@]}"; then
+        echo "Erstellt: $OUTPUT_DIR/$zip_name  (${#present[@]} Dateien)"
+        return 0
+    else
+        echo "FEHLER: Erstellen von $zip_name fehlgeschlagen"
+        return 2
+    fi
+}
+
 # =============================================================================
 # ESP8266 Bundle — alle ESP8266-Builds gesammelt in einem ZIP
 #   1M Flash: nur Scripter (UFILESYS fehlt → kein TinyC)
-#   4M Flash: Scripter + TinyC
+#   4M Flash: nur Scripter (kein TinyC — kein I2C fuer BinPlugin-Loader)
+#   Jeweils .bin (USB-Flash) UND .bin.gz (OTA "Use file upload").
 # =============================================================================
-create_zip "tasmota8266_bundle_ottelo.zip" \
+create_zip_optional "tasmota8266_bundle_ottelo.zip" \
+    tasmota-minimal.bin \
     tasmota-minimal.bin.gz \
+    tasmota1m_ottelo_tas.bin \
     tasmota1m_ottelo_tas.bin.gz \
+    tasmota1m_energy_ottelo_tas.bin \
     tasmota1m_energy_ottelo_tas.bin.gz \
+    tasmota1m_shelly_ottelo_tas.bin \
     tasmota1m_shelly_ottelo_tas.bin.gz \
+    tasmota4m_ottelo_tas.bin \
     tasmota4m_ottelo_tas.bin.gz || true
 
 # =============================================================================

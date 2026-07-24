@@ -376,7 +376,7 @@ struct TasmotaGlobal_t {
 
   String mqtt_data;                         // Buffer filled by Response functions
   char version[16];                         // Composed version string like 255.255.255.255
-  char image_name[64];                      // Code image and/or commit (ottelo: erweitert von 33 → 64 damit lange CODE_IMAGE_STR mit Domain reinpassen)
+  char image_name[64];                      // Code image and/or commit (ottelo: erweitert von 33 → 64 damit lange CODE_IMAGE_STR mit Domain reinpassen). Siehe auch Modifikation HTTP_END in xdrv_01_9_webserver.ino
   char hostname[33];                        // Composed Wifi hostname
   char serial_in_buffer[INPUT_BUFFER_SIZE];  // Receive buffer
   char mqtt_client[99];                     // Composed MQTT Clientname
