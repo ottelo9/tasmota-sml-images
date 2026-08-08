@@ -3910,13 +3910,23 @@ static void TinyC_WebSetVar(uint8_t slot_idx) {
 static bool tc_mirror_busy = false;
 
 // The JPEG mirror needs esp32-camera's software encoder (fmt2jpg_cb / jpge, RGB565).
-// That encoder builds on the Xtensa ESP32 family (classic / S2 / S3) WITHOUT the
-// camera driver — so gate by ARCHITECTURE, not by USE_WEBCAM/USE_TINYC_CAMERA. A
-// camera-less display node (e.g. ILI9488p16) gets a real JPEG mirror this way;
-// verified on .135. Excluded: P4 (has HW jpeg, handled separately) and C3/C6
-// (RISC-V — the SW encoder isn't built there), whose callers fall back to raw.
+// The encoder LIBRARY builds on the whole Xtensa ESP32 family (classic / S2 / S3) even
+// without the camera driver — but its DECLARATIONS only reach this file if somebody
+// pulls img_converters.h in, and exactly two places do:
+//   * xdrv_124_tinyc_vm.h   under USE_WEBCAM || USE_TINYC_CAMERA
+//   * xdrv_13_display.ino   under JPEG_PICTS
+// A camera-less display node gets the mirror through the second one (that is why it
+// worked on .135, an ILI9488p16 with JPEG_PICTS).
+//
+// ⚠️ This used to gate on ARCHITECTURE ALONE, which silently assumed one of those two
+// was always on. A display build with neither — device_esp32watch is the first —
+// failed to compile with "'fmt2jpg_cb' was not declared in this scope", pointing at
+// TinyC while the real cause was a missing include somewhere else entirely.
+// Excluded on top: P4 (HW jpeg, handled separately) and C3/C6 (RISC-V — the SW encoder
+// isn't built there). Callers fall back to raw / downscale wherever this is off.
 #if defined(ESP32) && !defined(CONFIG_IDF_TARGET_ESP32P4) && \
-    !defined(CONFIG_IDF_TARGET_ESP32C3) && !defined(CONFIG_IDF_TARGET_ESP32C6)
+    !defined(CONFIG_IDF_TARGET_ESP32C3) && !defined(CONFIG_IDF_TARGET_ESP32C6) && \
+    (defined(JPEG_PICTS) || defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
 #ifndef TC_MIRROR_JPEG        // allow a user_config_override.h to force it elsewhere
 #define TC_MIRROR_JPEG 1
 #endif
@@ -4761,9 +4771,9 @@ static void HandleTinyCUI(void) {
     "}"
     "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
     "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
-      "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+      "var o=e.innerHTML,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background,k=e.style.color;"
       "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
-      "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
+      "setTimeout(function(){e.innerHTML=o;e.style.background=c;e.style.color=k;delete e.dataset.b;},2500);}"
     "function siva(v,i){rfsh=1;la('&sv='+i+'_s_'+v);rfsh=0;}"
     "function sivat(v,i){rfsh=1;la('&sv='+i+'_t_'+v);rfsh=0;}"
     "function pr(f){if(f){lt=setTimeout(la,2000);rfsh=1;}else{clearTimeout(lt);rfsh=0;}}"
@@ -6625,9 +6635,9 @@ bool Xdrv124(uint32_t function) {
               "<script>"
               "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
               "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
-                "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+                "var o=e.innerHTML,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background,k=e.style.color;"
                 "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
-                "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
+                "setTimeout(function(){e.innerHTML=o;e.style.background=c;e.style.color=k;delete e.dataset.b;},2500);}"
               "function siva(v,i){la('&sv='+i+'_s_'+v);}"
               "function sivat(v,i){la('&sv='+i+'_t_'+v);}"
               "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"

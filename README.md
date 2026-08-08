@@ -107,17 +107,45 @@ Der **gemu-Fork** (auf dem die ottelo-Images basieren) hat einen Laufzeit-Partit
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdofree.com zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
-Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben). (Liste kann unvollständig sein)  
-- TasmotaProjekt/`tasmota/user_config_override.h`
-- TasmotaProjekt/`platformio_tasmota_cenv.ini`
-- TasmotaProjekt/`ccache_wrapper.py` <- siehe ccache (unten)
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` <- (optional) die aktuellste Scripter Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino)
-- TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` <- (optional) die aktuellste SML Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tasmota_xsns_sensor/xsns_53_sml.ino)
-- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_vm.h` <- (wichtig für TinyC) die aktuellste TinyC-VM Source aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/include/xdrv_124_tinyc_vm.h) — ändert sich fast täglich
-- TasmotaProjekt/tasmota/`tasmota.ino` <- (optional) `image_name`-Buffer von 33 auf 64 Bytes erweitert, damit lange `CODE_IMAGE_STR` (z.B. `ESP32-C3 TC ottelo.jimdofree.com`) nicht abgeschnitten werden
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` <- (optional) HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends`
-- TasmotaProjekt/boards/`esp32s3-qio.json` <- (optional) für ESP32-S3 Image (siehe `platformio_tasmota_cenv.ini`) ohne PSRAM Support, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32)
-- ggf. noch weitere Dateien, je nach Release...
+Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben). Basis ist der offizielle [Tasmota Source](https://github.com/arendst/Tasmota) in der jeweiligen Release-Version. (Liste kann unvollständig sein)
+
+**A) Meine Build-Konfiguration** (die braucht ihr immer)
+- TasmotaProjekt/`tasmota/user_config_override.h` — alle Features/Treiber (#define / #undef) + die `_tas`/`_tc`-Variantenlogik
+- TasmotaProjekt/`platformio_tasmota_cenv.ini` — meine Build-Umgebungen (envs) mit `lib_ignore`, Partitionen, `-D`-Flags
+- TasmotaProjekt/`platformio_tasmota32.ini` — **eigener Patch:** pinnt eine ältere ESP32-Platform-Version, siehe [Issue 52](https://github.com/ottelo9/tasmota-sml-images/issues/52) / [Issue 53](https://github.com/ottelo9/tasmota-sml-images/issues/53). Bei Problemen mit der neuesten Platform hier die Zeile `platform = ...` umschalten
+- TasmotaProjekt/`ccache_wrapper.py` — (optional) siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten
+- TasmotaProjekt/`boards/` — Board-Definitionen aus der gemu2015 Repo, die es im offiziellen Tasmota nicht gibt: `esp32c6cdc.json` (C6 mit USB-CDC), `esp32s2cdc.json` (S2 mit USB-CDC), `esp32p4_32m.json` (P4 mit 32M Flash). Nur nötig, wenn ihr das jeweilige Board in `platformio_tasmota_cenv.ini` verwendet.
+  Die ESP32-S3-Boards (`esp32s3-qio_qspi` usw.) liegen ebenfalls in gemus `boards/`-Ordner. Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
+
+**B) Sourcen aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal)** (Scripter / SML / TinyC — im offiziellen Tasmota nicht oder nur älter enthalten)
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` — Scripter-Engine
+- TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` — SML/OBIS Smartmeter-Treiber
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_1_webserver_mail.ino` — Mail-Client (`USE_SENDMAIL`), vom Scripter genutzt
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_50_filesystem.ino` — Filesystem-Erweiterungen (u.a. für Scripter/TinyC-Dateizugriffe)
+- TasmotaProjekt/tasmota/include/`tasmota_configurations_ESP32.h` — ESP32-Feature-Matrix des Forks
+- TasmotaProjekt/tasmota/`lvgl_berry/tasmota_lv_conf.h`, tasmota_xdrv_driver/`xdrv_54_lvgl.ino`, `xdrv_54_lvgl_tinyc.inc` — LVGL-Anbindung inkl. TinyC-Glue (nur bei Display-Builds nötig)
+- TasmotaProjekt/lib/… — angepasste Bibliotheken des Forks: `lib/default/TasmotaSerial-3.7.0`, `lib/default/TasmotaWebServer`, `lib/lib_ssl/tls_mini`, `lib/lib_ssl/bearssl-esp8266`, `lib/lib_deprecated/Xlatb_RA8876-gemu-1.0`, `lib/libesp32_eink/epdiy`
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_84_esp32_hosted.ino` — **nur für ESP32-P4 nötig.** Ohne sie bricht der P4-Build ab: `error: 'esp_hosted_get_cp_info' was not declared in this scope`. Die Funktion gibt es erst ab esp_hosted 2.12.2, das Framework pinnt aber 2.11.7 — gemus Version kapselt den Aufruf in einen Versions-Guard
+
+**C) TinyC** (nur für die `_tc`-Images — [Beschreibung](#tinyc---alternative-zum-scriptingberry-esp32--esp8266-4m))
+- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_vm.h` — **wichtig:** die TinyC-VM, ändert sich fast täglich
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_124_tinyc.ino` — TinyC-Treiber (XDRV_124) mit IDE-Endpoint, Konsolen-Befehlen und `TinyCChkpt`-Partitionsmanager
+- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_camera.h` — MIPI-CSI-Kamera für ESP32-P4 (nur bei Kamera-Nutzung)
+- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_spp.h` — Bluetooth-Classic (RFCOMM/SPP) als TinyC-Primitive
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_123_plugins.ino` — BinPlugin-Loader (`USE_BINPLUGINS`), lädt nachladbare Plugin-`.bin` zur Laufzeit
+- TasmotaProjekt/`tasmota/Plugins/modules_def.h` — Header, den der Plugin-Loader inkludiert (ohne ihn bricht der Build ab)
+- TasmotaProjekt/lib/libesp32_div/`matter_c/` — Matter-Bibliothek (`USE_MATTER_C`), komplett kopieren. Braucht zusätzlich `USE_DISCOVERY` (ist in meiner `user_config_override.h` schon gesetzt)
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_125_partedit.ino` — Partitions-Konverter (altes Dual-OTA → safeboot), gedacht für Safeboot-Images
+
+**D) Meine eigenen Patches am offiziellen Tasmota-Code** (optional, rein kosmetisch)
+- TasmotaProjekt/tasmota/`tasmota.ino` — `image_name`-Buffer von 33 auf 64 Bytes erweitert, damit lange `CODE_IMAGE_STR` (z.B. `ESP32-C3 TC ottelo.jimdofree.com`) nicht abgeschnitten werden
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` — HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends`
+
+**E) Zum Flashen / Ausliefern**
+- `tinyc/tinyc_ide.html.gz` — die TinyC-IDE, kommt **nicht** ins Projektverzeichnis, sondern via File Upload auf den ESP (Tools > Manage File System)
+- `make_tasmota_zips_extended.sh` — packt nach dem Build die Release-ZIPs, siehe [unten](#release-zips-erstellen-mit-make_tasmota_zips_extendedsh)
+
+> **Hinweis:** Welche gemu2015-Commit-Version ich zuletzt übernommen habe, steht in [`gemu2015 Repo Update.txt`](gemu2015%20Repo%20Update.txt).
 
 Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
