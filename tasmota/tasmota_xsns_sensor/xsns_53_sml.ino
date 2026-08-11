@@ -800,6 +800,13 @@ int8_t index;
 #define SML_OPTIONS_NO_WEB      4   // suppress the SML driver's own web (FUNC_WEB_SENSOR) rendering. A TinyC/Scripter program can
                                     // then read the descriptor and render the values inside its OWN card (one card, no duplicate).
                                     // Set from a script via `smlj |= 4` (Scripter) or `tasm_smlj = tasm_smlj | 4` (TinyC).
+#define SML_OPTIONS_JSON_ALL    8   // publish EVERY descriptor line on TelePeriod, including entries the meter has not sent yet.
+                                    // Upstream PR #24587 made SML_Show skip values whose `dvalid` flag is still 0, so a meter that
+                                    // reports a register only occasionally (or not at all, e.g. unused tariff registers) makes its
+                                    // JSON keys appear and disappear between TelePeriods. Consumers that expect a stable key set
+                                    // (databases, Node-RED flows, Grafana) break on that. With this bit the pre-#24587 behaviour
+                                    // is restored: never-received entries are published with their initial value.
+                                    // Set from a script via `smlj |= 8` (Scripter) or `tasm_smlj = tasm_smlj | 8` (TinyC).
 
 struct SML_GLOBS {
   uint8_t sml_send_blocks;
@@ -3620,8 +3627,8 @@ void SML_Show(boolean json) {
             }
 
             if (json) {
-              if (!sml_globs.dvalid[index]) {
-                // skip values not yet received from meter
+              if (!sml_globs.dvalid[index] && !(sml_globs.sml_options & SML_OPTIONS_JSON_ALL)) {
+                // skip values not yet received from meter (SML_OPTIONS_JSON_ALL keeps them, see above)
                 lastmind = mindex;
               } else {
                 // json export

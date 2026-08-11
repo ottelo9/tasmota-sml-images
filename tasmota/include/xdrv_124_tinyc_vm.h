@@ -327,13 +327,13 @@ static FS *tc_file_path(char *path) {
 // appends don't need it). The loader warns (still loads) on a .tcb abi_rev mismatch.
 #include "xdrv_124_tinyc_spp.h"
 
-#define TC_SYSCALL_ABI     19    // V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || VORHER V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || VORHER V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || VORHER V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
+#define TC_SYSCALL_ABI     23    // V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || VORHER V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || VORHER V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || VORHER V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || VORHER V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // REMINDER: when bumping TC_RELEASE, also update the visible <h1> label
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
 // maintained; got stuck at "v1.3.20" through 5 releases until Andreas's
 // Claude flagged it during the v1.5.2 review.
-#define TC_RELEASE         "1.6.45"     // **TinyC 1.6.45: drei Fehler, die alle STILL waren -- kein Compilerfehler, keine VM-Meldung, nur ausbleibende Wirkung. (1) FIRMWARE tc_stream_ref(): ein String-LITERAL, das durch einen char[]-FUNKTIONSPARAMETER gereicht wird, kommt als Konstanten-Pool-Referenz an, und tc_resolve_ref() gibt dafuer ABSICHTLICH nullptr zurueck -- webSend(css) gab dann GAR NICHTS aus. `void row(char css[]){webSend(css);} row("left:57px;")` blieb wirkungslos, waehrend sprintf("%s",param) durchweg funktionierte; das sah deshalb nach einem CSS-Problem aus statt nach einem verschluckten String. Betrifft webSend/responseAppend/mailBody und die uebrigen Streaming-Syscalls. (2) FIRMWARE tcbtn(): sicherte textContent statt innerHTML und stellte die Textfarbe hart auf '' zurueck -- ein Button mit Markup darin (z.B. <span>-Punkte) war nach dem ERSTEN Klick dauerhaft leer, und eine per Skript gesetzte Inline-Farbe ging verloren. Jetzt werden innerHTML UND die urspruengliche Inline-Farbe gesichert und zurueckgestellt. (3) COMPILER (codegen.js) String-Ternaer als Aufrufargument: `f(c ? "a" : "b")` uebersetzte anstandslos und tat zur Laufzeit NICHTS -- dieselbe Konstanten-Pool-Falle, sie trifft rund 79 Syscalls (responseCmnd, addLog, ...). Behoben durch Aufspalten in ZWEI vollstaendige Aufrufe, je einen pro Zweig, mit gewoehnlichem Literal-Argument; damit sind alle Syscalls auf einen Schlag erledigt, und es wirkt auf BEREITS AUSGELIEFERTER Firmware. ⚠️ (1) und (2) brauchen einen FLASH, (3) braucht nur die neue IDE -- und die liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht: nach dem Update einmal `TinyCIde` in der Konsole aufrufen und die Browserseite hart neu laden. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.44: neuer Syscall fileRename() (522/523) + IDE-Simulator-Fix. fileRename(from,to) -> 0/-1, beide Pfade Literal oder char[]; ein VORHANDENES Ziel wird NIE stillschweigend ueberschrieben (Tippfehler im Zielnamen darf keine Daten vernichten) und Umbenennen ueber Dateisystemgrenzen (/ffs/ <-> /sdfs/) wird abgelehnt statt halb zu scheitern. Motiv: sml_chart speichert Historie UND Nullpunkte jetzt gemeinsam in der .pvs (ottelo9/tasmota-sml-images#50) und braucht dafuer eine "schon uebernommen"-Marke -- die alte .bin wird nach <name>.done UMBENANNT statt geloescht, ihr Vorhandensein ist die Marke. Ausserdem in idesrc/src/vm.js: `Syscall` war in 63 case-Labels benutzt, aber nie importiert -- der Browser-Simulator starb an ReferenceError, sobald ein Syscall keinen frueheren Zahlen-Fall traf (z.B. jedes Programm mit fileWrite). WICHTIG: die IDE liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht -- nach dem Update einmal `TinyCIde` in der Konsole aufrufen, sonst meldet der Compiler "Undefined function: fileRename" trotz passender Firmware. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.43: persist + upload/network roll-up since 1.6.42 (no .tcb-format / syscall-ABI change, still ABI 16). PERSIST OVERHAUL: name-keyed .pvs (PV3, 3763abf02) - adding/reordering/resizing persist vars or recompiling NO LONGER wipes saved state (entries migrate by NAME; PVS2 read-fallback so old .pvs upgrade seamlessly); persist cap 64->128 on ESP32 with a LOUD parse error when a program exceeds the cap (was SILENT truncation - vars past #64 always reloaded as 0); heap-persist ARRAYS (persist float a[N]) now actually restore across reload AND reboot (5a0f1f06f: restore-at-load + idempotent slot-stop - a reload's double TinyCStopVM used to re-save from the freed heap and zero the .pvs) => chart history can live in .pvs (energy_dashboard converted, .bin files dropped). WORKER/FS: spawnTask worker runs on its own dual-context VM aliasing primary globals, DEFAULT-ON ESP32 (3342f4835; fixes callback 'Bounds PC=0' frame corruption under concurrent net I/O; opt out USE_TINYC_NO_WORKER_VM); cross-slot file-handle race fixed (3473e6192: atomic reserve under mutex + owner-keyed close - two tasks could grab the SAME handle -> wrong-file writes/heap panics). UPLOAD/NET: port-83 raw-socket large-upload server off loopTask (fixes big /ufsu truncate+reboot) + post-FIN drain; dl/upload (82/83) + cam-stream servers now start on Ethernet-only devices (HasIP instead of WifiHasIP); /ufsu deletes the partial file on an aborted write and reports distinct error 10 'write failed' (was misreported as 'too large'); UDP-pause-sync during blocking TLS + tcpConnect 2s default timeout. WEB/LVGL: multi-series WebChart defaults to a top legend (series names no longer truncate to '...'); TC_LV_MAX 128->256 + lvglSetText type-guard (dashboard handle-overflow crash). Examples: energy_dashboard solar + battery-SOC charts (persist-backed), sml_ebus energy/temp charts + dual y-axis, moritz_dash alarm siren+email + MAN/AUTO per thermostat, marstek discharge-cap, hyundai_soc manual live-refresh, esf37 history table + TTS toggle + bounded GATT read.** **TinyC 1.6.42: bugfix roll-up since 1.6.41 (no .tcb-format / syscall-ABI change, still ABI 16). HEAP-CORRUPTION FIX: disabled the idle bump-heap shrink (a11c45565) - special_realloc could MOVE the VM heap while the running program's live frame/stack/global/handle references are ABSOLUTE pointers (not offsets), dangling them all -> use-after-free -> tlsf_free/lwIP crashes + ~30s-cadence boot-loops on ESP32. Root cause of Rolf's .200 (Matter+SML+DS2484) and Andreas's C6 crashes; found independently via OTA git-bisect + UBSan. Callback-arg buffer now reserved per-slot + eager-reserved at slot load (fixes 'Event callback heap alloc failed' after hours of uptime). ESP8266 RUNS AGAIN and ships again: output-program HWDT fixed (tc_syscall scratch buffers moved to heap). Web UI: control-panel scripts render their controls INLINE on the main page (raw HTML in WebCall via /cm?cmnd=...), and a bare WebUI() no longer emits the stray generic 'TinyC UI' button - only webPageLabel-registered pages get a /tc_ui button, and /tc_ui no longer 503s when it would land on an empty slot. Example fixes: ecotracker daily-chart off-by-one date, marstek real Venus E control via the UDP JSON-RPC local API, bmx280 BME680/688/690.** **TinyC 1.6.41: device-wedge + web-stability roll-up since 1.6.40. /tc repo index + .tcb downloads moved CLIENT-SIDE (a synchronous repo TLS GET on the loop task wedged the device for minutes); chunked-send loop-block bounded (a permanent web-wedge under slow-client reload becomes a self-recovering ~8s cap, Andreas-verified) + lwip/sockets self-include; deferred commands (tasmDefer/audioPlay/I2STTS/sendmail) now run from EVENT-DRIVEN slots (were gated on slot-0 vm.halted, never true for a callback slot -> silently never fired); Scripter ?sv= crash on TinyC builds fixed + ?sv= bounds-check; TasmotaSerial freeUart C3/C6 hang fixed; WebChart rolls the newest sample to the right edge; LVGL runs on renderer-based displays (RA8876, not just uDisplay); chkpt r handles a custom partition BEFORE spiffs without bricking. No .tcb format / syscall-ABI change vs 1.6.40 (ABI 16).** **TinyC 1.6.40: per-script main-page web cards (webCard 521, ABI 15->16 -- each WebCall slot auto-framed in a <fieldset> so multiple apps on one main page get a frame+gap; webCard(0) opts a slot out) + TLS-before-WiFi boot-crash guard + repo-fetch offline skip/backoff + raw-TLS abort-close & lwIP PCB-pool census + dyson STATE-CHANGE parse + widget writes routed to the rendering slot. ABI 15->16 (webCard pure append; recompile .tc with the v16 IDE). **TinyC 1.6.39: test-release roll-up of a month's work since the 1.6.38 build — main-loop wedge fix (httpGet/Post/sendMail no longer stall the device), share-table heap fix (~120 KB internal DRAM back on S3+PSRAM), dead-IP connect bounding, raw TLS client + rsaEncrypt() + utcSecs() syscalls, audio (full-duplex I2S / WAV player / mic in), on-device LVGL GUI, P4 MIPI camera + BLE GATT, IDE/firmware ABI-mismatch warning; ESP8266 builds + runs basic programs again (custom images). No .tcb format / syscall-ABI change vs 1.6.38. **TinyC 1.6.38: TWO-PHASE autoexec boot. 1.6.37's serial load only serialised slot STARTS — but each slot's main() still raced the PRIOR slots' already-running TaskLoops (Andreas .142 boot-log: slot-0 `TaskLoop enter` at 02.254 while slot-3 still ran main() at 02.580 → slot-3, the last slot, was starved of VM time/heap, never reached addCommand("EM") → durable column never written on the FIRST boot → reheal had nothing to restore = henne/ei). Fix: new per-slot `hold_taskloop` (TcSlot, ESP32) — the autoexec loader sets it before starting each slot, the VM task BLOCKS after main() (before Phase-2/TaskLoop) while it's set, and the loader clears it on ALL slots only after EVERY main() has run (or timed out). So while slot-3's main() runs, slots 0..2 are parked instead of spinning their TaskLoops → each main() reaches addCommand() with no TaskLoop competition → the durable prefix column is written on the first boot every time. Pairs with 1.6.37's durable cache (the belt; two-phase is the suspenders). No ABI/VM/bytecode/IDE change. **TinyC 1.6.37: command prefix is now DURABLE + serial autoexec load. 1.6.36's sticky prefix only re-armed when `cmd_prefix_saved` (RAM/BSS, set only by main()'s addCommand()) survived; a heap-tight REBOOT where main() never reaches addCommand() left it empty after the BSS reset, so the per-second self-heal had no target and `BAT*` stayed Unknown (Andreas .107 = S3+PSRAM, NOT C3). FIX (a) the prefix is mirrored into a DURABLE 3rd column of /tinyc.cfg (slot_config[].cmd_prefix), learned on the first successful addCommand() and used by TinyCPrefixReheal as the heal target even on a boot whose main() never registered — it now re-registers a RUNNING slot from cmd_prefix_saved OR the persisted copy (the `s->running` gate re-arms only an executing VM, never a deliberately-stopped slot); cleared on program-replace/reset (TinyCClearDurablePrefix), NOT on a plain stop or same-file reload. FIX (b) the autoexec boot loader loads slots SERIALLY — it waits for each slot's main() (Phase 1) to finish via the new `slot->main_done` flag (bounded by TC_BOOT_MAIN_WAIT_MS) before starting the next, so concurrent boot load can't starve a tight S3/PSRAM of the heap headroom main() needs to reach addCommand() (Andreas's root-cause request). No ABI/VM/bytecode/IDE change. **TinyC 1.6.36: registered command prefix is now STICKY. A slot's BAT*/command prefix (set by main()'s addCommand()) used to be cleared by every TinyCStopVM teardown and re-set ONLY when main() runs again — so a transient worker stop+resume (SD->Flash sync worker-stop, or the #76 auto-stop) whose main() doesn't re-reach addCommand() under heap pressure, or a heap-tight boot, left the slot Running:1 while EVERY command fell through to {"Command":"Unknown"}; recoverable only by a full slot-restart (a reboot did NOT fix it). New `cmd_prefix_saved` mirror is set alongside cmd_prefix at registration and cleared ONLY on a deliberate stop/reset/program-replace; it's re-applied in TinyCStartVM (before the VM task re-runs main) and by a once-per-second TinyCPrefixReheal() self-heal that re-arms any loaded slot whose live prefix went empty without a main() re-run. Fixes Andreas's .107 'BAT* Unknown after sync / after boot' (Wurzelanalyse 2026-06-04). No ABI/VM/bytecode/IDE change. PREVIOUS 1.6.35: .tcb bytecode format v5->v6 — self-describing header (new header_size B20-21 + total_size B22-25 u32) + a 2-byte syscall-ABI-revision abi_rev (B26-27) + 12 reserved bytes for future fields (no further format bump). The loader now (a) cross-checks total_size vs the on-disk file size — catches a truncated/corrupt upload before it reads OOB; (b) WARNS (still loads) when a slot's abi_rev != firmware TC_SYSCALL_ABI: 'recompile with the current IDE; commands may not register' — fixes the silent 'slot runs but BAT*/commands return Unknown' trap after a firmware update done with a STALE IDE (syscall renumbering); (c) nudges once when loading pre-v6 bytecode. v2..v5 .tcb still load byte-identically; a v6 .tcb is rejected (loud) by pre-v6 firmware. Needs the matching IDE rebundle (codegen emits v6). BUMP TC_SYSCALL_ABI in BOTH opcodes.js (SYSCALL_ABI) and this file whenever syscall NUMBERS are inserted/renumbered.** PREVIOUS 1.6.34: **TinyC 1.6.34: FUNC_COMMAND now answers {"Command":"Busy"} instead of the generic {"Command":"Unknown"} when a registered TinyC command-prefix matches a slot whose VM is busy — the bounded 200 ms try-lock (1.6.23) times out under a slot-0 load burst (BYD reads / colliding 60 s timers on Andreas's .107), or the VM is mid-execution. Polling HTML UIs can now keep the last good value on a transient busy instead of blanking (which looked like data loss). No ABI/VM change.** PREVIOUS 1.6.33: **TinyC 1.6.33: sprintf/addLog no longer corrupt a float (%f) argument whose VARIABLE NAME collides with a built-in #define (the file-mode constants r/w/a, colours, MATTER_*/CLUSTER_*). The compiler's resolveArg now respects local/global shadowing (it previously substituted the define's int literal -> a spurious I2F reinterpreted the float bit-pattern, e.g. 2.0 -> "1073741824"; compileExpr used the real local, so only collided names broke, looking like "the 2nd+ %f"). Codegen-only + IDE rebundled; no VM change. Also: removed the /ufsu big-write heap-trace debug logging (UPL: heap-trace ...); new example sml_custom_line.tc (descriptor name '*' suppresses a meter line -> render a combined V/A/W line + decimal-aligned columns from a script); matter_c BLIB plugin (Fork B) scaffolding + by-pointer crypto seam (off by default).** PREVIOUS 1.6.32: **TinyC fastMux(flag,time,buf,len) — HW-timer GPIO multiplexer ported from Scripter's ESP32_FAST_MUX. An IRAM hardware-timer ISR steps a small scan buffer of pin-encoding bytes (direct GPIO.out_w1ts/out_w1tc set/clear, pins 0..31) for jitter-free LED-matrix/7-segment/charlieplex multiplexing far steadier than the VM loop. flag 0=start(config pins + period in us @1MHz timer), 1=stop, 2=load scan sequence, 3=read scan position. Gated `USE_TINYC_FAST_MUX` + dual-core Xtensa only — classic ESP32 OR ESP32-S3 (off by default; RISC-V C-series excluded; returns -1 if not built); ported to the Arduino-core-3.x timer API (timerBegin(freq)/timerAlarm/timerAttachInterrupt). SYS_FAST_MUX 427; codegen builtin (refArgs:[2]) + IDE rebundled; example fast_mux.tc.** PREVIOUS 1.6.31: **TinyC dynamic-HTML enablers: varIdx(var)->int returns a global's index so a script can hand-build fully custom interactive HTML (e.g. emit raw `<button onclick='tcbtn(this,1,IDX)'>` / `<input ... onchange='seva(value,IDX)'>` in any layout); plus webButtonV(var,labelbuf) and webSliderV(var,min,max,labelbuf) — runtime-(char[])-label twins of webButton/webSlider (the built-ins only accept compile-time string-literal labels). Closes the two gaps hit building matter_bridge_ui's table: dynamic widget labels + custom raw-HTML controls. SYS_VAR_IDX 424 / SYS_WEB_BUTTON_V 425 / SYS_WEB_SLIDER_V 426; codegen builtins + IDE rebundled.** PREVIOUS 1.6.30: **TinyC generic JSON parsing: new jsonNum(buf,"a#b#c")->float and jsonStr(buf,"a#b#c",dst)->len syscalls (SYS_JSON_NUM 422 / SYS_JSON_STR 423) parse ANY char[] the script holds (e.g. an httpGet response from a remote device) via Tasmota's JsonParser with a '#'-separated path — like sensorGet but on a provided buffer, not just this device's own sensors. Lets matter_bridge_ui read a remote's DeviceName robustly (the hand-rolled string slicing tripped over TinyC quote/char-literal quirks). Codegen builtins + IDE rebundled.** PREVIOUS 1.6.29: **TinyC httpGet (SYS_HTTP_GET) body read rewritten + retried. ROOT CAUSE (proven on .143 C3 via per-call code/size/len logging): on a busy C3 (matter_c + WiFi) the framework http.getString() intermittently returns an EMPTY body on a valid HTTP 200 — ALWAYS for a slow ESP8266 peer (chunked reply split across many small TCP segments) and occasionally for an ESP32 peer; it also saw transient -1 connect drops. FIX: read the body ourselves — drain the raw stream patiently (wait for available() with a 1.5 s per-idle wall-clock bound, continue past FIN while bytes remain buffered) and de-chunk Transfer-Encoding: chunked on the fly; retry the whole GET up to 3x (120 ms apart) on a -1 transport error or an empty read. GET only (idempotent); POST is NOT retried. Fixes the matter_bridge_ui / remote-bridge poller never reading a sleepy ESP8266 RGB lamp (.38) and occasional empty reads from ESP32 peers (.51).** PREVIOUS 1.6.28: **TinyC IDE self-update from the console (Hans's request): new `TinyCIde [url]` command + a /tc "Update IDE" button fetch tinyc_ide.html.gz from the repo and atomically replace the device's served IDE — stream to a .tmp, validate the gzip magic + size, then rename over the live file; the ~190 KB LittleFS write quiesces the VM tasks (TinyCFsWritePause) + holds the loop-WDT, mirroring the /ufsu big-write path. Updates the browser IDE without the Tasmota file manager. Verified live on .143: 186422->187286 B, gunzip OK, no .tmp residue, Matter preserved.** PREVIOUS 1.6.27: **matter_c: Alexa support — UpdateFabricLabel (0x3E/0x09) commission-abort fix; mandatory Groups (0x0004) + ColorControl + Level attrs on light/plug device types (Alexa GS014 conformance); per-fabric Bridged-Node 0x0013 suppression for Alexa/Amazon vendors (NON_BRIDGE_VENDOR, Berry parity). Alexa now commissions + controls matter_c lights/plugs as DIRECT (non-bridged) nodes. LIMITATION: Alexa rejects a single node that mixes actuators + sensors — split into a lights node + a separate sensor-bridge node; the full mixed matter_home_bridge.tc still works on Apple/Google (Apple regression-tested OK).** PREVIOUS 1.6.26: **matter_c: handle IM TimedRequest (op 0x0A) — fix Google Nest "Gerät kann nicht hinzugefügt werden"**. Hans's C3 log (matter_powermeter.tc) showed commissioning fully succeed (PASE→attest→CSR→AddNOC fabric idx=5→CASE operational sid=13653) and post-CASE Descriptor reads, then Google Nest sent an IM TimedRequest (proto=0x0001 op=0x0A exch=0x2613); matter_c had no handler so it sent only an MRP StandaloneAck and no IM StatusResponse → Nest's timed interaction stalled, retried the TimedRequest ~10s later (0x2614), then gave up. Per Core Spec §8.7 a TimedRequest{0:timeoutMs} must be answered with StatusResponse(SUCCESS); the follow-up timed Invoke/Write then arrives on the same exchange and is handled normally. Added the handler in the secured-rx IM dispatch (emits the 8-byte StatusResponse `15 24 00 00 24 FF 0C 18`); follow-up accepted unconditionally (no command on this device needs strict timed gating). Apple Home doesn't use a timed interaction at that step, which is why it already paired. PREVIOUS 1.6.25: **matter_c: add `SAT=4000` to operational mDNS TXT (fix Google Nest "kann nicht verbinden" post-CASE)** — Hans reported Google Nest fails commissioning right after our log shows CASE Sigma3 verified + OPERATIONAL SESSION sid=61744 (1 active). Our operational mDNS TXT records were `SII=5000 SAI=300 T=0` — missing `SAT` (Session Active Threshold, ms) which Matter Core Spec §4.3.1.6 marks MANDATORY since v1.3. Apple Home tolerates SAT missing; Google Nest rejects. Added `SAT=4000` (spec default). Also added an opt-in diagnostic build flag `-DMTRC_DIAG_HANS` that logs every decrypted secured-channel rx with proto/op/exch/payload hex prefix — useful for diagnosing post-CASE failures where the controller stops talking. PREVIOUS 1.6.24: **matter_c: drop per-packet AddLog from AsyncUDP onPacket lambda (fix .122 hourly reboot)** — Captured live on .122 (ESP32-C6 matter_home_bridge with 32 endpoints, Apple Home subscription pressure) via USB-CDC serial 2026-05-27 15:34:50: Guru Meditation `Instruction access fault` with MEPC=RA=MTVAL=0x6f48222c after ~1h uptime (BootCount 290). 0x6f48222c decoded as LE ASCII bytes = `,"Ho` — start of `,"Hostname":"ESP32-C6"` JSON fragment from Tasmota's STATE/SENSOR teleperiod. Stack at crash also held `stname":"ESP`/`rx 42 B`/`from`/`:00:`. Root cause: `AddLog("MTR: udp rx %u B from %s:%u …", …, mtrc_peer_ip.toString().c_str(), …)` inside the AsyncUDP onPacket lambda — `IPAddress::toString()` of an IPv6 link-local plus Tasmota's LOGSZ stack buffer for vsnprintf overflowed the AsyncTCP task's ~4 KB stack and corrupted the saved RA with adjacent format-string bytes. `matter_udp_rx()` itself ran fine on that stack (no crashes in crypto/IM dispatch); the overflow was specifically in the log path. Fix: remove the per-packet AddLog from the lambda; bump two volatile uint32_t counters (pkts/bytes) instead; FUNC_LOOP logs aggregates every 5 s on the main task where 8 KB+ of stack is safe. A wider previous attempt (deferred matter_udp_rx itself to main loop) starved WiFi/HTTP for the ~7-second 682-chunk Subscribe response burst and was reverted (5199ae4fb) before any release upload. PREVIOUS 1.6.23: **Bounded try-lock on share-table readers + FUNC_COMMAND vm_mutex** — Andreas reported a deterministic ~2:30 min HTTP-server outage on .104 (ESP32-C3 single-core + TinyC ebusD-Reader) when slot-0 emits 60 shareSetFloat/s and the HTTP task tries /cm?cmnd=WP+B (or /ufsu). Two unbounded `portMAX_DELAY` locks in the same path: `shareGet*`/`shareHas` on `tc_share_mutex`, and `FUNC_COMMAND` on the slot's `vm_mutex`; either could pile up enough scheduler pressure to wedge AsyncTCP, recovering only at the 60 s UDP-multicast socket-reset boundary. Readers now use a 50 ms `tc_share_try_lock_ms()` (drop the read with default value on timeout — same as missing-key behaviour); `FUNC_COMMAND` uses a 200 ms `xSemaphoreTake` deadline (returns "Command unknown" instead of blocking the web task). Writers (`shareSet*`) keep `portMAX_DELAY` since they MUST persist. With this in place a 60-shares/s pattern is again the supported case (the 3-categories polling workaround stays a useful tidiness pattern but is no longer required for stability). PREVIOUS 1.6.22: **WebChart now respects Tasmota's per-language `D_DECIMAL_SEPARATOR`** — tooltips and any formatted axis labels on `WebChart()` charts show `1,5` on a `de_DE` build (or whatever the language header defines) instead of `1.5`. Implemented by injecting a `google.visualization.NumberFormat({decimalSymbol: …})` after the data table is built (before the `WebChartJS` hook, so user-supplied JS sees the formatter already applied). JS literals in chart data stay '.' (correct). Same mechanism Tasmota itself uses for its sensor body (`WSContentSend_PD`). Script-side `webSend(...)` already runs through `WSContentSend_PD` so it was already localized. **Companion: sml_chart_editor is now locale-aware** — display via `Intl.NumberFormat` (browser locale, so a DE user sees `,` even on an en_GB-built firmware), parser accepts both `.` and `,` so paste-from-anywhere works; CSV export keeps `.` to match `fileWriteArray` on the device. PREVIOUS 1.6.21: `/cedit` route — host the sml_chart binary editor on the device. A tiny new webserver route reads `/sml_chart_editor.html(.gz)` from the filesystem and serves it inline as `text/html`, so the standalone editor (`tasmota/tinyc/utils/sml_chart_editor.html`) can be opened at `http://<device>/cedit` and its Load / Save buttons hit `/ufsd?download=`, `/ufsu` and `/cm` same-origin to read `/sml_chart.bin` in place, write it back, and run `Backlog TinyCStop 0; TinyCRun /sml_chart.tcb` so the script reloads — no manual download/upload cycle. The route is needed because Tasmota's generic `/ufsd?download=` always sends `Content-Disposition: attachment` and would just download the HTML instead of rendering it. Editor README at `tasmota/tinyc/utils/sml_chart_editor.md`. Requested by mi-hol (discussion #83). PREVIOUS 1.6.20: PWL_DIRECT_GLOBALS: the polling spawnTask worker no longer silently exits at its first delay (the "no values fetched" symptom). The worker BORROWS the one shared VM; during its delay() windows it releases the mutex while still looking halted=true, so the high-rate UDP-global RX path (tc_udp_on_receive) injected globals into the borrowed VM and disturbed the worker's loop state, making the worker loop exit cleanly (no error). Fix: a `vm->worker_borrowed` flag set for the WHOLE borrow incl. its delay windows; tc_udp_on_receive now skips injection when a worker is borrowing the VM (on top of the 1.6.19 drop-on-busy try-lock). Verified live on a devkit-S3: the globals-ON worker survives its 15 s startup delay and runs its request cycle. PREVIOUS 1.6.19: PWL_DIRECT_GLOBALS / UDP-global RX no longer crashes a node that also runs a spawnTask TLS worker. `tc_udp_on_receive()` took the per-slot `vm_mutex` with `portMAX_DELAY`, so while a spawnTask worker held the VM for a multi-second BearSSL request (the powerwall worker), loopTask blocked in the UDP-global-receive path for the WHOLE TLS — freezing the web server + LwIP servicing and corrupting the TLSF heap. It surfaced as Exception 29 (StoreProhibited) in LwIP `tcp_alloc` on the worker's NEXT TLS socket (wild free-list pointer), and the reboot wiped the web log ring so it looked like the worker had silently stopped. Fix: the UDP-global injection is now NON-BLOCKING — `xSemaphoreTake(vm_mutex, 0)` and drop-on-busy (multicast globals are best-effort, so dropping one while the VM is busy is harmless; same drop-on-busy pattern as matter_udp_rx). Live-verified on a devkit-S3 (.39): `powerwall.tc` with `-DPWL_DIRECT_GLOBALS` ran 11 request cycles / ~5 min with ZERO crashes and a clean heap throughout (it crashed deterministically within 9-60s before). Root-caused via UDP-syslog capture + `heap_caps_check_integrity_all` probing (heap was clean through 15s of UDP RX on the borrowed VM and right up to the TLS — only the lock-stall during TLS corrupted it). PREVIOUS 1.6.18: fileWriteArray()/fileReadArray() now store FLOAT values (was integer): they write/read human-readable TAB-separated float text, one array per line — a plain editable `.csv`/`.tab` — restoring parity with Scripter's `fwa()`/`fra()` (which are float). New signature `fileWriteArray(arr, handle, count [, append [, decimals]])` / `fileReadArray(arr, handle [, count])`: `count` is now explicit (like fileWriteBin/fileReadBin) because TinyC global arrays don't carry their declared size — without it small global arrays over-wrote the whole global pool. `decimals` (default 2, trailing zeros stripped via Scripter's `%*_f`) caps decimal places so the file stays compact — without it small/fractional values could blow up to long strings (e.g. 0.0001234567) and bloat big arrays. The integer variant is dropped (no example used it; use fileWriteBin/fileReadBin for compact binary). Read is now streamed value-by-value, so arrays of ANY size work (the old 512-byte line / 256-element cap is gone) — e.g. a 1441-slot SML chart buffer can be saved as readable CSV and restored. Motivated by users wanting to read/edit/restore the sml_chart_* data as text instead of opaque binary. PREVIOUS 1.6.17: **Flash-FS file-manager upload no longer hard-hangs a running node: a large internal-flash (LittleFS) write — e.g. uploading the ~183 KB IDE via /ufsu — repeatedly disables the SPI flash cache, and on a dual-core node running a TinyC VM task this deadlocked the device with NO watchdog recovery (needed a power-cycle). Reproduced + serial-traced on an S3 Matter-bridge (TaskLoop); SD-card uploads were unaffected (external SPI never disables the internal cache). The old tc_global_pause only suppressed main-loop callbacks — tc_vm_task kept stepping; and merely pausing/vTaskSuspend()ing it was NOT enough (the task still wedged the write — verified). Fix: for /ufsu uploads >= TC_FS_BIG_WRITE (16 KB; small files never deadlock so they skip it) the writer STOPS each running VM task for the duration of the write (TinyCFsWritePause→TinyCStopVM, fully off the scheduler — the only thing that lets the write through, ~3 s vs a hard hang) and RESTARTS them after (TinyCFsWriteResume→TinyCStartVM, re-runs main(); for the bridge that re-runs matterReset()+rebuild, identical to a normal boot — Matter fabric persists on UFS, no commissioning lost). Wired into xdrv_50 UfsUploadFileOpen/Close with HandleUploadUFSDone as a resume safety-net. Small .tcb /tc_upload writes are left untouched (tc_deploy manages its own slot). PREVIOUS 1.6.16: **Matter commissioning fix (CRITICAL on newlib-nano builds): the operational DNS-SD instance name `<CompressedFabricID>-<NodeID>` formatted the 64-bit node id with `%016llX`, but ESP-IDF newlib-nano printf (default on several Tasmota envs, e.g. tinyc32s3/c3) ignores the `ll` length modifier and emits garbage ("…lX") — so a controller (Apple Home) could never resolve the node for the CASE handshake and commissioning ended at "connecting → no response". Fixed by formatting all 64-bit ids byte-by-byte with `%02X` (fabric_op_instance in matter_c + the commissionable instance in xdrv). Also: matterSet/matterSetFloat now bump the subscription generation ONLY on a real value change — re-publishing identical sensor values no longer triggers a ReportData burst, which had flooded the subscriber (a script writing N attrs/second = N reports/second) and starved the CASE handshake / overwhelmed single-core nodes during commissioning. Together these make a multi-endpoint Matter bridge commission + run on a dual-core S3 (verified: 14 endpoints, 3 controller sessions). PREVIOUS 1.6.15: **Matter per-endpoint naming: new builtin `matterName(ep, "label")` (SYS_MTR_NAME=408). Apple Home (and other controllers) can only show a manufacturer-supplied name per endpoint when the node is a Matter *bridge*, so matterName turns the node into one: the first call lazily creates an Aggregator (0x000E) endpoint, the named endpoint becomes a Bridged Node (its Descriptor DeviceTypeList gains 0x0013) and gets a Bridged Device Basic Information cluster (0x0039) whose NodeLabel carries the label — exactly the pattern Berry Matter uses. Before this, a multi-endpoint node (e.g. a HomeKit-scripter port with N temp/humidity sensors) showed up as "Temperatursensor 1..N" with no way to name them. matterName(ep, name) is opt-in per endpoint; unnamed endpoints stay plain (no bridge forced). Call AFTER matterAdd for that endpoint; idempotent (re-call to rename); matterReset() drops all labels + the aggregator. Malloc-free (parallel 33-entry label table in the heap-allocated matter ctx). Adding a bridge changes the node identity, so an already-commissioned node must be removed + re-added in the controller to pick up the names. PREVIOUS 1.6.14: **DMX moved to RMT (no UART consumed). `dmxInit` is now `dmxInit(gpio)` (1 arg) — the DMX512 frame (BREAK+MAB+start+slots, 4us/bit, byte = start-low+8 data LSB+2 stop-high) is built as rmt_symbol_word_t[] and pushed via rmt_new_tx_channel + copy encoder at 1 MHz (exact, hardware-clocked — no CPU busy-wait BREAK). IDF5 RMT API = native to pinned arduino-esp32 3.3.7; UARTs stay free for SML/Modbus/tc_serial (the whole motivation). Re-sent ~20 Hz from FUNC_EVERY_50_MSECOND, 30 s watchdog -> all-zero. Compile-time auto-init via #define TC_DMX_GPIO. Replaces the 1.6.12/1.6.13 UART backend (dmxInit(uart,rx,tx) signature gone — nothing depended on it yet). PREVIOUS 1.6.13: **DMX runtime config: new builtin `dmxInit(uart, rx, tx)` (SYS_DMX_INIT=397) -> 1=ok/0=fail. Pick the hardware UART (0..2) + rx/tx GPIOs at runtime from the .tc script — no recompile/`#define` per board. Call once before `dmxWrite`; `dmxInit` reconfigures cleanly if called again (end()+delete+re-begin). Compile-time `TC_DMX_TX_PIN`/`TC_DMX_RX_PIN`/`TC_DMX_UART_NUM` still work as an auto-init fallback when `dmxWrite` is used without `dmxInit`. Frame BREAK now uses the runtime-selected UART for uart_set_line_inverse. PREVIOUS 1.6.12: **New builtin `dmxWrite(channel, value)` (SYS_DMX_WRITE=396): TX-only DMX512 on a dedicated ESP32 hardware UART (default UART2) for solar-surplus heater dimmers and similar. No library/HAL patch — per-frame BREAK via uart_set_line_inverse (inverse-line method), 250000 8N2, start code + TC_DMX_SLOTS (16) data slots, auto-refreshed from FUNC_EVERY_50_MSECOND (~20 Hz, runs even while the VM is paused so the dimmer never loses its frame), 30 s watchdog → all-zero (heater safe-off). Lazy UART init on first dmxWrite; pins via user_config_override.h (#define TC_DMX_TX_PIN <gpio>, optional TC_DMX_DE_PIN for RS485 DE, TC_DMX_UART_NUM, TC_DMX_SLOTS). Linearisation LUT + surplus logic stay in the .tc script. ESP8266: no-op. PREVIOUS 1.6.11: **Boot-loop false-positive fix (Andreas/Bat3). A commanded `Restart`/OTA was mistaken for a crash-loop and disabled autoexec — esp. right after an OTA flash (Tasmota also reports "settings reset") + 1-2 manual `Restart 1`. tc_bootloop_detected() is pure-OR with early return, so the filesystem marker ALONE trips it. Fix A: clear the boot-loop marker in FUNC_SAVE_BEFORE_RESTART (Tasmota calls that ONLY on graceful restart/OTA, never on crash/WDT/panic) — folded into the existing case, before CleanUp/persist-save. Fix B (belt+suspenders): tc_bootloop_detected() short-circuits on esp_reset_reason()==ESP_RST_SW (clean software reset) and proactively deletes the stale marker; crash resets (PANIC/WDT/BROWNOUT) and power-on (QPC counter) still detected. PREVIOUS 1.6.10: **Two production-UX fixes (Andreas/Bat3). (1) WebOn/WebUI page-switch no longer flashes a "TinyC not ready" 503 white page: `HandleTinyCWebOn` (was hardcoded immediate-503 on slot 0) and `HandleTinyCUI` now split *fatal* (no slot/not loaded/vm.error) from *transient* and wait up to `TC_WEBON_HALTED_WAIT_MS` (default 1500, `#ifndef`-guarded) for `vm.halted` before 503 — a slot running a TaskLoop (Modbus/BYD polls) is only sub-ms non-halted so the page now loads first try. Multi-slot-aware WebOn (`handler_slot[]` like `page_slot[]`) tracked for 1.7.x. (2) Persist `.pvs` layout-hash / legacy mismatch no longer **deletes** the file → `tc_persist_demote()` renames it to `<name>.pvs.bak` (one generation) so a schema-change flash is *recoverable* instead of total data-loss (Bat3: 27 cfg + tariff/SOC tables wiped by a single new `persist` var, twice in 2 days). Falls back to remove only if rename fails. Full name-keyed migration (PVS3 — `index` is compiler-assigned and shifts on add/remove, so raw-index migration is unsafe; needs .tcb-format names) tracked for 1.7.x. PREVIOUS 1.6.9: **`responseCmnd(buf)` no longer silently truncates.** The char-array form copied through a hardcoded 255-byte stack buffer; longer JSON was cut mid-object → Tasmota rendered an empty `{}` with no diagnostic (Andreas lost non-trivial time on a ~280-char BATrt response on .107). Buffer is now `TC_RESPONSE_MAX` (ESP32 512 / ESP8266 256), `#ifndef`-guarded so user_config_override.h can raise it; a truncation emits `TCC: responseCmnd output truncated at N chars (raise TC_RESPONSE_MAX...)` — same silent-drop anti-pattern eliminated for shareSet* in 1.6.6. String-literal `responseCmnd("…")` was never affected (no 256-cap). Plus doc fixes: CLAUDE.md persist note now states a layout change resets ALL persist values to defaults (not just changed vars); TinyC_Reference.md documents the responseCmnd cap. PREVIOUS 1.6.8: **WebUI sv= write now targets the page-owning slot, not hardcoded slot 0.** `TinyC_WebSetVar` was hardcoded to `slots[0]`: any script running in a non-zero slot rendered its widgets correctly (the `/tc_ui` render path resolves the page-owning slot from `page_slot[]`) but every checkbox/button/slider write landed in slot 0's globals, which that script never reads → "WebUI renders but does nothing". Surfaced with marstek_emu running in slot 1 on .39 (slot 0 in use by test deploys). Fix: `TinyC_WebSetVar(uint8_t slot_idx)` — `/tc_ui` passes the page-owning slot index (`si`), the main-page WebPage path keeps 0 (separate pre-existing multi-slot assumption). Takes an index not a `TcSlot*` because a pointer param breaks Arduino's auto-generated forward prototype in the concatenated tasmota.ino (TcSlot declared after the generated decl). Device-verified on .39 (marstek slot 1): sv=21_1 / 3_1 now stick, toggle both directions. PREVIOUS 1.6.7: **WebUI button rework: `webButton` is now a momentary action button (no `: ON/OFF` suffix; optional `"Idle|Active"` confirm text shown ~2.5 s on click, generic ✓ otherwise) and a new `webToggle(var,"On|Off")` syscall (394) provides a latching on/off button — green when var!=0, grey when 0, with optional per-state text/emoji. Device-verified on tasmota32s3-devkit (.39): grey↔green latch + per-state text swap + emoji render confirmed via /tc_ui. IDE bundle (opcodes/codegen/vm sim) regenerated so `webToggle` compiles in-browser and via tc_deploy.mjs.** PREVIOUS 1.6.6: **`udp(10, mcast_ip)` correctness fix + share-table PSRAM-BSS + share-Set diagnostic hardening.** Three independent items shipped in one drop. (1) `udp(10)` rewritten — the 1.6.1-shipped path called raw LwIP `igmp_leavegroup()` and returned ERR_OK, but Andreas's 14./15.05. nightly A/B test on .107 (Bat3 / SMA Tripower SE) showed `spw_pkts/h` stayed constant at ~18 000/h in Phase A and Phase B (no measurable drop in multicast reception despite syntactic-OK leave). Root cause: Arduino-ESP32 `NetworkUDP::beginMulticast()` joins via SOCKET-layer `setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)` which writes BOTH the netif IGMP table AND a per-socket membership list in `lwip_sockets`. Our `igmp_leavegroup()` only cleared the netif table; the socket-internal membership remained active, so the UDP demux continued to deliver matching packets to the PCB. Fix: case 10 now calls `Tinyc->udp_port.stop()` (which internally does `setsockopt(IPPROTO_IP, IP_DROP_MEMBERSHIP, ...)` on the underlying fd, atomically clearing both layers) followed by `Tinyc->udp_port.begin(saved_port)` to reopen as a plain unicast listener on the same port (preserves Andreas's "drop without losing port" requirement at the user-visible level — unicast UDP on the port keeps working). API arg `mcast_ip` kept for compatibility + sanity-checked against the bound group (mismatch logged but drop still proceeds). The previous 1.6.5 ESP8266 path-fork (`#ifdef ESP32 ... #endif` wrapping the raw IGMP call) is gone — the socket-layer path works on both ESP32 and ESP8266 with identical code. `<lwip/igmp.h>` include removed (no longer needed). The 13.05. smoke-test on .39 that "verified" the original implementation only checked rc=0 and the watchdog-rejoin gate; it never measured packet flow stop. New case-10 emits explicit success/failure logs per call so users can confirm at runtime. Workaround for users on 1.6.5 in the meantime: substitute `udp(0, <port>)` for `udp(10, ...)` — same socket-layer API path, same effect at the user level. (2) `EXT_RAM_BSS_ATTR` on `tc_share_table[TC_SHARE_MAX]` — Andreas's Bat3 override `TC_SHARE_STR_LEN=2560` + `TC_SHARE_MAX=32` yields a ~83 KB static table that was eating internal DRAM unconditionally on PSRAM-equipped boards. With the attribute, the BSS section is placed in external RAM when `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` is set in sdkconfig (true for Tasmota's tasmota32s3-* envs); on non-PSRAM boards EXT_RAM_BSS_ATTR resolves to empty → byte-identical placement to 1.6.5. Initializer `= { }` dropped (BSS is zero-init by definition; explicit init would force a data-section copy, defeating the attribute). (3) AddLog hardening on `SYS_SHARE_SET_INT/FLT/STR` — the 1.5.0..1.6.5 implementations silently `break`'d on three failure modes: null key (const-pool index invalid — bytecode corruption), `find_or_alloc` returning -1 (table at `TC_SHARE_MAX` capacity, no free slot), and (STR-only) source-buffer truncation past `TC_SHARE_STR_LEN`. All three now emit a specific INFO-level log including key name, attempted value (truncated to 32 chars for STR), and a "raise TC_SHARE_MAX/TC_SHARE_STR_LEN in user_config_override.h" hint. Motivating case: Andreas debugged a silent-drop scenario on 1.6.3 where SHARE_SET_STR was overflowing the then-default `TC_SHARE_MAX=24` with no diagnostic — the eventual bump to 32 was guessed-at, not data-driven. New `tc_share_count_used()` helper (mutex-held, linear scan) supplies the "%d/%d" capacity hint in the log. Caveat: a script polling shareSet in EveryLoop with a typo'd or always-failing key will flood the log; no per-key rate-limit (kept simple — script authors are expected to fix the call site once the log surfaces). All three items are independent — the udp(10) fix doesn't affect share-table behaviour and vice versa; both compile on ESP32 + ESP8266. IDE patch not needed (no API surface changes — `udp` is already variadic, share-set syscalls unchanged at the bytecode level). Andreas pending live cross-check on .107 with both `udp(10, "239.12.255.254")` and `udp(0, 9522)` paths — expectation is Phase-B `spw_pkts/h` falls to ~0 (vs the 18 000/h baseline that defeated the 1.6.1-1.6.5 path). Previous: "1.6.5" — ESP8266 build fix for udp(10, mcast_ip) — Ottelo's `tasmota4m_ottelo_tc` ESP8266 build failed with `'igmp_leavegroup' was not declared in this scope` at link time. The 1.6.1 changelog claim "ESP32 + ESP8266 LwIP both export the raw IGMP API → no platform gates needed" was wrong: ESP8266 LwIP keeps `igmp_leavegroup()` internal — the function exists but the public `<lwip/igmp.h>` header doesn't expose it the way the ESP32 IDF's LwIP does. Fix: wrap the `#include <lwip/igmp.h>` and the `case 10:` body of SYS_UDP_FUNC in `#ifdef ESP32 ... #endif`. On ESP8266, the case still pops its argument (stack-balance discipline) and pushes 0 (= not supported); scripts that detect the 0 return can fall back to `udp(0, port)` for a port-close. ESP32 path byte-identical to 1.6.4. Ottelo verified the fix builds clean on his side. **1.6.5 is now obsolete** — 1.6.6's socket-layer replacement makes the ESP32/ESP8266 split unnecessary and addresses the underlying correctness issue 1.6.5 was never going to detect. Previous: "1.6.4" — **Phase-1 vm_mutex fix from 1.6.3 ROLLED BACK** — commit `5f647b704` introduced an `xSemaphoreTake/Give(vm_mutex, portMAX_DELAY)` cycle around each 256-instruction batch in Phase 1 of `tc_vm_task` (mirroring Phase 2's TaskLoop pattern). Intent: close a Frame-locals-NULL race Andreas (.107 / Bat3) was hitting at ~30 % Slot-0-restart frequency. The fix was structurally correct (post-fix 4 reload cycles all clean, vs ~1-2 fail rate pre-fix) BUT triggered a much worse production regression: WR-Modbus-TCP-disconnect-storm at ~200/h vs ~7-8/h baseline. Andreas's user-side App-Layer-Watchdog forced TCP-disconnect + immediate reconnect every ~15 s after 3 consecutive Modbus-read fails — the Sunny-Tripower WR at 192.168.56.91:502 was being hammered with reconnects in the minute-takt, unzumutbar for production use. Andreas pulled .107 from the network at 21:15 today to protect the inverter. Mechanism (Andreas's hypothesis 1, most likely): Phase-1 holding vm_mutex for 256-instr batches (~5-10 ms each) serialised against Phase-2 TaskLoop's own mutex-cycle and against callback mutex-takes. When main() did substantial work (Andreas's `slot-0_bat_ctrl.tcb` is 27 KB of bytecode = several hundred ms init), the new contention pushed Modbus response-read latency past the worker's 200 ms threshold, the 3-fail watchdog tripped, TCP cycled, repeat. Also: the fix was incomplete — Andreas still hit 1× err=12 crash POST-1.6.3 with same fingerprint (PC=7273 ctx=main fp=0 fc=0 instr=375), so there's at least one other race-class the mutex doesn't catch. ROLLBACK is the correct trade-off: err=12 is a 30 % Restart-Roulette (recoverable, scripts re-launch), WR-Modbus-storm is a continuous Hardware-Hammer (potential damage). shareDump (1.6.2) and udp(10, mcast_ip) (1.6.1) remain intact — they're in the prior commit `ebb277e64`, unaffected. **A proper Phase-1 race fix needs a different mechanism** — candidate: clearing `vm->halted = false` AFTER `tc_vm_load` returns rather than before, so callbacks can't slip past the `!halted` gate during the load window. Will revisit when time + bench-rig allows. IDE H1 label bumped 1.6.2 → 1.6.4 (skipping 1.6.3, matching TC_RELEASE). Previous (rolled back): "1.6.3" — Phase-1 vm_mutex fix. Previous: "1.6.2" — `shareDump()` — new diagnostic syscall (SYS_SHARE_DUMP = 352, picked from the 352..359 gap between TCP tuning and crypto since the natural 348 slot was already taken by SYS_TCP_KEEPALIVE in v1.5.1) that walks the entire `tc_share_table[]` and emits one `TCC: share[N] key="K" type=T value=V` log line per live entry, plus a summary `shareDump: N/32 live entries`. Returns the number of live entries to TinyC. Pure diagnostic — non-allocating, mutex-protected, ESP32 + ESP8266 compatible. Andreas (.107 / Bat3) hit a reproduction of the cross-VM share-anomaly where Slot 2's `shareSetFloat` writes are correctly logged on the writer side but Slot 0's `shareGetFloat` reads return 0.0 for all keys Slot 2 owns (price, pv_tod, pv_tom). All four diagnostic theories from my 09:15 letter (init-race, float/int mismatch, slot-self-read, identifier-collision) were ruled out by his testing — the remaining hypotheses (allocator bug, type-tag mismatch in slot, mutex-failure under heap pressure) all benefit from being able to inspect the table contents directly. `shareDump()` lets a script log the inventory and answer: did the write actually land? at what index? with what type and value? — without resorting to firmware patches with strategically-placed debug logs. Plus IDE `<h1>` header bumped 1.6.0 → 1.6.2 (was a missed step in the 1.6.1 bump — Andreas spotted it at 12:45). IDE patch `patch_share_dump.mjs` adds the `shareDump` builtin to the BUILTINS table (zero-arg, returns int) and updates the visible release label. Previous: "1.6.1" — `udp(10, mcast_ip)` — netif-level IGMP-Leave syscall for clean multicast-off A/B testing. Calls LwIP's `igmp_leavegroup(IP_ADDR_ANY, &group)` directly so the host stops accepting packets to the group at the netif level, independent of which WiFiUDP/AsyncUDP socket originally joined it. Required because `WiFiUDP::stop()` only releases the underlying PCB — if multiple sockets share a port (as happens when `Tinyc->udp` globalvars-multicast and `Tinyc->udp_port` user-multicast coexist on port 9522), stopping one socket leaves the IGMP group membership pinned by the other, and packets keep arriving at the surviving bind. Andreas (.107 / Bat3 / Sunny Tripower diagnostics) discovered this when his A/B test loop did `udp(0, SPW_PORT)` to "turn off" multicast for Phase B and observed spw_pkts/h growing *higher* in Phase B than Phase A — the LwIP IGMP filter was still leaking 18 000 frames/h to whatever socket happened to be bound. Implementation in SYS_UDP_FUNC mode 10: parse the IP from a TinyC char[], call `igmp_leavegroup` with `ifaddr=0` (= any netif), log the lwIP err_t, and clear `Tinyc->udp_port_mcast` if it matched (so case-1's inactivity watchdog won't try to rejoin the just-left group). Returns 1 on ERR_OK, 0 on bad IP or LwIP failure. Pulled `<lwip/igmp.h>` into the file's includes block — small header, no transitive cost. Pairs with `udp(9, mcast_ip, port)` (join) and `udp(0, port)` (plain-unicast bind): the Phase-B sequence is now `udp(10, "239.12.255.254")` to leave, then re-join with `udp(9, "239.12.255.254", 9522)` at Phase-A return. No IDE patch needed — `udp` is a variadic builtin already, the new mode just adds a runtime case. ESP32-only path; ESP8266 has igmp_leavegroup too (LwIP raw API is identical) so the code compiles on both. Previous: "1.6.0" — `tcpTransact(req, req_len, resp, resp_max, timeout_ms)` — atomic write-and-await-reply for request/response TCP protocols (Modbus-TCP being the headliner). Folds the canonical `tcpWriteArray + delay/poll-tcpAvailable + tcpReadArray` pattern into a single syscall (SYS_TCP_TRANSACT = 351), eliminating the explicit busy-loop every script ships by hand. Returns: bytes received on success (the moment any data arrives, all immediately-available bytes up to resp_max are read); -1 timeout (no response within the window); -2 not connected, OR peer dropped mid-wait (tcpDisconnectReason() set to PEER_CLOSED in that case); -3 bad arguments. Wait granularity is 1 FreeRTOS tick (≈1 ms) — `vTaskDelay(1)` between availability checks lets other FreeRTOS tasks run freely during the gaps. Holds the calling slot's vm_mutex throughout — intended use is from a spawnTask worker handling one TCP session, where blocking that slot's other callbacks for ≤200 ms is fine. Suitable for protocols where the response fits in a single TCP segment (Modbus-TCP, ≤256 B); for protocols where data dribbles in chunks, the lower-level tcpWriteArray + tcpAvailable + tcpReadArray remain available unchanged. Updates examples/modbus_lib.tc to use tcpTransact internally — mbFC03/04/06/16 helpers drop the per-FC `mb_wait_for` poll-loop and become single-syscall transactions, also tightening the timeout-correctness story (the old loop slept up to 2 ms past the deadline; tcpTransact ends within ~1 ms of millis() ≥ deadline). IDE BUILTINS + simulator stub in lock-step (tinyc_ide.html.gz) so the compiler accepts `tcpTransact` and standalone-IDE runs report a "no net" stub return. Pairs with the v1.5.1 TCP tuning syscalls — typical SMA Tripower flow becomes: tcpSelect(0); tcpConnect(...); tcpKeepalive(30,10,3); /* loop */ int n = tcpTransact(req, 12, resp, 260, 200); if (n < 0) { reason = tcpDisconnectReason(); ... }. Andreas's BYD HVS + SMA Tripower polling worker shrinks from ~25 lines per FC to ~5 with this in place. Previous: "1.5.2" — `#include "file.tc"` directive (IDE-side only — pure preprocessor; firmware unchanged from 1.5.1). The IDE compiler now recognizes `#include "file.tc"` lines and inlines the content from the device filesystem (fetched via existing `/tc_api?cmd=readfile`) before compile. Recursive (included files can themselves #include); first-include-only deduplication acts as an automatic header-guard so simple libraries don't need #ifndef/#define wrappers; cycle detection (max depth 16) catches accidental infinite recursion. Fall-through: source with no #include directives is unchanged, no network call. New convention: shared libraries live as `.tc` files in the device's UFS (e.g. `/modbus_lib.tc`), main script does `#include "modbus_lib.tc"` and gets all the library's functions/globals as if typed inline. Motivating example: `examples/modbus_lib.tc` ships `mbFC03/FC04/FC06/FC16` helpers for Modbus TCP — Andreas's BYD HVS + SMA Tripower + HM2.0 stack now reads as e.g. `int n = mbFC03(0, 1, 0x0010, 4, regs, 200);` instead of hand-assembling 12-byte request frames in every script. Pairs with the v1.5.1 TCP tuning syscalls (tcpKeepalive/tcpDisconnectReason). Implementation: ~80 lines of new IDE JS (parseDirective gets a `'include'` case, preprocess() rejects unresolved #include with a clear error, new async `tcResolveIncludes()` wraps the recursive fetch+inline pass). `compileCode/runCode/saveTcb/uploadWiFi/runOnDevice` are now async to await the include resolver. Firmware is byte-identical to 1.5.1 (the inlined source becomes one big `.tc` text before the bytecode compiler runs — VM has no concept of separate compilation units). Previous: "1.5.1" — TCP-client tuning + critical regression fixes (May 7). Three new per-slot syscalls (348/349/350) for outgoing TCP connections: `tcpKeepalive(idle_sec, intvl_sec, count)` sets SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT on the selected slot via direct setsockopt on the LwIP fd — solves the SMA Tripower / Solar Edge "idle-disconnect after 60 s" pattern that's been forcing scripts to do periodic dummy reads; `tcpNoDelay(on)` toggles Nagle's algorithm (off by default after every connect, so this is mainly for re-enabling it intentionally); `tcpDisconnectReason()` returns 0..5 (NEVER, CONNECTED, PEER_CLOSED, TIMEOUT, NETWORK, USER_CLOSED) so a watchdog can react intelligently to RST/FIN vs network errors instead of blind reconnects. State is tracked per-slot in a new `tcp_cli_reason[TC_TCP_CLI_SLOTS]` field on the Tinyc struct; updated automatically by SYS_TCP_CONNECT/DISCONNECT/CONNECTED/DISCONNECT_REASON. Also bumped `TC_TCP_CLI_SLOTS` 4 → 8 (one Modbus-TCP user with BYD HVS + SMA Tripower SE + HM2.0 + Wallbox + future modules ran out at 4); each slot ~80 B in the Tinyc struct so 8 is fine even on ESP8266. Override via `-DTC_TCP_CLI_SLOTS=N`. IDE BUILTINS table + simulator stubs in lock-step (tinyc_ide.html.gz). Two critical regression fixes also rolled in: (a) AES/HMAC/SHA/HEX2BIN syscall stack-buffer overflow — 1.3.20 introduced `stackbuf[4096]` + `kbuf[1024]+dbuf[4096]` + `dbuf[4096]` + `src[1024]` as fixed-size locals inside `tc_vm_step`'s switch handlers; GCC at -Os reserves the largest unified switch-case frame at function entry regardless of which case runs, so every TinyC callback dispatch inflated tc_vm_step by ~5 KB. Loop task (8 KB) and web-server task (~4-8 KB) callbacks overflowed into adjacent heap → StoreProhibited in WiFi RX (esf_buf_alloc / wDev_IndicateFrame / ppTask). Fixed by heap-allocating all four buffers via special_malloc (PSRAM-preferring on equipped devices). (b) Multi-slot deadlock from `drop racy halted pre-check` (Apr 30) — that change removed the `s->vm.halted && s->vm.error == TC_OK` pre-check before tc_slot_callback in TinyCShow's JsonCall+WebCall fan-out, intending to fix a cosmetic spawnTask UI-disappear case. But without the pre-check every fan-out unconditionally takes each slot's mutex with portMAX_DELAY, deadlocking when a slot is mid-callback (delay) or mid-syscall in a spawnTask worker. Multi-slot configs hung permanently on slot startup or first nav-button click. Bisect against the C3 baseline (commit 63a7e6535, Apr 20) which ran the same pattern stably for weeks — pre-check restored. The spawnTask UI-disappear case will need a different cleaner fix (xSemaphoreTake with timeout instead of portMAX_DELAY) — open as a v1.6 follow-up. Previous: "1.5.0" — String operations (Option B from the strings evaluation): 7 new built-ins that operate in-place on existing char[] buffers — no new VM type, no GC, no heap pressure. New syscalls 302-308: SYS_STR_REPLACE_CONST (in-place find-and-replace-all of a literal old/new pair, returns count, handles both grow and shrink with full buffer-overflow guard), SYS_STR_STARTS_CONST (literal prefix check, 1/0), SYS_STR_ENDS_CONST (literal suffix check, 1/0), SYS_STR_CONTAINS_CONST (literal substring search, 1/0), SYS_STR_TO_UPPER (in-place ASCII A-Z conversion, UTF-8 multi-byte chars passed through), SYS_STR_TO_LOWER (in-place a-z), SYS_STR_TRIM (in-place strip leading + trailing ' '/'\\t'/'\\n'/'\\r', returns new length, shifts buffer down). Wired in the IDE BUILTINS table as strReplace / strStartsWith / strEndsWith / strContains / strToUpper / strToLower / strTrim. Each takes a `char[]` arg and a string-literal arg (compiled to const-pool index); runtime-needle variants intentionally not added in v1 — the literal-needle case is overwhelmingly common in IoT scripts (config-file parsing, prefix-based command dispatch, file-extension checks). Validated on .39 (tasmota32s3-devkit) via examples/test_strings_v15.tc — 9 test cases all green: multi-replace with UTF-8 expansion (unit=C → unit=°C ×2), replace grow (b → BB), replace shrink (hello → hi ×2), startsWith with edge cases (empty needle, longer-than-buffer), endsWith, contains, in-place case conversion, trim with all four whitespace cases (none, leading+trailing spaces, mixed \\t\\n\\r, all-whitespace). Closes ~80% of the "TinyC string handling is painful" gap from the strings evaluation; the runtime-needle variants and structural ops (split, join) are deferred — sprintf + the existing strToken cover those niches. Compile cycle unchanged (~10ms), bytecode adds ~20 bytes per call site (LOAD_CONST + LOAD_CONST + SYSCALL2). Previous: "1.4.3" — `void swap(int& a, int& b)` declares scalar pass-by-reference parameters; the callee reads/writes through the ref, mutations are visible to the caller. Also: `void parse_pair(int input, int& low, int& high)` for multi-out, `void inc_by(int& n, int amount) { n += amount; }` for in-place compound assignment, globals as ref args. **Zero new VM opcodes** — the implementation reuses the existing reference machinery (ADDR_LOCAL 0x78, ADDR_GLOBAL 0x79, LOAD_REF_ARR 0xA3, STORE_REF_ARR 0xA4 — already shipped for `int arr[]` array-by-reference params). A scalar ref is literally "an array ref always accessed at index 0": caller emits ADDR_LOCAL/ADDR_GLOBAL with the variable's slot/gindex; callee stores the encoded ref in a 1-slot local with `isScalarRef=true`; reads emit `PUSH_I8 0; LOAD_REF_ARR <slot>`; writes emit `PUSH_I8 0; <value>; STORE_REF_ARR <slot>`. Compound assignment (`n += 5`) handled with the standard DUP-and-recompute-offset pattern. Implementation: 5 idempotent patches in patch_refparams_v1.mjs (parser AMPERSAND-after-type acceptance, function-entry param registration, call-site ref encoding, identifier read, assignment write). v1 scope: int& only (float& and char& work too with same code path — declared types pass through, but coercions on float assignment route through I2F/F2I correctly); arg must be a plain Identifier of a local or global int variable; passing array elements (arr[i]), struct fields (obj.f), or heap-array variables yields a clear compile error. Validated on .39 via examples/test_refparams_v1.tc — all 4 patterns: swap (x=7, y=5 from 5,7), multi-out (lo=0xcd, hi=0xab from 0xABCD), compound `n += 5` (counter=25 from 10), globals as ref args (g_count=3, g_total=600 from 0,0). Out of v1: ref to array element (`func(arr[i])`), ref to struct field (`func(obj.f)`), heap-array vars as ref args, signature checking on the caller side (today silent). Float& and char& work but untested in v1. Previous: "1.4.2" — completes the dispatch-table pattern: `struct CmdEntry { char name[12]; cmd_handler handler; }` declares a struct with a typedef'd fn-ptr field; `cmds[i].handler = do_on;` assigns; `cmds[i].handler(args);` calls indirectly through the struct field. Three idempotent patches in patch_fnptrs_v2.mjs: (1) parser postfix accepts `(args)` after MemberAccess/MemberArrayAccess and produces a CallExpr with `callee` set to the access node (no name); (2) compileCallExpr detects callee-on-member-access, looks up the fn-ptr signature via the field's resolved type, pushes args, compiles the member access (emits LOAD_X to get the address from the struct slot), emits OP_CALL_INDIRECT; (3) exprLeavesValue extended to read the field signature for void-call detection. VM unchanged — uses the OP_CALL_INDIRECT shipped in v1.4.1. Validated on .39 via examples/test_fnptrs_v2.tc: 3-entry CmdEntry table populated with `cmds[i].handler = do_X`, looped-dispatched via `cmds[i].handler(arg)`, all three handlers (DO_ON, DO_OFF, DO_SET args=[42]) invoked correctly with the char[] arg propagated. Out of scope: function-pointer fields with array suffix `cmds[0].handlers[i](args)`, fn-ptr ARRAY fields. Previous: "1.4.1" — typedef-based fn-ptr types let scripts hold and call function references at runtime, enabling clean dispatch tables and callback-style APIs. New syntax: `typedef int (*cmp_fn)(int, int);` declares a fn-ptr type; `cmp_fn fn;` declares a variable; `fn = my_function;` assigns a named function's address; `fn(a, b)` calls indirectly. Works for locals, globals, and function parameters (e.g. `int run_op(cmp_fn f, int a, int b) { return f(a, b); }`). One new VM opcode `OP_CALL_INDIRECT 0x56`: pops u16 target from data stack instead of reading next 2 bytecode bytes, otherwise identical frame setup to OP_CALL. Bare function-name expression (no parens) emits PUSH_I32 with the function's bytecode address — uses big-endian 4-byte encoding to match existing PUSH_I32 / tc_read_i32 semantics; high two bytes always 0 since bytecode addresses fit in 16 bits. Forward references (calling a function defined later in the source) handled by a new `fnAddrPatches` queue that resolves after the function-compile pass alongside the existing forward-CALL patches. Implementation in patch_fnptrs_v1.mjs (11 idempotent patches against the IDE) + 1 new opcode handler in firmware. Validated end-to-end on .39 (tasmota32s3-devkit) via examples/test_fnptrs_v1.tc — all 4 patterns: local fn-ptr with two reassignments (7, 12), dispatch-by-id (9, 20), global fn-ptr with reassignment (Hello world! / Hi Tasmota.), fn-ptr as function parameter (30, 200). Two notable bugs found and fixed during validation: (1) initial PUSH_I32 byte order was little-endian, but firmware reads big-endian → indirect calls jumped to truncated addresses ending up at offset 0 and re-entering main() in an infinite loop; (2) compileExprStmt's exprLeavesValue() didn't know fn-ptr calls, defaulting to true → emitted POP for void fn-ptr calls → stack underflow on the 2nd void indirect call. Out of v1: function-pointer struct fields (interaction with Phase E pending), inline fn-ptr type syntax `void (*p)(int)` without typedef, comparison operators (==, !=) on fn-ptrs, returning fn-ptrs from functions, anonymous function literals. Previous: "1.4.0" — `struct Tag { int x; float y; char name[16]; }` defines a record type. Local + global + persist'd struct vars, positional initializer (`Point p = {1, 2}`), array of struct (`WriteLog wlog[16]`), char-array fields with `strcpy/sprintf %s`, nested structs (`Rect{Point tl; Point br}`), whole-struct assignment (`b = a` between matching tags) including array<->var both directions, struct as function parameter (by value), struct as return value, `sizeof(StructTag)` returns slot count at compile time. Implementation in `patch_structs_v1.mjs` (18 idempotent patches against the IDE). VM unchanged — uses existing 1D-array opcodes (LOAD/STORE_LOCAL/GLOBAL/HEAP_ARR) with compile-time field offsets and per-slot copy unrolling. Struct values follow TinyC's int32 slot model: each `int`/`char`/`float` field is 1 slot, char-array fields take their full slot count, nested structs flatten into the containing struct's layout. Heap-promotion follows existing rules: structs of ≤16 slots stack, larger ones (or array-of-struct totaling >16) auto-promote to heap. Return-by-value uses the existing `Op.RET` (which preserves data stack across frame teardown) — callee pushes N field values, caller pops them into the receiving local using a per-function temp slot for the offset/value swap. Validated end-to-end on .39 via `examples/test_structs_v1.tc` (11 test cases): basic field access (10/20/30), positional init, global+char-field, array indexed read/write, char-array field with strcpy+sprintf %s, nested struct (Rect.tl/br with 4-slot Point inner = 4 total slots, off-by-N bug fixed), whole-struct copy (var→var, arr[i]→var, var→arr[i]), function param (got 99,11), function return (z=42,84), sizeof (Point=2 WriteLog=4 Sample=18 Rect=4). Known v1 limitations: persist hash includes struct slotCount but NOT field-name list — silently reordering fields within a struct decl after persist data exists won't invalidate the .pvs file (workaround: delete .pvs manually, or add/remove a field which DOES invalidate). Also out of v1: self-referential structs (`struct Node { Node next; }` — needs pointers), 2D-array fields, struct equality `a==b`, designated initializers, function-pointer fields. Previous: "1.3.38" — `char/int/float buf[N][M]`. Full element read/write `buf[i][j] = …`, row passing `func(buf[i])` to char[]/int[]/float[] params, sprintf("%s", buf[i]) recognizer for char 2D, `strcpy/strcat/strcmp` on rows. Compiles to existing 1D heap-array opcodes via `i*M + j` flattening + `ADDR_HEAP_OFF` for row refs — VM unchanged. Row references require heap storage (auto-promoted at >16 elements; hard error otherwise with a clear message). Validated with `examples/test_2d.tc` (char) and `examples/test_2d_phase2.tc` (int + float + sprintf %s) on .39: int 2D writes/reads (ltab[r][c] = r*10+c → ltab[2][3]=23 ✓), float 2D (coef[1][1]=0.500 ✓), sprintf("%s", msgs[i]) in for-loop ✓. Patch script `patch_2d_arrays.mjs` is idempotent: applies cleanly to a fresh tinyc_ide.html.gz on each release rebuild. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)`. Element access `buf[i][j]` compiles to flat index `i*M + j` against the existing 1D heap-array opcodes. Single-index access `buf[i]` produces a row reference (via `ADDR_HEAP_OFF`, an existing opcode) when the result is used in a `char[]` parameter context — so `processChannel(buf[i], len)` and `strcpy(buf[i], "x")` work cleanly. Limited to `char` 2D for now; row-reference semantics requires heap storage (auto-promoted at >16 elements, so any practical 2D dimension qualifies). VM unchanged — pure compiler/IDE work. Validated end-to-end via `examples/test_2d.tc` on .39 with element access, constant + variable index row passing, strcpy/strcat/strcmp on rows, and a UDF accepting char[]. Phase 2 (deferred) covers `int/float buf[R][C]` and `sprintf("%s", buf[i])` recognizer. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)` move count int32 elements between file and memory as 4-byte little-endian. Same syscall serves int[] and float[] alike (both are int32 in memory; the on-disk bit pattern is identical). Motivating use case: chart history files that survive `persist` layout-hash invalidation. The existing `persist` mechanism is right for layout-coupled scalars (where reading wrong-named data is dangerous), but hostile for time-series chart arrays — every persist-var add/remove blows away hours of accumulated history. Scripts can now keep charts in regular globals and save/load to a dedicated named file via these syscalls, independent of persist. New IDs 286/287; documented in TinyC_Reference.md. Pattern is reusable for any binary blob (calibration tables, lookup tables, etc.). Previous: "1.3.36"    // Autoexec spawn — additionally gated on `TasmotaGlobal.uptime >= TC_AUTOEXEC_MIN_UPTIME` (default 3 s). 1.3.35 deferred the spawn from FUNC_INIT to first FUNC_LOOP, which on this hardware is uptime ~134 ms. Empirically that's still inside the Wi-Fi/RF coex bring-up window: `serialBegin` from main() claims the UART but receives ZERO bytes. (Verified on 2026.05.03 ttgo47 build with heatpump_map.tcb — Tasmota's own download server doesn't come up until uptime ~2.4 s, indicating WifiHasIP went true around then; before that the UART subsystem isn't stable.) Adding the uptime gate makes the autoexec spawn wait until the Wi-Fi/RF coex is past its bring-up phase. main() then runs in a fully quiet environment and serialBegin works without any script-side delay or BootInit hook. Override via `-DTC_AUTOEXEC_MIN_UPTIME=N` for slow networks. Manual TinyCRun mid-life is unaffected. Previous: "1.3.35" — Autoexec spawn deferred from FUNC_INIT to first FUNC_LOOP. Root cause analysis: TinyC's main() runs in its own FreeRTOS task (`tc_vm_task`) spawned during xdrv_124's FUNC_INIT. The task gets scheduled when loopTask yields — which it does while other drivers' FUNC_INITs are still running and Wi-Fi/RF coex is initializing. main() ends up calling `serialBegin` (or any peripheral begin) concurrently with this platform init, the UART claim returns OK but the GPIO matrix routing gets clobbered, and zero bytes ever arrive on RX. In-tree Tasmota drivers don't see this race because they all run synchronously on loopTask in FUNC_INIT, single-threaded. The historical workaround was `delay(15000)` at the top of main() — the 15 seconds let Wi-Fi/RF coex + every late driver fully settle before serialBegin ran. Fix: split TinyCLoadSettings into two phases. FUNC_INIT only loads `/tinyc.cfg` and populates `Tinyc->slot_config[]`; the actual TinyCStartVM() loop moves to a new `TinyCStartAutoexec()` called once on the first non-paused FUNC_LOOP. By that point every other driver's FUNC_INIT has run — main() spawns into a quiet environment and user `serialBegin`/`i2cBegin`/`spiBegin` in main() works without any delay or BootInit hook. The BootInit callback added in 1.3.31 is kept (still useful for users who want to keep main() lean and put hardware init in a separately-named function), but it's now an opt-in convenience instead of a workaround for a timing bug. `TC_BOOT_INIT_MIN_UPTIME` define from 1.3.34 removed (no longer relevant). Manual TinyCRun mid-life is unaffected — that path didn't have the race in the first place since Tasmota was already past FUNC_INIT. Validated against `examples/heatpump_map.tc` with bookkeeping-only main() + serialBegin in BootInit + 15-second delay removed. Previous: "1.3.34" — BootInit cold-boot uptime gate (`TC_BOOT_INIT_MIN_UPTIME = 3 s`). 1.3.33 fired BootInit on the first FUNC_LOOP after main() returned, but on a script with bookkeeping-only main, that fires within ~600 ms of cold boot — much too early for serialBegin: the UART claim succeeds (handle returned) but NO bytes ever arrive. Empirically this is the same race that motivated the historical 15-second `delay()` workaround in main(): Tasmota's late-init phase (WiFi-up RF coex, SerialBridge, console/OTA listeners) needs several seconds to settle before peripheral hardware is stable. New gate: only dispatch BootInit at FUNC_LOOP when `TasmotaGlobal.uptime >= TC_BOOT_INIT_MIN_UPTIME`. 3 s is the minimum that lets WiFi come up cleanly on a typical network. Mid-life TinyCRun reloads are unaffected — uptime is already large so the gate is moot, BootInit fires immediately after main returns. Override via `-DTC_BOOT_INIT_MIN_UPTIME=N` if 3 s is too short for a particular board (the user's empirical 15 s window suggests some hardware needs more — observe at `addLog` "BootInit fired at uptime N s" and bump if your script still misses bytes). Previous: "1.3.33" — BootInit gate fix — use `s->vm.halted` (with mutex) instead of `!s->task_running`. The 1.3.32 implementation gated dispatch on `!s->task_running` which is wrong for any script with a `TaskLoop` callback: TaskLoop keeps the slot's FreeRTOS task alive forever after main() returns, so `task_running` stays true and BootInit never fires. (heatpump_map.tc has TaskLoop for the email watchdog — that's how this surfaced. 0 frames after reload because serialBegin in BootInit never ran.) Correct gate: hold the slot's vm_mutex, check `s->vm.halted && error == TC_OK`, fire `tc_vm_call_callback_id`, clear `boot_init_pending` — all atomic against concurrent TaskLoop callbacks (which momentarily set halted=false during their own invocations). Also early-clear the pending flag when the script doesn't define BootInit at all (cb_index < 0) to avoid scanning the same slot every FUNC_LOOP forever. Previous: "1.3.32" — BootInit dispatch — per-slot, fires once per VM run instead of once per device boot. The 1.3.31 implementation gated dispatch on a static-global one-shot (`tc_boot_init_fired`) which only fired on the very first non-paused FUNC_LOOP at cold boot — meaning any TinyCStop+TinyCRun reload silently SKIPPED BootInit, breaking the dev workflow (every script reload would lose hardware init). New gate: per-slot `s->boot_init_pending` (in TcSlot) — set to `true` in `TinyCStartVM` right after tc_vm_load, cleared after dispatch. FUNC_LOOP scans all slots; for each loaded slot with `boot_init_pending && !task_running` (i.e. main() has returned), dispatch BootInit and clear the flag. Net semantics: BootInit fires exactly once per VM run, after main() exits, on the first FUNC_LOOP that follows. Cold-boot autoexec works (~50 ms after FUNC_INIT chain settles); manual TinyCRun reload works (immediately after main returns); post-upload restart works (via the existing TinyCStartVM call). Validated against `examples/heatpump_map.tc` migrated to use BootInit() for `serialBegin` (removed the historical 15-second `delay()` workaround at the top of `main()`). Previous: "1.3.31" — New `BootInit` callback — fires once on the first FUNC_LOOP, after every other Tasmota driver's FUNC_INIT has run and all template-defined GPIOs are configured. Equivalent of Scripter's `>BS` section. Solves a long-standing pain point where `serialBegin()` (and other peripheral inits) called from `main()` race Tasmota's own driver init and crash or silently fail to bind a pin — users had to insert a multi-second `delay()` at the top of main to work around it. New idiom: keep `main()` for VM-side bookkeeping (allocations, persist load, addCommand, etc.) and put hardware init (`serialBegin`, `i2cBegin`, `spiBegin`, peripheral config writes) in `void BootInit() { ... }`. By the time BootInit fires, Tasmota's GPIO+peripheral setup has fully completed; WiFi may or may not be up yet (use `OnWifiConnect`/`OnInit` for that). Wired analogously to `tc_init_done` (FUNC_NETWORK_UP one-shot for OnInit) — new static `tc_boot_init_fired` gates a single dispatch on first FUNC_LOOP. cb_index slot inserted in the middle of TcCallbackId enum (between EVERY_SECOND and ON_INIT) so all subsequent IDs renumber by +1; safe because nothing serializes these IDs across firmware versions and any in-flight `vm->cb_index[]` is always re-resolved at `tc_vm_load`. IDE CALLBACK_NAMES in lock-step (tinyc_ide.html.gz) so the compiler keeps `BootInit` in the function table instead of dead-code-eliminating it. CLAUDE.md callback section updated. Previous: "1.3.30" — pwlRequest — fully drop the handshake timeout caps that 1.3.24..1.3.29 were trying. Decisive new evidence: the unmodified Scripter Powerwall.h runs for months on the SAME firmware where our TinyC pwlRequest sticks within ~30 connect cycles. Same library, same Powerwall, same chip — only difference left was that we set tc_basic_client.setTimeout(10) + tc_ssl_client.setHandshakeTimeout(10) before connect; Scripter sets neither. Hypothesis: occasional ECDSA handshakes exceed the cap, aborted mid-handshake, leaves BearSSL state half-initialized, cumulative corruption. Reverting to exact Scripter pattern (only setTimeout(3000) + 2-arg connect). Worst-case stuck window goes back up to ~30 s but the script-side pwl-stale watchdog (5 min) catches the rare actual-stuck case via Restart 1. Previous: "1.3.29" — pwlRequest 10-second handshake timeout cap (sweet spot between aborting ECDSA and unbounded lwIP hangs). 1.3.28 removed all caps to fix ECDSA handshake aborting at 3 s — but then a stuck BearSSL session caused 120-s lwIP TCP-connect hangs (the ESP-IDF lwIP default), holding the VM mutex for 2 minutes per failed call. 10 s is well above ECDSA's ~5 s cost and 12× shorter than lwIP default. Pairs with examples/powerwall.tc lower reboot threshold (PWL_REBOOT_THRESHOLD 6 → 3) so when @R doesn't unstick BearSSL (observed: it usually doesn't) we fall back to chip reboot in ~30 s instead of after multiple 5-min backoff cycles. Previous: "1.3.28" — pwlRequest connect-timeout caps removed (1.3.24/25/26 reverted). Tesla rolled the Powerwall local-API cert from RSA to ECDSA; ECDSA handshakes on ESP32 BearSSL take 4-5 s (EC point math), which our wobbler-protection caps (setHandshakeTimeout(3), 3-arg connect with 3000ms, tc_basic_client.setTimeout(3)) were aborting before completion. Symptom: every pwlRequest returned -1 in 6228 ms (= 2 retries × 3 s) regardless of actual Powerwall reachability — the Scripter's same-library `Powerwall` class kept working because it never had these caps. Reverted to the Scripter pattern: only `setTimeout(3000)` (which BSSL_TCP_Client interprets as 3000 SECONDS — effectively no timeout) and 2-arg `connect()`. Wobbler recovery now relies entirely on the script-side circuit breaker (cookie wipe → @R → reboot escalation in examples/powerwall.tc), which still works because individual operations either succeed in normal time or block on the BSSL default ~30 s and then fail. Worst-case stuck window is back up to ~30 s per failed call but normal operation works again. Previous: "1.3.27" — pwlRequest("@R") — SSL reset without device reboot. Adds a new `@R` command to tc_call2pwl that tears down the BSSL_TCP_Client session AND the underlying WiFiClient socket, briefly pauses for lwIP to release, then re-binds and re-inits ssl config + buffer sizes + insecure mode, and clears the auth cookie. Lets the powerwall.tc script recover from a stuck BearSSL state (the recurring failure mode where every pwlRequest times out at 6 s regardless of Powerwall reachability) without escalating to `tasmCmd("Restart 1")`. The script's circuit breaker now does @R at PWL_RESET_THRESHOLD (3 consecutive FAST fails) and only escalates to chip reboot at PWL_REBOOT_THRESHOLD (6 fails) if @R didn't help. Existing `@D` (config), `@C` (cts serials), `@N` (clear cookie) commands unchanged. Previous: "1.3.26" — pwlRequest connect() with explicit timeout. 1.3.24+25 set tc_basic_client.setTimeout(3) AND tc_ssl_client.setHandshakeTimeout(3) — but neither reliably caps the BSSL_TCP_Client `connect(host, port)` call on Arduino-ESP32 core 3.x. Observed 37-second hangs on a single failed call despite both timeouts. Switched to the explicit 3-arg `connect(host, port, timeout_ms)` overload (BSSL_TCP_Client.h line 130) which bounds the whole connect+handshake phase. Worst-case stuck window per failed call now ~3 s × TC_PWL_RETRIES = 6 s instead of 37 s. The setTimeout/setHandshakeTimeout calls stay (they bound read/write phases) but the connect cap is now what it always should have been. Combined with the script-side circuit breaker (cookie wipe + 4× backoff + skip-remaining), Powerwall wobblers now cause one ~3 s mutex hold instead of cascading multi-call freezes — device stays HTTP-responsive throughout. Previous: "1.3.25" — pwlRequest SSL-handshake timeout cap. 1.3.24 capped TCP connect (`tc_basic_client.setTimeout(3)`) which dropped the worst-case stuck window from ~60 s to ~36 s — but the SSL handshake itself has its own ~30 s default in BSSL_TCP_Client and was now the dominant cost (observed 36.6 s timeout per failed call). Now also calls `tc_ssl_client.setHandshakeTimeout(3)` (BSSL_TCP_Client API, seconds) to bound the handshake phase. Combined: TCP connect 3 s + SSL handshake 3 s + read/write 3-5 s; with TC_PWL_RETRIES=2 on connect, worst case ~6 s per failed pwlRequest call instead of 36+ s. Pairs with the script-side circuit breaker in examples/powerwall.tc — single failed call now causes ~6 s mutex hold (HTTP server recovers between calls), cookie wipe + 4× backoff prevents repeated hits, device stays usable through Powerwall wobblers. Previous: "1.3.24" — pwlRequest TCP connect-timeout cap. tc_pwl_get_cookie / tc_pwl_get_request both call `tc_ssl_client.connect()` which on Arduino-ESP32 inherits a ~30-s default TCP-connect timeout — the `setTimeout(3000)` set on the SSL client right above only bounds read/write. Combined with TC_PWL_RETRIES=2 + delay(100), worst case = ~60 s of held VM mutex when the Powerwall is unresponsive. During that hold the device looks completely "stuck" from the LAN side: HTTP server can't respond, multiple cadences pile up in TaskLoop, cascade of 3× 60-s timeouts froze a test device for ~3 minutes. Now also calls `tc_basic_client.setTimeout(3)` (Arduino WiFiClient API, seconds) which DOES bound the connect phase. Worst case drops to ~6 s (2 retries × 3 s). Pairs well with the script-side circuit breaker in examples/powerwall.tc which now backs off + clears the auth cookie on consecutive failures. Previous: "1.3.23" — pwlRequest now accepts a runtime char[] buffer (was: string-literal only). The SYS_PWL_REQUEST handler used to call `tc_get_const_str(vm, ci)` which only reads from the bytecode constant pool — meaning the whole credential string ("@Dip,email,password") had to be hardcoded in the .tc source. That forced either committing credentials or sprinkling `<POWERWALL_IP>` placeholders that broke the build for everyone else. Now uses the same dual-source `tc_ref_to_cstr` pattern that SPRINTF_STR was fixed to use a few releases back: copies up to 160 chars (fits @D ip,email,password) into a stack buffer regardless of whether the ref is a const-pool string literal or a heap/local char[]. IDE BUILTIN tinyc_ide.html.gz updated in lock-step (pwlRequest's `constArgs: [0]` → `strArgs: [0]`) so the compiler stops rejecting non-literal first arguments. Net effect: scripts can now do `char cmd[160]; sprintf(cmd, "@D%s,%s,%s", ip, email, pw); pwlRequest(cmd);` with credentials read at runtime from /powerwall.cfg — no more TESLA_EMAIL/PASSWORD/IP defines needed in user_config_override.h, no more credentials in the firmware binary, no more credentials in the .tc source. Pattern is identical to /pool_pump.cfg loading in examples/pool_pump.tc — see examples/powerwall.tc's load_pwl_config() for the canonical implementation. String-literal callsites (the existing `pwlRequest("/api/meters/aggregates")` etc) keep working unchanged because tc_ref_to_cstr handles const-pool refs transparently. Previous: "1.3.22" — sprintf %%-escape fix in `tc_sprintf_float`. The custom Arduino-safe float formatter (which bypasses libc snprintf because Arduino strips %f support) hand-walks the format string and copies prefix/suffix bytes verbatim around the float-spec replacement. The hunt loop correctly *skips* `%%` while searching for the active spec, but the prefix/suffix copy loops were emitting `%%` literally — producing e.g. "85 %% (12.98 kWh)" instead of "85 % (12.98 kWh)" on `sprintf(buf,"%d %% (%.2f kWh)",pct,kwh)`. Visible in any TinyC sprintf with `%%` adjacent to a float spec; the int path uses real snprintf and was already correct. Fixed both the prefix and suffix byte-walk loops to detect `%%` pairs and emit a single `%` (one extra `c++` per pair). No format-string semantic change for existing call sites that didn't use `%%`. Previous: "1.3.21" — UDP `global` send-side self-heal: when WiFi degrades, Arduino UDP can wedge multicast `endPacket()` while the upper-layer `udp_connected` flag stays true — silencing all `global` broadcasts from a slot until that slot is restarted. Symptom seen on a heat-pump device .31 whose `hp_in/hp_out/hp_at/hp_run` UDP globals stopped reaching subscriber slots even though the VM kept executing and `store_reg()` kept assigning. Receive side already auto-recovered via inactivity watchdog (`tc_udp_poll`); send side now mirrors that — `tc_udp_send/_array/_str` check `endPacket()`'s return value and on failure call `tc_udp_send_fail_recover()` which throttle-rebinds the multicast socket (`tc_udp_init()`). Throttle is `TC_UDP_REINIT_THROTTLE_MS = 5000` so a genuinely-down network can't cause continuous re-bind churn (every assignment to a UDP global would otherwise trigger). Logs at INFO when a re-init fires. Same logic transparently helps any future scripted-UDP/`udpSend` path that goes through these helpers. Previous: "1.3.20" — Symmetric crypto syscalls (360–365): aesEcb / aesCbc (AES-128, in-place on TinyC char[] buffers), hmacSha256, sha256, plus hex2bin / bin2hex byte-twiddling helpers. ESP32-only via mbedtls (already linked for HTTPS/MQTT-TLS); ESP8266 path stubs return 0/no-op. Motivating use case: TinyC scripts speaking the Tuya local protocol (v3.3 = AES-128-ECB) so users can drive Smart-Life-controlled devices (pool heat pumps, plugs, switches, dehumidifiers) directly from Tasmota without a cloud round-trip or a separate bridge. Also enables custom signed REST APIs (HMAC-SHA256), encrypted SML decoders not covered by AmsLib, and per-device MQTT-TLS fingerprinting. Buffers follow TinyC convention (one byte per int32 slot, low 8 bits used); lengths are in bytes and must fit the ref's allocated capacity. AES-CBC stack-allocates up to 4 KB per call, falls back to malloc above; HMAC/SHA bounded at 1024 B key / 4 KB data — bigger payloads should be hashed in chunks via repeated SHA-256 of a hash-state buffer (future enhancement). Tuya v3.4 (ECDH+AES-GCM) not exposed yet — most Smart-Life devices are still v3.3. IDE BUILTINS + symbol-table entries for the 6 functions are wired (refArgs[] / strArgs[] / intArgs[] in tinyc_ide.html.gz) — first user is examples/pool_pump.tc, validated end-to-end on ESP32-S3. Previous: "1.3.19" — Cross-VM share table + PSRAM-backed bytecode + IDE strcmp/sprintf fixes. (1) New 8-syscall `share*` API (340–347) lets two TinyC slots exchange named scalars/strings via a driver-global 32-entry table (~2.6 KB DRAM, mutex-protected on ESP32). Use this when one program outgrows a single slot and is split across two — e.g. Andreas's BYD/Speedwire/EEBus stack. Missing-key reads return 0/0.0/"" without error; `shareHas`/`shareDelete` complete the model. (2) `TC_MAX_PROGRAM` 65536 → 131072 with PSRAM fallback: `s->program` and `vm->const_data` allocate from internal DRAM first, only spill to `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` on OOM (ESP32 only). Small/normal programs stay in fast static RAM; only edge-case 100+ KB scripts (or scripts on devices with fragmented heap) reach PSRAM. AddLog INFO line emitted when PSRAM path is taken. (3) IDE: 4-site emitByte-truncation bug fixed — `emit(Op.SYSCALL); emitByte(Syscall.X)` truncated ids ≥256 to `id & 0xFF`, silently rerouting STRCMP_CONST=275 to SYS_MATH_POW=19 (so `strcmp(arr,"literal")` returned NaN bits 0x7FC00000 = 2143289344, breaking every `if (strcmp(...) == 0)` branch). Same bug hit FILE_WRITE_STR=276, LOG_LEVEL=269, LOG_LEVEL_STR=270. All four sites now use the existing `emitSyscall(id)` helper which auto-picks SYSCALL2 (u16) for ids ≥256. (4) IDE: `inferType(CallExpr)` had a hardcoded float-builtin list (sqrt/sin/cos/.../atof) and ignored the symbol-table `returnFloat: true` flag, so `sprintf(buf,"%.2f",shareGetFloat(...))` saw valType='int' and emitted I2F → reinterpreted bits → printed 1056964608.00 (= 0.5f bit-pattern). Now also returns 'float' when `BUILTINS[name].returnFloat === true`; future float-returning builtins work automatically.   Previous: "1.3.18" — Constant pool cap raised 512→1024 on ESP32 (Andreas BYD/Speedwire/EEBus scripts hit 440/512). "1.3.17" — TC_ERR_BOUNDS rich log + RET-time SP-balance check + compiler float→int narrowing warning.
+#define TC_RELEASE         "1.6.49"     // **TinyC 1.6.49: die IDE uebersetzt jetzt FUER DAS GERAET, an dem sie haengt. Sie kennt dessen ABI laengst — /tc_api?cmd=status liefert sie, und es ist DASSELBE Feld "Device IP", ueber das auch die .tcb hochgeladen wird; das Ziel ist also nicht geraten, sondern konstruktionsbedingt richtig. Bisher diente die Zahl nur einer Warnung. Jetzt richtet sich die Uebersetzung danach, und das nutzt die beiden Arten von ABI-Bedarf verschieden: VERSCHMELZUNGEN sind entbehrlich — die unverschmolzene Form bedeutet dasselbe, also laesst der Compiler sie weg, wenn das Geraet sie nicht kennt (Programm bleibt korrekt, nur langsamer). SYSCALLS sind es nicht — wer bleSppConnect() aufruft, braucht ABI 20, hier gibt es keine aeltere gleichbedeutende Form; also harter Abbruch mit Namen statt einer .tcb, die auf dem Geraet an einem fehlenden Syscall stirbt. Gemessen an einem Skript mit Schleife: Ziel 23 -> abi_rev 23 (98 B), Ziel 22 -> 22 (97 B), Ziel 21 -> 21 (101 B), Ziel 20 -> abi_rev 2 (107 B) und laeuft damit auf beliebig alter Firmware. Kostet unverschmolzen rund 1,8x auf engen Ganzzahlschleifen und ~9 Prozent mehr Bytecode. Ohne erreichbares Geraet bleibt alles wie bisher (volles ABI) — und beides wird im Ausgabefenster GESAGT, damit niemand still langsameres Bytecode bekommt, ohne zu wissen warum. ⚠️ Die Warnung "Geraet aelter als IDE" ist entfallen: sie behauptete, eine .tcb koenne die falsche Firmware-Funktion aufrufen — das verhindert der Lader, und jetzt entsteht so eine .tcb gar nicht erst. Nur die Gegenrichtung (Geraet NEUER als die IDE) bleibt eine echte Warnung. Alle 225 Beispiele uebersetzen byte-identisch, die Erweiterung ist rein additiv. || VORHER 1.6.48: Notfallbehebung fuer die IDE aus 1.6.47 — sie stuerzte beim UEBERSETZEN ab, nicht erst beim Ausfuehren. Der Disassembler bekam in 1.6.47 die neuen Superinstruktionen, und im Zweig fuer LK_OP_ST/LL_OP_ST stand `opcode` statt `op` — eine Variable, die es in vm.js nirgends gibt. ES-Module laufen im strict mode, also ReferenceError: "opcode is not defined". Und da disassemble() nach JEDEM Uebersetzen automatisch die Disassembler-Ansicht fuellt (nicht erst auf Knopfdruck), traf es jedes Skript mit einer Zuweisung der Form x = y OP z oder x = y OP konst auf int-Locals — also praktisch jedes. Gemeldet von mi-hol (Issue #115), Behebung ist ein Wort. ⚠️ Die Lehre steht als Kommentar schon neben der Fundstelle: eine neue Superinstruktion braucht VIER Eintraege (tc_vm_step, tc_vm_run_slice_ex, den Bytecode-Scanner der Firmware, den IDE-Disassembler) PLUS den Simulator — und ein Disassembler-Fall, den niemand ausfuehrt, wird von keinem Test erwischt. An der Firmware und am Bytecode hat sich NICHTS geaendert; ABI bleibt 23. Wer 1.6.47 geflasht hat, braucht nur die neue IDE (TinyCIde aufrufen, Seite hart neu laden). || VORHER 1.6.47: die VM ist ueberall schneller, und ein eigener Schutzmechanismus hat rohe Web-Antworten getoetet. (1) FIRMWARE Webserver: rohe Scripter-Antworten kamen nur an, solange die Tasmota-WebUI im Browser offen war. Das 8-Sekunden-Sendebudget aus dem Wedge-Schutz (WS_SEND_BUDGET_MS, urspruenglich gegen einen an einem langsamen Client festhaengenden loopTask) verankerte seinen Startzeitpunkt NUR in WSContentBegin(). Ein Scripter->on1, das per won(1 "/v1/json") einen eigenen HTTP-Header mit wcs so(4) / wcs / wcf schreibt, laeuft da nie durch -- es mass also gegen den Start der VORHERIGEN Antwort. Lag der ueber 8 s zurueck, wurde die Verbindung geschlossen, BEVOR ein einziges Byte rausging: curl meldete "Empty reply from server". Fingerabdruck: der Endpunkt lebte nur, solange die WebUI offen war (deren ~2 s-Polling hielt den Zeitstempel frisch), und nach jedem beliebigen normalen Request exakt 8 s lang; der Handler lief und baute seinen JSON-String korrekt, nur ausgeliefert wurde nichts (ottelo, EcoTracker- und Shelly-Emulation). Das Budget wird jetzt PRO ANFRAGE verankert -- Ruecksetzung in PollDnsWebserver vor handleClient, Verankerung in WSContentBegin wie bisher UND spaetestens beim ersten Byte in _WSContentSend. Rohe Antworten bekommen dadurch auch den 2s-SO_SNDTIMEO je Schreibvorgang, den sie nie hatten; fuer normale Seiten aendert sich nichts. (2) TEMPO: der ESP32 fuehrt Bytecode jetzt auf der direkt gefaedelten Schleife aus (2,4x bis 3x, 671 -> 276 ns je Opcode), Frame-Locals werden wiederverwendet (ein Funktionsaufruf kostet 2,8 statt 11,8 us), und sechs Superinstruktionen fassen die haeufigsten Muster zusammen: i++ als Anweisung (0xB0), x = y OP z und x = y OP konst (0xB1/0xB2), deren Weitkonstanten-Zwilling (0xB3) und der Schleifenkopf if !(La CMP Lb|k) goto (0xB4/0xB5), der jede Schleife und jedes if trifft. Der Rumpf von bench_int schrumpfte von 33 auf 13 Opcodes. Gemessen auf .39 gegen Berry auf demselben Chip: Ganzzahl 923 -> 499 ms (Berry 401), Fliesskomma 477 -> 389 (212), Felder 802 -> 643 (2072), Aufrufe 968 -> 748 (810), Zeichenketten 179 -> 152 (97), gesamt 3353 -> 2433 ms gegen Berrys 3592 -- TinyC liegt damit 1,48x vorn. (3) WARNUNG ABI 20 -> 23: neu uebersetzte .tcb laufen NICHT auf aelterer Firmware. Seit ABI 21 VERWEIGERT der Lader eine .tcb mit hoeherer abi_rev, statt sie zu laden und dann mitten in der Schleife an einem unbekannten Opcode zu sterben. Also erst Firmware flashen, dann TinyCIde aufrufen und die IDE-Seite hart neu laden, und erst danach Skripte neu uebersetzen. (4) TC_HEAPLOG baut jetzt auch auf ESP32 -- vorher war es auf 8266 gegated und damit blind auf genau der Plattform mit dem ~1 KB-je-Slot-Neustart-Leck -- und setzt Marken im Inneren der VM-Task. Nur mit -DTINYC_HEAP_DEBUG, kostet normale Builds nichts. Damit per Messung ausgeschlossen: Frame-Locals-Cache, FreeRTOS-Tasklebenszyklus (2 Byte je 251 Zyklen), tc_vm_load, Persist-Restore, Programmpuffer. Die Drift von ~1028 B steht schon an der allerersten Marke IM Task. || VORHER 1.6.46: vier Neuerungen und ein Fehler, der jede zweite Seite still halbiert hat. (1) FIRMWARE Web-Callbacks: WebCall/WebPage/JsonCall prueften vm.halted UNGESPERRT und mit NULL Wartezeit und liessen den Slot dann aus. Ein Slot mit TaskLoop + delay(10) ist die halbe Zeit nicht halted -- also fehlte in der Haelfte aller Seitenaufbauten der GANZE Block dieses Skripts: keine Sensorzeile, kein Canvas, keine Fehlermeldung, kein Logeintrag. Von aussen sah das nach Browser oder WLAN aus. Gemessen von Rolf an max30102.tc: WebCall 11/12, WebPage 4/8, waehrend derselbe Slot ueber seinen webOn-Endpunkt 25/25 lieferte -- weil DER wartet. Jetzt wartet der Seitenaufbau auf das naechste nutzbare Fenster und entscheidet das UNTER dem Mutex, gedeckelt auf 400 ms fuer die ganze Seite (TC_WEB_PASS_BUDGET_MS). Nach dem Fix an .39 nachgemessen: 20/20 auf allen drei Endpunkten, auch wenn das delay() eine Funktion tief steckt, bei unveraenderter Latenz. ⚠️ Wer wartet, muss auf das RICHTIGE warten: ein TaskLoop, der eine Funktion tief bei delay() parkt, IST halted (Mutex frei), nur die Rahmentiefe steht auf 2 -- ein Warten allein auf halted meldet sofort 'bereit' und wird danach von der Reentrancy-Sperre abgewiesen. Genau daran scheiterte der erste Anlauf (0/20, inklusive der 1500-ms-Wartestelle von webOn). Es gibt jetzt EIN tc_slot_dispatchable() -- halted, kein Fehler, Rahmentiefe <=1, nicht geliehen --, auf das ALLE Wartestellen warten. Uebriggebliebene Ausfaelle werden gezaehlt: das nackte Konsolenkommando TinyC meldet \"WebSkip\":N je Slot, TinyCInfo zeigt es in den Webzeilen. Steigt die Zahl, ist der eigene TaskLoop zu beschaeftigt -- nicht der Browser. (2) COMPILER #if wertet jetzt den WERT eines Makros aus, nicht nur seine Existenz: '#define SIM 0' gefolgt von '#if SIM' war WAHR, weil nur eine Menge von Namen gefuehrt wurde. Ein Simulationsschalter auf 0 blieb damit an, und das Geraet meldete weiter 'SIMULATION aktiv'. Braucht nur die neue IDE. (3) BLE \"SPP\" -- eine BLEIBENDE GATT-Verbindung (ABI 20, bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump). Der bisherige GATT-Client verbindet, macht EINEN Vorgang und trennt -- richtig fuer eine Waage, falsch fuer einen Strom. UUIDs sind hier Zeichenketten (16 Bit oder volle 128 Bit); die alte int16-Variante erreicht einen proprietaeren Dienst gar nicht. Verifiziert an einem BlueRadios-Modul (EKG-Rekorder, 250 Saetze/s, null Synchronfehler). ⚠️ bleSppWrite zerlegt an der ATT-MTU -- ein 29 Byte langer Befehl passte vorher in keinen einzelnen Schreibvorgang und verliess den ESP nie, waehrend kurze Befehle immer durchgingen. Braucht eine Firmware mit USE_TINYC_BLE. (4) Bluetooth Classic / SPP (ABI 17/18, sppInit..sppScan + sppDeinit) -- serielle Verbindung zu JEDEM Classic-Geraet, das Protokoll lebt im SKRIPT. NUR der klassische ESP32 (BR/EDR) und nur mit USE_TINYC_SPP gegen ein Bluedroid-Framework; S3/C3/C6/P4 sind BLE-only. sppDeinit gibt die rund 85 KB des Stapels zurueck -- ohne das scheitert der naechste Slot-Neustart an der Speicheranforderung und meldet irrefuehrend 'Stack overflow'. (5) lvglChartUpdateMode (ABI 19) legt lv_chart_set_update_mode offen. Die LVGL-Vorgabe SHIFT macht bei jedem Wert die GANZE Diagrammflaeche ungueltig, CIRCULAR nur eine schmale Spalte -- auf einer 760x300-Flaeche Faktor ~250 und der Unterschied, ob eine 250-Hz-Kurve darstellbar ist. Ausserdem: die lwIP-PCB-Warnung zaehlte ihren eigenen Beobachter mit, der JPEG-Display-Spiegel wird jetzt auf einen wirklich vorhandenen Encoder gegatet, und Doku zu WebChart -- Nullpunkt per WebChartJS(\"o.vAxis.viewWindow={min:0}\") bei unbekanntem Maximum, und WebChartSize ist EINE Einstellung je Seitenaufbau, die in Slot-Reihenfolge weiterwandert (ein Skript ohne eigenen Aufruf erbt die Breite des Vorgaengers statt der Vorgabe -- Ursache ungleich breiter Diagramme bei mehreren Skripten). ⚠️ ABI 16 -> 20: ein .tcb, das die neuen Aufrufe nutzt, braucht diese Firmware. Bestehende .tcb laufen unveraendert weiter (reine Anhaenge, kein Formatwechsel). ⚠️ Nach dem Flashen einmal TinyCIde in der Konsole aufrufen und die Browserseite hart neu laden -- die IDE liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht. || VORHER 1.6.45: drei Fehler, die alle STILL waren -- kein Compilerfehler, keine VM-Meldung, nur ausbleibende Wirkung. (1) FIRMWARE tc_stream_ref(): ein String-LITERAL, das durch einen char[]-FUNKTIONSPARAMETER gereicht wird, kommt als Konstanten-Pool-Referenz an, und tc_resolve_ref() gibt dafuer ABSICHTLICH nullptr zurueck -- webSend(css) gab dann GAR NICHTS aus. `void row(char css[]){webSend(css);} row("left:57px;")` blieb wirkungslos, waehrend sprintf("%s",param) durchweg funktionierte; das sah deshalb nach einem CSS-Problem aus statt nach einem verschluckten String. Betrifft webSend/responseAppend/mailBody und die uebrigen Streaming-Syscalls. (2) FIRMWARE tcbtn(): sicherte textContent statt innerHTML und stellte die Textfarbe hart auf '' zurueck -- ein Button mit Markup darin (z.B. <span>-Punkte) war nach dem ERSTEN Klick dauerhaft leer, und eine per Skript gesetzte Inline-Farbe ging verloren. Jetzt werden innerHTML UND die urspruengliche Inline-Farbe gesichert und zurueckgestellt. (3) COMPILER (codegen.js) String-Ternaer als Aufrufargument: `f(c ? "a" : "b")` uebersetzte anstandslos und tat zur Laufzeit NICHTS -- dieselbe Konstanten-Pool-Falle, sie trifft rund 79 Syscalls (responseCmnd, addLog, ...). Behoben durch Aufspalten in ZWEI vollstaendige Aufrufe, je einen pro Zweig, mit gewoehnlichem Literal-Argument; damit sind alle Syscalls auf einen Schlag erledigt, und es wirkt auf BEREITS AUSGELIEFERTER Firmware. ⚠️ (1) und (2) brauchen einen FLASH, (3) braucht nur die neue IDE -- und die liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht: nach dem Update einmal `TinyCIde` in der Konsole aufrufen und die Browserseite hart neu laden. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.44: neuer Syscall fileRename() (522/523) + IDE-Simulator-Fix. fileRename(from,to) -> 0/-1, beide Pfade Literal oder char[]; ein VORHANDENES Ziel wird NIE stillschweigend ueberschrieben (Tippfehler im Zielnamen darf keine Daten vernichten) und Umbenennen ueber Dateisystemgrenzen (/ffs/ <-> /sdfs/) wird abgelehnt statt halb zu scheitern. Motiv: sml_chart speichert Historie UND Nullpunkte jetzt gemeinsam in der .pvs (ottelo9/tasmota-sml-images#50) und braucht dafuer eine "schon uebernommen"-Marke -- die alte .bin wird nach <name>.done UMBENANNT statt geloescht, ihr Vorhandensein ist die Marke. Ausserdem in idesrc/src/vm.js: `Syscall` war in 63 case-Labels benutzt, aber nie importiert -- der Browser-Simulator starb an ReferenceError, sobald ein Syscall keinen frueheren Zahlen-Fall traf (z.B. jedes Programm mit fileWrite). WICHTIG: die IDE liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht -- nach dem Update einmal `TinyCIde` in der Konsole aufrufen, sonst meldet der Compiler "Undefined function: fileRename" trotz passender Firmware. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.43: persist + upload/network roll-up since 1.6.42 (no .tcb-format / syscall-ABI change, still ABI 16). PERSIST OVERHAUL: name-keyed .pvs (PV3, 3763abf02) - adding/reordering/resizing persist vars or recompiling NO LONGER wipes saved state (entries migrate by NAME; PVS2 read-fallback so old .pvs upgrade seamlessly); persist cap 64->128 on ESP32 with a LOUD parse error when a program exceeds the cap (was SILENT truncation - vars past #64 always reloaded as 0); heap-persist ARRAYS (persist float a[N]) now actually restore across reload AND reboot (5a0f1f06f: restore-at-load + idempotent slot-stop - a reload's double TinyCStopVM used to re-save from the freed heap and zero the .pvs) => chart history can live in .pvs (energy_dashboard converted, .bin files dropped). WORKER/FS: spawnTask worker runs on its own dual-context VM aliasing primary globals, DEFAULT-ON ESP32 (3342f4835; fixes callback 'Bounds PC=0' frame corruption under concurrent net I/O; opt out USE_TINYC_NO_WORKER_VM); cross-slot file-handle race fixed (3473e6192: atomic reserve under mutex + owner-keyed close - two tasks could grab the SAME handle -> wrong-file writes/heap panics). UPLOAD/NET: port-83 raw-socket large-upload server off loopTask (fixes big /ufsu truncate+reboot) + post-FIN drain; dl/upload (82/83) + cam-stream servers now start on Ethernet-only devices (HasIP instead of WifiHasIP); /ufsu deletes the partial file on an aborted write and reports distinct error 10 'write failed' (was misreported as 'too large'); UDP-pause-sync during blocking TLS + tcpConnect 2s default timeout. WEB/LVGL: multi-series WebChart defaults to a top legend (series names no longer truncate to '...'); TC_LV_MAX 128->256 + lvglSetText type-guard (dashboard handle-overflow crash). Examples: energy_dashboard solar + battery-SOC charts (persist-backed), sml_ebus energy/temp charts + dual y-axis, moritz_dash alarm siren+email + MAN/AUTO per thermostat, marstek discharge-cap, hyundai_soc manual live-refresh, esf37 history table + TTS toggle + bounded GATT read.** **TinyC 1.6.42: bugfix roll-up since 1.6.41 (no .tcb-format / syscall-ABI change, still ABI 16). HEAP-CORRUPTION FIX: disabled the idle bump-heap shrink (a11c45565) - special_realloc could MOVE the VM heap while the running program's live frame/stack/global/handle references are ABSOLUTE pointers (not offsets), dangling them all -> use-after-free -> tlsf_free/lwIP crashes + ~30s-cadence boot-loops on ESP32. Root cause of Rolf's .200 (Matter+SML+DS2484) and Andreas's C6 crashes; found independently via OTA git-bisect + UBSan. Callback-arg buffer now reserved per-slot + eager-reserved at slot load (fixes 'Event callback heap alloc failed' after hours of uptime). ESP8266 RUNS AGAIN and ships again: output-program HWDT fixed (tc_syscall scratch buffers moved to heap). Web UI: control-panel scripts render their controls INLINE on the main page (raw HTML in WebCall via /cm?cmnd=...), and a bare WebUI() no longer emits the stray generic 'TinyC UI' button - only webPageLabel-registered pages get a /tc_ui button, and /tc_ui no longer 503s when it would land on an empty slot. Example fixes: ecotracker daily-chart off-by-one date, marstek real Venus E control via the UDP JSON-RPC local API, bmx280 BME680/688/690.** **TinyC 1.6.41: device-wedge + web-stability roll-up since 1.6.40. /tc repo index + .tcb downloads moved CLIENT-SIDE (a synchronous repo TLS GET on the loop task wedged the device for minutes); chunked-send loop-block bounded (a permanent web-wedge under slow-client reload becomes a self-recovering ~8s cap, Andreas-verified) + lwip/sockets self-include; deferred commands (tasmDefer/audioPlay/I2STTS/sendmail) now run from EVENT-DRIVEN slots (were gated on slot-0 vm.halted, never true for a callback slot -> silently never fired); Scripter ?sv= crash on TinyC builds fixed + ?sv= bounds-check; TasmotaSerial freeUart C3/C6 hang fixed; WebChart rolls the newest sample to the right edge; LVGL runs on renderer-based displays (RA8876, not just uDisplay); chkpt r handles a custom partition BEFORE spiffs without bricking. No .tcb format / syscall-ABI change vs 1.6.40 (ABI 16).** **TinyC 1.6.40: per-script main-page web cards (webCard 521, ABI 15->16 -- each WebCall slot auto-framed in a <fieldset> so multiple apps on one main page get a frame+gap; webCard(0) opts a slot out) + TLS-before-WiFi boot-crash guard + repo-fetch offline skip/backoff + raw-TLS abort-close & lwIP PCB-pool census + dyson STATE-CHANGE parse + widget writes routed to the rendering slot. ABI 15->16 (webCard pure append; recompile .tc with the v16 IDE). **TinyC 1.6.39: test-release roll-up of a month's work since the 1.6.38 build — main-loop wedge fix (httpGet/Post/sendMail no longer stall the device), share-table heap fix (~120 KB internal DRAM back on S3+PSRAM), dead-IP connect bounding, raw TLS client + rsaEncrypt() + utcSecs() syscalls, audio (full-duplex I2S / WAV player / mic in), on-device LVGL GUI, P4 MIPI camera + BLE GATT, IDE/firmware ABI-mismatch warning; ESP8266 builds + runs basic programs again (custom images). No .tcb format / syscall-ABI change vs 1.6.38. **TinyC 1.6.38: TWO-PHASE autoexec boot. 1.6.37's serial load only serialised slot STARTS — but each slot's main() still raced the PRIOR slots' already-running TaskLoops (Andreas .142 boot-log: slot-0 `TaskLoop enter` at 02.254 while slot-3 still ran main() at 02.580 → slot-3, the last slot, was starved of VM time/heap, never reached addCommand("EM") → durable column never written on the FIRST boot → reheal had nothing to restore = henne/ei). Fix: new per-slot `hold_taskloop` (TcSlot, ESP32) — the autoexec loader sets it before starting each slot, the VM task BLOCKS after main() (before Phase-2/TaskLoop) while it's set, and the loader clears it on ALL slots only after EVERY main() has run (or timed out). So while slot-3's main() runs, slots 0..2 are parked instead of spinning their TaskLoops → each main() reaches addCommand() with no TaskLoop competition → the durable prefix column is written on the first boot every time. Pairs with 1.6.37's durable cache (the belt; two-phase is the suspenders). No ABI/VM/bytecode/IDE change. **TinyC 1.6.37: command prefix is now DURABLE + serial autoexec load. 1.6.36's sticky prefix only re-armed when `cmd_prefix_saved` (RAM/BSS, set only by main()'s addCommand()) survived; a heap-tight REBOOT where main() never reaches addCommand() left it empty after the BSS reset, so the per-second self-heal had no target and `BAT*` stayed Unknown (Andreas .107 = S3+PSRAM, NOT C3). FIX (a) the prefix is mirrored into a DURABLE 3rd column of /tinyc.cfg (slot_config[].cmd_prefix), learned on the first successful addCommand() and used by TinyCPrefixReheal as the heal target even on a boot whose main() never registered — it now re-registers a RUNNING slot from cmd_prefix_saved OR the persisted copy (the `s->running` gate re-arms only an executing VM, never a deliberately-stopped slot); cleared on program-replace/reset (TinyCClearDurablePrefix), NOT on a plain stop or same-file reload. FIX (b) the autoexec boot loader loads slots SERIALLY — it waits for each slot's main() (Phase 1) to finish via the new `slot->main_done` flag (bounded by TC_BOOT_MAIN_WAIT_MS) before starting the next, so concurrent boot load can't starve a tight S3/PSRAM of the heap headroom main() needs to reach addCommand() (Andreas's root-cause request). No ABI/VM/bytecode/IDE change. **TinyC 1.6.36: registered command prefix is now STICKY. A slot's BAT*/command prefix (set by main()'s addCommand()) used to be cleared by every TinyCStopVM teardown and re-set ONLY when main() runs again — so a transient worker stop+resume (SD->Flash sync worker-stop, or the #76 auto-stop) whose main() doesn't re-reach addCommand() under heap pressure, or a heap-tight boot, left the slot Running:1 while EVERY command fell through to {"Command":"Unknown"}; recoverable only by a full slot-restart (a reboot did NOT fix it). New `cmd_prefix_saved` mirror is set alongside cmd_prefix at registration and cleared ONLY on a deliberate stop/reset/program-replace; it's re-applied in TinyCStartVM (before the VM task re-runs main) and by a once-per-second TinyCPrefixReheal() self-heal that re-arms any loaded slot whose live prefix went empty without a main() re-run. Fixes Andreas's .107 'BAT* Unknown after sync / after boot' (Wurzelanalyse 2026-06-04). No ABI/VM/bytecode/IDE change. PREVIOUS 1.6.35: .tcb bytecode format v5->v6 — self-describing header (new header_size B20-21 + total_size B22-25 u32) + a 2-byte syscall-ABI-revision abi_rev (B26-27) + 12 reserved bytes for future fields (no further format bump). The loader now (a) cross-checks total_size vs the on-disk file size — catches a truncated/corrupt upload before it reads OOB; (b) WARNS (still loads) when a slot's abi_rev != firmware TC_SYSCALL_ABI: 'recompile with the current IDE; commands may not register' — fixes the silent 'slot runs but BAT*/commands return Unknown' trap after a firmware update done with a STALE IDE (syscall renumbering); (c) nudges once when loading pre-v6 bytecode. v2..v5 .tcb still load byte-identically; a v6 .tcb is rejected (loud) by pre-v6 firmware. Needs the matching IDE rebundle (codegen emits v6). BUMP TC_SYSCALL_ABI in BOTH opcodes.js (SYSCALL_ABI) and this file whenever syscall NUMBERS are inserted/renumbered.** PREVIOUS 1.6.34: **TinyC 1.6.34: FUNC_COMMAND now answers {"Command":"Busy"} instead of the generic {"Command":"Unknown"} when a registered TinyC command-prefix matches a slot whose VM is busy — the bounded 200 ms try-lock (1.6.23) times out under a slot-0 load burst (BYD reads / colliding 60 s timers on Andreas's .107), or the VM is mid-execution. Polling HTML UIs can now keep the last good value on a transient busy instead of blanking (which looked like data loss). No ABI/VM change.** PREVIOUS 1.6.33: **TinyC 1.6.33: sprintf/addLog no longer corrupt a float (%f) argument whose VARIABLE NAME collides with a built-in #define (the file-mode constants r/w/a, colours, MATTER_*/CLUSTER_*). The compiler's resolveArg now respects local/global shadowing (it previously substituted the define's int literal -> a spurious I2F reinterpreted the float bit-pattern, e.g. 2.0 -> "1073741824"; compileExpr used the real local, so only collided names broke, looking like "the 2nd+ %f"). Codegen-only + IDE rebundled; no VM change. Also: removed the /ufsu big-write heap-trace debug logging (UPL: heap-trace ...); new example sml_custom_line.tc (descriptor name '*' suppresses a meter line -> render a combined V/A/W line + decimal-aligned columns from a script); matter_c BLIB plugin (Fork B) scaffolding + by-pointer crypto seam (off by default).** PREVIOUS 1.6.32: **TinyC fastMux(flag,time,buf,len) — HW-timer GPIO multiplexer ported from Scripter's ESP32_FAST_MUX. An IRAM hardware-timer ISR steps a small scan buffer of pin-encoding bytes (direct GPIO.out_w1ts/out_w1tc set/clear, pins 0..31) for jitter-free LED-matrix/7-segment/charlieplex multiplexing far steadier than the VM loop. flag 0=start(config pins + period in us @1MHz timer), 1=stop, 2=load scan sequence, 3=read scan position. Gated `USE_TINYC_FAST_MUX` + dual-core Xtensa only — classic ESP32 OR ESP32-S3 (off by default; RISC-V C-series excluded; returns -1 if not built); ported to the Arduino-core-3.x timer API (timerBegin(freq)/timerAlarm/timerAttachInterrupt). SYS_FAST_MUX 427; codegen builtin (refArgs:[2]) + IDE rebundled; example fast_mux.tc.** PREVIOUS 1.6.31: **TinyC dynamic-HTML enablers: varIdx(var)->int returns a global's index so a script can hand-build fully custom interactive HTML (e.g. emit raw `<button onclick='tcbtn(this,1,IDX)'>` / `<input ... onchange='seva(value,IDX)'>` in any layout); plus webButtonV(var,labelbuf) and webSliderV(var,min,max,labelbuf) — runtime-(char[])-label twins of webButton/webSlider (the built-ins only accept compile-time string-literal labels). Closes the two gaps hit building matter_bridge_ui's table: dynamic widget labels + custom raw-HTML controls. SYS_VAR_IDX 424 / SYS_WEB_BUTTON_V 425 / SYS_WEB_SLIDER_V 426; codegen builtins + IDE rebundled.** PREVIOUS 1.6.30: **TinyC generic JSON parsing: new jsonNum(buf,"a#b#c")->float and jsonStr(buf,"a#b#c",dst)->len syscalls (SYS_JSON_NUM 422 / SYS_JSON_STR 423) parse ANY char[] the script holds (e.g. an httpGet response from a remote device) via Tasmota's JsonParser with a '#'-separated path — like sensorGet but on a provided buffer, not just this device's own sensors. Lets matter_bridge_ui read a remote's DeviceName robustly (the hand-rolled string slicing tripped over TinyC quote/char-literal quirks). Codegen builtins + IDE rebundled.** PREVIOUS 1.6.29: **TinyC httpGet (SYS_HTTP_GET) body read rewritten + retried. ROOT CAUSE (proven on .143 C3 via per-call code/size/len logging): on a busy C3 (matter_c + WiFi) the framework http.getString() intermittently returns an EMPTY body on a valid HTTP 200 — ALWAYS for a slow ESP8266 peer (chunked reply split across many small TCP segments) and occasionally for an ESP32 peer; it also saw transient -1 connect drops. FIX: read the body ourselves — drain the raw stream patiently (wait for available() with a 1.5 s per-idle wall-clock bound, continue past FIN while bytes remain buffered) and de-chunk Transfer-Encoding: chunked on the fly; retry the whole GET up to 3x (120 ms apart) on a -1 transport error or an empty read. GET only (idempotent); POST is NOT retried. Fixes the matter_bridge_ui / remote-bridge poller never reading a sleepy ESP8266 RGB lamp (.38) and occasional empty reads from ESP32 peers (.51).** PREVIOUS 1.6.28: **TinyC IDE self-update from the console (Hans's request): new `TinyCIde [url]` command + a /tc "Update IDE" button fetch tinyc_ide.html.gz from the repo and atomically replace the device's served IDE — stream to a .tmp, validate the gzip magic + size, then rename over the live file; the ~190 KB LittleFS write quiesces the VM tasks (TinyCFsWritePause) + holds the loop-WDT, mirroring the /ufsu big-write path. Updates the browser IDE without the Tasmota file manager. Verified live on .143: 186422->187286 B, gunzip OK, no .tmp residue, Matter preserved.** PREVIOUS 1.6.27: **matter_c: Alexa support — UpdateFabricLabel (0x3E/0x09) commission-abort fix; mandatory Groups (0x0004) + ColorControl + Level attrs on light/plug device types (Alexa GS014 conformance); per-fabric Bridged-Node 0x0013 suppression for Alexa/Amazon vendors (NON_BRIDGE_VENDOR, Berry parity). Alexa now commissions + controls matter_c lights/plugs as DIRECT (non-bridged) nodes. LIMITATION: Alexa rejects a single node that mixes actuators + sensors — split into a lights node + a separate sensor-bridge node; the full mixed matter_home_bridge.tc still works on Apple/Google (Apple regression-tested OK).** PREVIOUS 1.6.26: **matter_c: handle IM TimedRequest (op 0x0A) — fix Google Nest "Gerät kann nicht hinzugefügt werden"**. Hans's C3 log (matter_powermeter.tc) showed commissioning fully succeed (PASE→attest→CSR→AddNOC fabric idx=5→CASE operational sid=13653) and post-CASE Descriptor reads, then Google Nest sent an IM TimedRequest (proto=0x0001 op=0x0A exch=0x2613); matter_c had no handler so it sent only an MRP StandaloneAck and no IM StatusResponse → Nest's timed interaction stalled, retried the TimedRequest ~10s later (0x2614), then gave up. Per Core Spec §8.7 a TimedRequest{0:timeoutMs} must be answered with StatusResponse(SUCCESS); the follow-up timed Invoke/Write then arrives on the same exchange and is handled normally. Added the handler in the secured-rx IM dispatch (emits the 8-byte StatusResponse `15 24 00 00 24 FF 0C 18`); follow-up accepted unconditionally (no command on this device needs strict timed gating). Apple Home doesn't use a timed interaction at that step, which is why it already paired. PREVIOUS 1.6.25: **matter_c: add `SAT=4000` to operational mDNS TXT (fix Google Nest "kann nicht verbinden" post-CASE)** — Hans reported Google Nest fails commissioning right after our log shows CASE Sigma3 verified + OPERATIONAL SESSION sid=61744 (1 active). Our operational mDNS TXT records were `SII=5000 SAI=300 T=0` — missing `SAT` (Session Active Threshold, ms) which Matter Core Spec §4.3.1.6 marks MANDATORY since v1.3. Apple Home tolerates SAT missing; Google Nest rejects. Added `SAT=4000` (spec default). Also added an opt-in diagnostic build flag `-DMTRC_DIAG_HANS` that logs every decrypted secured-channel rx with proto/op/exch/payload hex prefix — useful for diagnosing post-CASE failures where the controller stops talking. PREVIOUS 1.6.24: **matter_c: drop per-packet AddLog from AsyncUDP onPacket lambda (fix .122 hourly reboot)** — Captured live on .122 (ESP32-C6 matter_home_bridge with 32 endpoints, Apple Home subscription pressure) via USB-CDC serial 2026-05-27 15:34:50: Guru Meditation `Instruction access fault` with MEPC=RA=MTVAL=0x6f48222c after ~1h uptime (BootCount 290). 0x6f48222c decoded as LE ASCII bytes = `,"Ho` — start of `,"Hostname":"ESP32-C6"` JSON fragment from Tasmota's STATE/SENSOR teleperiod. Stack at crash also held `stname":"ESP`/`rx 42 B`/`from`/`:00:`. Root cause: `AddLog("MTR: udp rx %u B from %s:%u …", …, mtrc_peer_ip.toString().c_str(), …)` inside the AsyncUDP onPacket lambda — `IPAddress::toString()` of an IPv6 link-local plus Tasmota's LOGSZ stack buffer for vsnprintf overflowed the AsyncTCP task's ~4 KB stack and corrupted the saved RA with adjacent format-string bytes. `matter_udp_rx()` itself ran fine on that stack (no crashes in crypto/IM dispatch); the overflow was specifically in the log path. Fix: remove the per-packet AddLog from the lambda; bump two volatile uint32_t counters (pkts/bytes) instead; FUNC_LOOP logs aggregates every 5 s on the main task where 8 KB+ of stack is safe. A wider previous attempt (deferred matter_udp_rx itself to main loop) starved WiFi/HTTP for the ~7-second 682-chunk Subscribe response burst and was reverted (5199ae4fb) before any release upload. PREVIOUS 1.6.23: **Bounded try-lock on share-table readers + FUNC_COMMAND vm_mutex** — Andreas reported a deterministic ~2:30 min HTTP-server outage on .104 (ESP32-C3 single-core + TinyC ebusD-Reader) when slot-0 emits 60 shareSetFloat/s and the HTTP task tries /cm?cmnd=WP+B (or /ufsu). Two unbounded `portMAX_DELAY` locks in the same path: `shareGet*`/`shareHas` on `tc_share_mutex`, and `FUNC_COMMAND` on the slot's `vm_mutex`; either could pile up enough scheduler pressure to wedge AsyncTCP, recovering only at the 60 s UDP-multicast socket-reset boundary. Readers now use a 50 ms `tc_share_try_lock_ms()` (drop the read with default value on timeout — same as missing-key behaviour); `FUNC_COMMAND` uses a 200 ms `xSemaphoreTake` deadline (returns "Command unknown" instead of blocking the web task). Writers (`shareSet*`) keep `portMAX_DELAY` since they MUST persist. With this in place a 60-shares/s pattern is again the supported case (the 3-categories polling workaround stays a useful tidiness pattern but is no longer required for stability). PREVIOUS 1.6.22: **WebChart now respects Tasmota's per-language `D_DECIMAL_SEPARATOR`** — tooltips and any formatted axis labels on `WebChart()` charts show `1,5` on a `de_DE` build (or whatever the language header defines) instead of `1.5`. Implemented by injecting a `google.visualization.NumberFormat({decimalSymbol: …})` after the data table is built (before the `WebChartJS` hook, so user-supplied JS sees the formatter already applied). JS literals in chart data stay '.' (correct). Same mechanism Tasmota itself uses for its sensor body (`WSContentSend_PD`). Script-side `webSend(...)` already runs through `WSContentSend_PD` so it was already localized. **Companion: sml_chart_editor is now locale-aware** — display via `Intl.NumberFormat` (browser locale, so a DE user sees `,` even on an en_GB-built firmware), parser accepts both `.` and `,` so paste-from-anywhere works; CSV export keeps `.` to match `fileWriteArray` on the device. PREVIOUS 1.6.21: `/cedit` route — host the sml_chart binary editor on the device. A tiny new webserver route reads `/sml_chart_editor.html(.gz)` from the filesystem and serves it inline as `text/html`, so the standalone editor (`tasmota/tinyc/utils/sml_chart_editor.html`) can be opened at `http://<device>/cedit` and its Load / Save buttons hit `/ufsd?download=`, `/ufsu` and `/cm` same-origin to read `/sml_chart.bin` in place, write it back, and run `Backlog TinyCStop 0; TinyCRun /sml_chart.tcb` so the script reloads — no manual download/upload cycle. The route is needed because Tasmota's generic `/ufsd?download=` always sends `Content-Disposition: attachment` and would just download the HTML instead of rendering it. Editor README at `tasmota/tinyc/utils/sml_chart_editor.md`. Requested by mi-hol (discussion #83). PREVIOUS 1.6.20: PWL_DIRECT_GLOBALS: the polling spawnTask worker no longer silently exits at its first delay (the "no values fetched" symptom). The worker BORROWS the one shared VM; during its delay() windows it releases the mutex while still looking halted=true, so the high-rate UDP-global RX path (tc_udp_on_receive) injected globals into the borrowed VM and disturbed the worker's loop state, making the worker loop exit cleanly (no error). Fix: a `vm->worker_borrowed` flag set for the WHOLE borrow incl. its delay windows; tc_udp_on_receive now skips injection when a worker is borrowing the VM (on top of the 1.6.19 drop-on-busy try-lock). Verified live on a devkit-S3: the globals-ON worker survives its 15 s startup delay and runs its request cycle. PREVIOUS 1.6.19: PWL_DIRECT_GLOBALS / UDP-global RX no longer crashes a node that also runs a spawnTask TLS worker. `tc_udp_on_receive()` took the per-slot `vm_mutex` with `portMAX_DELAY`, so while a spawnTask worker held the VM for a multi-second BearSSL request (the powerwall worker), loopTask blocked in the UDP-global-receive path for the WHOLE TLS — freezing the web server + LwIP servicing and corrupting the TLSF heap. It surfaced as Exception 29 (StoreProhibited) in LwIP `tcp_alloc` on the worker's NEXT TLS socket (wild free-list pointer), and the reboot wiped the web log ring so it looked like the worker had silently stopped. Fix: the UDP-global injection is now NON-BLOCKING — `xSemaphoreTake(vm_mutex, 0)` and drop-on-busy (multicast globals are best-effort, so dropping one while the VM is busy is harmless; same drop-on-busy pattern as matter_udp_rx). Live-verified on a devkit-S3 (.39): `powerwall.tc` with `-DPWL_DIRECT_GLOBALS` ran 11 request cycles / ~5 min with ZERO crashes and a clean heap throughout (it crashed deterministically within 9-60s before). Root-caused via UDP-syslog capture + `heap_caps_check_integrity_all` probing (heap was clean through 15s of UDP RX on the borrowed VM and right up to the TLS — only the lock-stall during TLS corrupted it). PREVIOUS 1.6.18: fileWriteArray()/fileReadArray() now store FLOAT values (was integer): they write/read human-readable TAB-separated float text, one array per line — a plain editable `.csv`/`.tab` — restoring parity with Scripter's `fwa()`/`fra()` (which are float). New signature `fileWriteArray(arr, handle, count [, append [, decimals]])` / `fileReadArray(arr, handle [, count])`: `count` is now explicit (like fileWriteBin/fileReadBin) because TinyC global arrays don't carry their declared size — without it small global arrays over-wrote the whole global pool. `decimals` (default 2, trailing zeros stripped via Scripter's `%*_f`) caps decimal places so the file stays compact — without it small/fractional values could blow up to long strings (e.g. 0.0001234567) and bloat big arrays. The integer variant is dropped (no example used it; use fileWriteBin/fileReadBin for compact binary). Read is now streamed value-by-value, so arrays of ANY size work (the old 512-byte line / 256-element cap is gone) — e.g. a 1441-slot SML chart buffer can be saved as readable CSV and restored. Motivated by users wanting to read/edit/restore the sml_chart_* data as text instead of opaque binary. PREVIOUS 1.6.17: **Flash-FS file-manager upload no longer hard-hangs a running node: a large internal-flash (LittleFS) write — e.g. uploading the ~183 KB IDE via /ufsu — repeatedly disables the SPI flash cache, and on a dual-core node running a TinyC VM task this deadlocked the device with NO watchdog recovery (needed a power-cycle). Reproduced + serial-traced on an S3 Matter-bridge (TaskLoop); SD-card uploads were unaffected (external SPI never disables the internal cache). The old tc_global_pause only suppressed main-loop callbacks — tc_vm_task kept stepping; and merely pausing/vTaskSuspend()ing it was NOT enough (the task still wedged the write — verified). Fix: for /ufsu uploads >= TC_FS_BIG_WRITE (16 KB; small files never deadlock so they skip it) the writer STOPS each running VM task for the duration of the write (TinyCFsWritePause→TinyCStopVM, fully off the scheduler — the only thing that lets the write through, ~3 s vs a hard hang) and RESTARTS them after (TinyCFsWriteResume→TinyCStartVM, re-runs main(); for the bridge that re-runs matterReset()+rebuild, identical to a normal boot — Matter fabric persists on UFS, no commissioning lost). Wired into xdrv_50 UfsUploadFileOpen/Close with HandleUploadUFSDone as a resume safety-net. Small .tcb /tc_upload writes are left untouched (tc_deploy manages its own slot). PREVIOUS 1.6.16: **Matter commissioning fix (CRITICAL on newlib-nano builds): the operational DNS-SD instance name `<CompressedFabricID>-<NodeID>` formatted the 64-bit node id with `%016llX`, but ESP-IDF newlib-nano printf (default on several Tasmota envs, e.g. tinyc32s3/c3) ignores the `ll` length modifier and emits garbage ("…lX") — so a controller (Apple Home) could never resolve the node for the CASE handshake and commissioning ended at "connecting → no response". Fixed by formatting all 64-bit ids byte-by-byte with `%02X` (fabric_op_instance in matter_c + the commissionable instance in xdrv). Also: matterSet/matterSetFloat now bump the subscription generation ONLY on a real value change — re-publishing identical sensor values no longer triggers a ReportData burst, which had flooded the subscriber (a script writing N attrs/second = N reports/second) and starved the CASE handshake / overwhelmed single-core nodes during commissioning. Together these make a multi-endpoint Matter bridge commission + run on a dual-core S3 (verified: 14 endpoints, 3 controller sessions). PREVIOUS 1.6.15: **Matter per-endpoint naming: new builtin `matterName(ep, "label")` (SYS_MTR_NAME=408). Apple Home (and other controllers) can only show a manufacturer-supplied name per endpoint when the node is a Matter *bridge*, so matterName turns the node into one: the first call lazily creates an Aggregator (0x000E) endpoint, the named endpoint becomes a Bridged Node (its Descriptor DeviceTypeList gains 0x0013) and gets a Bridged Device Basic Information cluster (0x0039) whose NodeLabel carries the label — exactly the pattern Berry Matter uses. Before this, a multi-endpoint node (e.g. a HomeKit-scripter port with N temp/humidity sensors) showed up as "Temperatursensor 1..N" with no way to name them. matterName(ep, name) is opt-in per endpoint; unnamed endpoints stay plain (no bridge forced). Call AFTER matterAdd for that endpoint; idempotent (re-call to rename); matterReset() drops all labels + the aggregator. Malloc-free (parallel 33-entry label table in the heap-allocated matter ctx). Adding a bridge changes the node identity, so an already-commissioned node must be removed + re-added in the controller to pick up the names. PREVIOUS 1.6.14: **DMX moved to RMT (no UART consumed). `dmxInit` is now `dmxInit(gpio)` (1 arg) — the DMX512 frame (BREAK+MAB+start+slots, 4us/bit, byte = start-low+8 data LSB+2 stop-high) is built as rmt_symbol_word_t[] and pushed via rmt_new_tx_channel + copy encoder at 1 MHz (exact, hardware-clocked — no CPU busy-wait BREAK). IDF5 RMT API = native to pinned arduino-esp32 3.3.7; UARTs stay free for SML/Modbus/tc_serial (the whole motivation). Re-sent ~20 Hz from FUNC_EVERY_50_MSECOND, 30 s watchdog -> all-zero. Compile-time auto-init via #define TC_DMX_GPIO. Replaces the 1.6.12/1.6.13 UART backend (dmxInit(uart,rx,tx) signature gone — nothing depended on it yet). PREVIOUS 1.6.13: **DMX runtime config: new builtin `dmxInit(uart, rx, tx)` (SYS_DMX_INIT=397) -> 1=ok/0=fail. Pick the hardware UART (0..2) + rx/tx GPIOs at runtime from the .tc script — no recompile/`#define` per board. Call once before `dmxWrite`; `dmxInit` reconfigures cleanly if called again (end()+delete+re-begin). Compile-time `TC_DMX_TX_PIN`/`TC_DMX_RX_PIN`/`TC_DMX_UART_NUM` still work as an auto-init fallback when `dmxWrite` is used without `dmxInit`. Frame BREAK now uses the runtime-selected UART for uart_set_line_inverse. PREVIOUS 1.6.12: **New builtin `dmxWrite(channel, value)` (SYS_DMX_WRITE=396): TX-only DMX512 on a dedicated ESP32 hardware UART (default UART2) for solar-surplus heater dimmers and similar. No library/HAL patch — per-frame BREAK via uart_set_line_inverse (inverse-line method), 250000 8N2, start code + TC_DMX_SLOTS (16) data slots, auto-refreshed from FUNC_EVERY_50_MSECOND (~20 Hz, runs even while the VM is paused so the dimmer never loses its frame), 30 s watchdog → all-zero (heater safe-off). Lazy UART init on first dmxWrite; pins via user_config_override.h (#define TC_DMX_TX_PIN <gpio>, optional TC_DMX_DE_PIN for RS485 DE, TC_DMX_UART_NUM, TC_DMX_SLOTS). Linearisation LUT + surplus logic stay in the .tc script. ESP8266: no-op. PREVIOUS 1.6.11: **Boot-loop false-positive fix (Andreas/Bat3). A commanded `Restart`/OTA was mistaken for a crash-loop and disabled autoexec — esp. right after an OTA flash (Tasmota also reports "settings reset") + 1-2 manual `Restart 1`. tc_bootloop_detected() is pure-OR with early return, so the filesystem marker ALONE trips it. Fix A: clear the boot-loop marker in FUNC_SAVE_BEFORE_RESTART (Tasmota calls that ONLY on graceful restart/OTA, never on crash/WDT/panic) — folded into the existing case, before CleanUp/persist-save. Fix B (belt+suspenders): tc_bootloop_detected() short-circuits on esp_reset_reason()==ESP_RST_SW (clean software reset) and proactively deletes the stale marker; crash resets (PANIC/WDT/BROWNOUT) and power-on (QPC counter) still detected. PREVIOUS 1.6.10: **Two production-UX fixes (Andreas/Bat3). (1) WebOn/WebUI page-switch no longer flashes a "TinyC not ready" 503 white page: `HandleTinyCWebOn` (was hardcoded immediate-503 on slot 0) and `HandleTinyCUI` now split *fatal* (no slot/not loaded/vm.error) from *transient* and wait up to `TC_WEBON_HALTED_WAIT_MS` (default 1500, `#ifndef`-guarded) for `vm.halted` before 503 — a slot running a TaskLoop (Modbus/BYD polls) is only sub-ms non-halted so the page now loads first try. Multi-slot-aware WebOn (`handler_slot[]` like `page_slot[]`) tracked for 1.7.x. (2) Persist `.pvs` layout-hash / legacy mismatch no longer **deletes** the file → `tc_persist_demote()` renames it to `<name>.pvs.bak` (one generation) so a schema-change flash is *recoverable* instead of total data-loss (Bat3: 27 cfg + tariff/SOC tables wiped by a single new `persist` var, twice in 2 days). Falls back to remove only if rename fails. Full name-keyed migration (PVS3 — `index` is compiler-assigned and shifts on add/remove, so raw-index migration is unsafe; needs .tcb-format names) tracked for 1.7.x. PREVIOUS 1.6.9: **`responseCmnd(buf)` no longer silently truncates.** The char-array form copied through a hardcoded 255-byte stack buffer; longer JSON was cut mid-object → Tasmota rendered an empty `{}` with no diagnostic (Andreas lost non-trivial time on a ~280-char BATrt response on .107). Buffer is now `TC_RESPONSE_MAX` (ESP32 512 / ESP8266 256), `#ifndef`-guarded so user_config_override.h can raise it; a truncation emits `TCC: responseCmnd output truncated at N chars (raise TC_RESPONSE_MAX...)` — same silent-drop anti-pattern eliminated for shareSet* in 1.6.6. String-literal `responseCmnd("…")` was never affected (no 256-cap). Plus doc fixes: CLAUDE.md persist note now states a layout change resets ALL persist values to defaults (not just changed vars); TinyC_Reference.md documents the responseCmnd cap. PREVIOUS 1.6.8: **WebUI sv= write now targets the page-owning slot, not hardcoded slot 0.** `TinyC_WebSetVar` was hardcoded to `slots[0]`: any script running in a non-zero slot rendered its widgets correctly (the `/tc_ui` render path resolves the page-owning slot from `page_slot[]`) but every checkbox/button/slider write landed in slot 0's globals, which that script never reads → "WebUI renders but does nothing". Surfaced with marstek_emu running in slot 1 on .39 (slot 0 in use by test deploys). Fix: `TinyC_WebSetVar(uint8_t slot_idx)` — `/tc_ui` passes the page-owning slot index (`si`), the main-page WebPage path keeps 0 (separate pre-existing multi-slot assumption). Takes an index not a `TcSlot*` because a pointer param breaks Arduino's auto-generated forward prototype in the concatenated tasmota.ino (TcSlot declared after the generated decl). Device-verified on .39 (marstek slot 1): sv=21_1 / 3_1 now stick, toggle both directions. PREVIOUS 1.6.7: **WebUI button rework: `webButton` is now a momentary action button (no `: ON/OFF` suffix; optional `"Idle|Active"` confirm text shown ~2.5 s on click, generic ✓ otherwise) and a new `webToggle(var,"On|Off")` syscall (394) provides a latching on/off button — green when var!=0, grey when 0, with optional per-state text/emoji. Device-verified on tasmota32s3-devkit (.39): grey↔green latch + per-state text swap + emoji render confirmed via /tc_ui. IDE bundle (opcodes/codegen/vm sim) regenerated so `webToggle` compiles in-browser and via tc_deploy.mjs.** PREVIOUS 1.6.6: **`udp(10, mcast_ip)` correctness fix + share-table PSRAM-BSS + share-Set diagnostic hardening.** Three independent items shipped in one drop. (1) `udp(10)` rewritten — the 1.6.1-shipped path called raw LwIP `igmp_leavegroup()` and returned ERR_OK, but Andreas's 14./15.05. nightly A/B test on .107 (Bat3 / SMA Tripower SE) showed `spw_pkts/h` stayed constant at ~18 000/h in Phase A and Phase B (no measurable drop in multicast reception despite syntactic-OK leave). Root cause: Arduino-ESP32 `NetworkUDP::beginMulticast()` joins via SOCKET-layer `setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)` which writes BOTH the netif IGMP table AND a per-socket membership list in `lwip_sockets`. Our `igmp_leavegroup()` only cleared the netif table; the socket-internal membership remained active, so the UDP demux continued to deliver matching packets to the PCB. Fix: case 10 now calls `Tinyc->udp_port.stop()` (which internally does `setsockopt(IPPROTO_IP, IP_DROP_MEMBERSHIP, ...)` on the underlying fd, atomically clearing both layers) followed by `Tinyc->udp_port.begin(saved_port)` to reopen as a plain unicast listener on the same port (preserves Andreas's "drop without losing port" requirement at the user-visible level — unicast UDP on the port keeps working). API arg `mcast_ip` kept for compatibility + sanity-checked against the bound group (mismatch logged but drop still proceeds). The previous 1.6.5 ESP8266 path-fork (`#ifdef ESP32 ... #endif` wrapping the raw IGMP call) is gone — the socket-layer path works on both ESP32 and ESP8266 with identical code. `<lwip/igmp.h>` include removed (no longer needed). The 13.05. smoke-test on .39 that "verified" the original implementation only checked rc=0 and the watchdog-rejoin gate; it never measured packet flow stop. New case-10 emits explicit success/failure logs per call so users can confirm at runtime. Workaround for users on 1.6.5 in the meantime: substitute `udp(0, <port>)` for `udp(10, ...)` — same socket-layer API path, same effect at the user level. (2) `EXT_RAM_BSS_ATTR` on `tc_share_table[TC_SHARE_MAX]` — Andreas's Bat3 override `TC_SHARE_STR_LEN=2560` + `TC_SHARE_MAX=32` yields a ~83 KB static table that was eating internal DRAM unconditionally on PSRAM-equipped boards. With the attribute, the BSS section is placed in external RAM when `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` is set in sdkconfig (true for Tasmota's tasmota32s3-* envs); on non-PSRAM boards EXT_RAM_BSS_ATTR resolves to empty → byte-identical placement to 1.6.5. Initializer `= { }` dropped (BSS is zero-init by definition; explicit init would force a data-section copy, defeating the attribute). (3) AddLog hardening on `SYS_SHARE_SET_INT/FLT/STR` — the 1.5.0..1.6.5 implementations silently `break`'d on three failure modes: null key (const-pool index invalid — bytecode corruption), `find_or_alloc` returning -1 (table at `TC_SHARE_MAX` capacity, no free slot), and (STR-only) source-buffer truncation past `TC_SHARE_STR_LEN`. All three now emit a specific INFO-level log including key name, attempted value (truncated to 32 chars for STR), and a "raise TC_SHARE_MAX/TC_SHARE_STR_LEN in user_config_override.h" hint. Motivating case: Andreas debugged a silent-drop scenario on 1.6.3 where SHARE_SET_STR was overflowing the then-default `TC_SHARE_MAX=24` with no diagnostic — the eventual bump to 32 was guessed-at, not data-driven. New `tc_share_count_used()` helper (mutex-held, linear scan) supplies the "%d/%d" capacity hint in the log. Caveat: a script polling shareSet in EveryLoop with a typo'd or always-failing key will flood the log; no per-key rate-limit (kept simple — script authors are expected to fix the call site once the log surfaces). All three items are independent — the udp(10) fix doesn't affect share-table behaviour and vice versa; both compile on ESP32 + ESP8266. IDE patch not needed (no API surface changes — `udp` is already variadic, share-set syscalls unchanged at the bytecode level). Andreas pending live cross-check on .107 with both `udp(10, "239.12.255.254")` and `udp(0, 9522)` paths — expectation is Phase-B `spw_pkts/h` falls to ~0 (vs the 18 000/h baseline that defeated the 1.6.1-1.6.5 path). Previous: "1.6.5" — ESP8266 build fix for udp(10, mcast_ip) — Ottelo's `tasmota4m_ottelo_tc` ESP8266 build failed with `'igmp_leavegroup' was not declared in this scope` at link time. The 1.6.1 changelog claim "ESP32 + ESP8266 LwIP both export the raw IGMP API → no platform gates needed" was wrong: ESP8266 LwIP keeps `igmp_leavegroup()` internal — the function exists but the public `<lwip/igmp.h>` header doesn't expose it the way the ESP32 IDF's LwIP does. Fix: wrap the `#include <lwip/igmp.h>` and the `case 10:` body of SYS_UDP_FUNC in `#ifdef ESP32 ... #endif`. On ESP8266, the case still pops its argument (stack-balance discipline) and pushes 0 (= not supported); scripts that detect the 0 return can fall back to `udp(0, port)` for a port-close. ESP32 path byte-identical to 1.6.4. Ottelo verified the fix builds clean on his side. **1.6.5 is now obsolete** — 1.6.6's socket-layer replacement makes the ESP32/ESP8266 split unnecessary and addresses the underlying correctness issue 1.6.5 was never going to detect. Previous: "1.6.4" — **Phase-1 vm_mutex fix from 1.6.3 ROLLED BACK** — commit `5f647b704` introduced an `xSemaphoreTake/Give(vm_mutex, portMAX_DELAY)` cycle around each 256-instruction batch in Phase 1 of `tc_vm_task` (mirroring Phase 2's TaskLoop pattern). Intent: close a Frame-locals-NULL race Andreas (.107 / Bat3) was hitting at ~30 % Slot-0-restart frequency. The fix was structurally correct (post-fix 4 reload cycles all clean, vs ~1-2 fail rate pre-fix) BUT triggered a much worse production regression: WR-Modbus-TCP-disconnect-storm at ~200/h vs ~7-8/h baseline. Andreas's user-side App-Layer-Watchdog forced TCP-disconnect + immediate reconnect every ~15 s after 3 consecutive Modbus-read fails — the Sunny-Tripower WR at 192.168.56.91:502 was being hammered with reconnects in the minute-takt, unzumutbar for production use. Andreas pulled .107 from the network at 21:15 today to protect the inverter. Mechanism (Andreas's hypothesis 1, most likely): Phase-1 holding vm_mutex for 256-instr batches (~5-10 ms each) serialised against Phase-2 TaskLoop's own mutex-cycle and against callback mutex-takes. When main() did substantial work (Andreas's `slot-0_bat_ctrl.tcb` is 27 KB of bytecode = several hundred ms init), the new contention pushed Modbus response-read latency past the worker's 200 ms threshold, the 3-fail watchdog tripped, TCP cycled, repeat. Also: the fix was incomplete — Andreas still hit 1× err=12 crash POST-1.6.3 with same fingerprint (PC=7273 ctx=main fp=0 fc=0 instr=375), so there's at least one other race-class the mutex doesn't catch. ROLLBACK is the correct trade-off: err=12 is a 30 % Restart-Roulette (recoverable, scripts re-launch), WR-Modbus-storm is a continuous Hardware-Hammer (potential damage). shareDump (1.6.2) and udp(10, mcast_ip) (1.6.1) remain intact — they're in the prior commit `ebb277e64`, unaffected. **A proper Phase-1 race fix needs a different mechanism** — candidate: clearing `vm->halted = false` AFTER `tc_vm_load` returns rather than before, so callbacks can't slip past the `!halted` gate during the load window. Will revisit when time + bench-rig allows. IDE H1 label bumped 1.6.2 → 1.6.4 (skipping 1.6.3, matching TC_RELEASE). Previous (rolled back): "1.6.3" — Phase-1 vm_mutex fix. Previous: "1.6.2" — `shareDump()` — new diagnostic syscall (SYS_SHARE_DUMP = 352, picked from the 352..359 gap between TCP tuning and crypto since the natural 348 slot was already taken by SYS_TCP_KEEPALIVE in v1.5.1) that walks the entire `tc_share_table[]` and emits one `TCC: share[N] key="K" type=T value=V` log line per live entry, plus a summary `shareDump: N/32 live entries`. Returns the number of live entries to TinyC. Pure diagnostic — non-allocating, mutex-protected, ESP32 + ESP8266 compatible. Andreas (.107 / Bat3) hit a reproduction of the cross-VM share-anomaly where Slot 2's `shareSetFloat` writes are correctly logged on the writer side but Slot 0's `shareGetFloat` reads return 0.0 for all keys Slot 2 owns (price, pv_tod, pv_tom). All four diagnostic theories from my 09:15 letter (init-race, float/int mismatch, slot-self-read, identifier-collision) were ruled out by his testing — the remaining hypotheses (allocator bug, type-tag mismatch in slot, mutex-failure under heap pressure) all benefit from being able to inspect the table contents directly. `shareDump()` lets a script log the inventory and answer: did the write actually land? at what index? with what type and value? — without resorting to firmware patches with strategically-placed debug logs. Plus IDE `<h1>` header bumped 1.6.0 → 1.6.2 (was a missed step in the 1.6.1 bump — Andreas spotted it at 12:45). IDE patch `patch_share_dump.mjs` adds the `shareDump` builtin to the BUILTINS table (zero-arg, returns int) and updates the visible release label. Previous: "1.6.1" — `udp(10, mcast_ip)` — netif-level IGMP-Leave syscall for clean multicast-off A/B testing. Calls LwIP's `igmp_leavegroup(IP_ADDR_ANY, &group)` directly so the host stops accepting packets to the group at the netif level, independent of which WiFiUDP/AsyncUDP socket originally joined it. Required because `WiFiUDP::stop()` only releases the underlying PCB — if multiple sockets share a port (as happens when `Tinyc->udp` globalvars-multicast and `Tinyc->udp_port` user-multicast coexist on port 9522), stopping one socket leaves the IGMP group membership pinned by the other, and packets keep arriving at the surviving bind. Andreas (.107 / Bat3 / Sunny Tripower diagnostics) discovered this when his A/B test loop did `udp(0, SPW_PORT)` to "turn off" multicast for Phase B and observed spw_pkts/h growing *higher* in Phase B than Phase A — the LwIP IGMP filter was still leaking 18 000 frames/h to whatever socket happened to be bound. Implementation in SYS_UDP_FUNC mode 10: parse the IP from a TinyC char[], call `igmp_leavegroup` with `ifaddr=0` (= any netif), log the lwIP err_t, and clear `Tinyc->udp_port_mcast` if it matched (so case-1's inactivity watchdog won't try to rejoin the just-left group). Returns 1 on ERR_OK, 0 on bad IP or LwIP failure. Pulled `<lwip/igmp.h>` into the file's includes block — small header, no transitive cost. Pairs with `udp(9, mcast_ip, port)` (join) and `udp(0, port)` (plain-unicast bind): the Phase-B sequence is now `udp(10, "239.12.255.254")` to leave, then re-join with `udp(9, "239.12.255.254", 9522)` at Phase-A return. No IDE patch needed — `udp` is a variadic builtin already, the new mode just adds a runtime case. ESP32-only path; ESP8266 has igmp_leavegroup too (LwIP raw API is identical) so the code compiles on both. Previous: "1.6.0" — `tcpTransact(req, req_len, resp, resp_max, timeout_ms)` — atomic write-and-await-reply for request/response TCP protocols (Modbus-TCP being the headliner). Folds the canonical `tcpWriteArray + delay/poll-tcpAvailable + tcpReadArray` pattern into a single syscall (SYS_TCP_TRANSACT = 351), eliminating the explicit busy-loop every script ships by hand. Returns: bytes received on success (the moment any data arrives, all immediately-available bytes up to resp_max are read); -1 timeout (no response within the window); -2 not connected, OR peer dropped mid-wait (tcpDisconnectReason() set to PEER_CLOSED in that case); -3 bad arguments. Wait granularity is 1 FreeRTOS tick (≈1 ms) — `vTaskDelay(1)` between availability checks lets other FreeRTOS tasks run freely during the gaps. Holds the calling slot's vm_mutex throughout — intended use is from a spawnTask worker handling one TCP session, where blocking that slot's other callbacks for ≤200 ms is fine. Suitable for protocols where the response fits in a single TCP segment (Modbus-TCP, ≤256 B); for protocols where data dribbles in chunks, the lower-level tcpWriteArray + tcpAvailable + tcpReadArray remain available unchanged. Updates examples/modbus_lib.tc to use tcpTransact internally — mbFC03/04/06/16 helpers drop the per-FC `mb_wait_for` poll-loop and become single-syscall transactions, also tightening the timeout-correctness story (the old loop slept up to 2 ms past the deadline; tcpTransact ends within ~1 ms of millis() ≥ deadline). IDE BUILTINS + simulator stub in lock-step (tinyc_ide.html.gz) so the compiler accepts `tcpTransact` and standalone-IDE runs report a "no net" stub return. Pairs with the v1.5.1 TCP tuning syscalls — typical SMA Tripower flow becomes: tcpSelect(0); tcpConnect(...); tcpKeepalive(30,10,3); /* loop */ int n = tcpTransact(req, 12, resp, 260, 200); if (n < 0) { reason = tcpDisconnectReason(); ... }. Andreas's BYD HVS + SMA Tripower polling worker shrinks from ~25 lines per FC to ~5 with this in place. Previous: "1.5.2" — `#include "file.tc"` directive (IDE-side only — pure preprocessor; firmware unchanged from 1.5.1). The IDE compiler now recognizes `#include "file.tc"` lines and inlines the content from the device filesystem (fetched via existing `/tc_api?cmd=readfile`) before compile. Recursive (included files can themselves #include); first-include-only deduplication acts as an automatic header-guard so simple libraries don't need #ifndef/#define wrappers; cycle detection (max depth 16) catches accidental infinite recursion. Fall-through: source with no #include directives is unchanged, no network call. New convention: shared libraries live as `.tc` files in the device's UFS (e.g. `/modbus_lib.tc`), main script does `#include "modbus_lib.tc"` and gets all the library's functions/globals as if typed inline. Motivating example: `examples/modbus_lib.tc` ships `mbFC03/FC04/FC06/FC16` helpers for Modbus TCP — Andreas's BYD HVS + SMA Tripower + HM2.0 stack now reads as e.g. `int n = mbFC03(0, 1, 0x0010, 4, regs, 200);` instead of hand-assembling 12-byte request frames in every script. Pairs with the v1.5.1 TCP tuning syscalls (tcpKeepalive/tcpDisconnectReason). Implementation: ~80 lines of new IDE JS (parseDirective gets a `'include'` case, preprocess() rejects unresolved #include with a clear error, new async `tcResolveIncludes()` wraps the recursive fetch+inline pass). `compileCode/runCode/saveTcb/uploadWiFi/runOnDevice` are now async to await the include resolver. Firmware is byte-identical to 1.5.1 (the inlined source becomes one big `.tc` text before the bytecode compiler runs — VM has no concept of separate compilation units). Previous: "1.5.1" — TCP-client tuning + critical regression fixes (May 7). Three new per-slot syscalls (348/349/350) for outgoing TCP connections: `tcpKeepalive(idle_sec, intvl_sec, count)` sets SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT on the selected slot via direct setsockopt on the LwIP fd — solves the SMA Tripower / Solar Edge "idle-disconnect after 60 s" pattern that's been forcing scripts to do periodic dummy reads; `tcpNoDelay(on)` toggles Nagle's algorithm (off by default after every connect, so this is mainly for re-enabling it intentionally); `tcpDisconnectReason()` returns 0..5 (NEVER, CONNECTED, PEER_CLOSED, TIMEOUT, NETWORK, USER_CLOSED) so a watchdog can react intelligently to RST/FIN vs network errors instead of blind reconnects. State is tracked per-slot in a new `tcp_cli_reason[TC_TCP_CLI_SLOTS]` field on the Tinyc struct; updated automatically by SYS_TCP_CONNECT/DISCONNECT/CONNECTED/DISCONNECT_REASON. Also bumped `TC_TCP_CLI_SLOTS` 4 → 8 (one Modbus-TCP user with BYD HVS + SMA Tripower SE + HM2.0 + Wallbox + future modules ran out at 4); each slot ~80 B in the Tinyc struct so 8 is fine even on ESP8266. Override via `-DTC_TCP_CLI_SLOTS=N`. IDE BUILTINS table + simulator stubs in lock-step (tinyc_ide.html.gz). Two critical regression fixes also rolled in: (a) AES/HMAC/SHA/HEX2BIN syscall stack-buffer overflow — 1.3.20 introduced `stackbuf[4096]` + `kbuf[1024]+dbuf[4096]` + `dbuf[4096]` + `src[1024]` as fixed-size locals inside `tc_vm_step`'s switch handlers; GCC at -Os reserves the largest unified switch-case frame at function entry regardless of which case runs, so every TinyC callback dispatch inflated tc_vm_step by ~5 KB. Loop task (8 KB) and web-server task (~4-8 KB) callbacks overflowed into adjacent heap → StoreProhibited in WiFi RX (esf_buf_alloc / wDev_IndicateFrame / ppTask). Fixed by heap-allocating all four buffers via special_malloc (PSRAM-preferring on equipped devices). (b) Multi-slot deadlock from `drop racy halted pre-check` (Apr 30) — that change removed the `s->vm.halted && s->vm.error == TC_OK` pre-check before tc_slot_callback in TinyCShow's JsonCall+WebCall fan-out, intending to fix a cosmetic spawnTask UI-disappear case. But without the pre-check every fan-out unconditionally takes each slot's mutex with portMAX_DELAY, deadlocking when a slot is mid-callback (delay) or mid-syscall in a spawnTask worker. Multi-slot configs hung permanently on slot startup or first nav-button click. Bisect against the C3 baseline (commit 63a7e6535, Apr 20) which ran the same pattern stably for weeks — pre-check restored. The spawnTask UI-disappear case will need a different cleaner fix (xSemaphoreTake with timeout instead of portMAX_DELAY) — open as a v1.6 follow-up. Previous: "1.5.0" — String operations (Option B from the strings evaluation): 7 new built-ins that operate in-place on existing char[] buffers — no new VM type, no GC, no heap pressure. New syscalls 302-308: SYS_STR_REPLACE_CONST (in-place find-and-replace-all of a literal old/new pair, returns count, handles both grow and shrink with full buffer-overflow guard), SYS_STR_STARTS_CONST (literal prefix check, 1/0), SYS_STR_ENDS_CONST (literal suffix check, 1/0), SYS_STR_CONTAINS_CONST (literal substring search, 1/0), SYS_STR_TO_UPPER (in-place ASCII A-Z conversion, UTF-8 multi-byte chars passed through), SYS_STR_TO_LOWER (in-place a-z), SYS_STR_TRIM (in-place strip leading + trailing ' '/'\\t'/'\\n'/'\\r', returns new length, shifts buffer down). Wired in the IDE BUILTINS table as strReplace / strStartsWith / strEndsWith / strContains / strToUpper / strToLower / strTrim. Each takes a `char[]` arg and a string-literal arg (compiled to const-pool index); runtime-needle variants intentionally not added in v1 — the literal-needle case is overwhelmingly common in IoT scripts (config-file parsing, prefix-based command dispatch, file-extension checks). Validated on .39 (tasmota32s3-devkit) via examples/test_strings_v15.tc — 9 test cases all green: multi-replace with UTF-8 expansion (unit=C → unit=°C ×2), replace grow (b → BB), replace shrink (hello → hi ×2), startsWith with edge cases (empty needle, longer-than-buffer), endsWith, contains, in-place case conversion, trim with all four whitespace cases (none, leading+trailing spaces, mixed \\t\\n\\r, all-whitespace). Closes ~80% of the "TinyC string handling is painful" gap from the strings evaluation; the runtime-needle variants and structural ops (split, join) are deferred — sprintf + the existing strToken cover those niches. Compile cycle unchanged (~10ms), bytecode adds ~20 bytes per call site (LOAD_CONST + LOAD_CONST + SYSCALL2). Previous: "1.4.3" — `void swap(int& a, int& b)` declares scalar pass-by-reference parameters; the callee reads/writes through the ref, mutations are visible to the caller. Also: `void parse_pair(int input, int& low, int& high)` for multi-out, `void inc_by(int& n, int amount) { n += amount; }` for in-place compound assignment, globals as ref args. **Zero new VM opcodes** — the implementation reuses the existing reference machinery (ADDR_LOCAL 0x78, ADDR_GLOBAL 0x79, LOAD_REF_ARR 0xA3, STORE_REF_ARR 0xA4 — already shipped for `int arr[]` array-by-reference params). A scalar ref is literally "an array ref always accessed at index 0": caller emits ADDR_LOCAL/ADDR_GLOBAL with the variable's slot/gindex; callee stores the encoded ref in a 1-slot local with `isScalarRef=true`; reads emit `PUSH_I8 0; LOAD_REF_ARR <slot>`; writes emit `PUSH_I8 0; <value>; STORE_REF_ARR <slot>`. Compound assignment (`n += 5`) handled with the standard DUP-and-recompute-offset pattern. Implementation: 5 idempotent patches in patch_refparams_v1.mjs (parser AMPERSAND-after-type acceptance, function-entry param registration, call-site ref encoding, identifier read, assignment write). v1 scope: int& only (float& and char& work too with same code path — declared types pass through, but coercions on float assignment route through I2F/F2I correctly); arg must be a plain Identifier of a local or global int variable; passing array elements (arr[i]), struct fields (obj.f), or heap-array variables yields a clear compile error. Validated on .39 via examples/test_refparams_v1.tc — all 4 patterns: swap (x=7, y=5 from 5,7), multi-out (lo=0xcd, hi=0xab from 0xABCD), compound `n += 5` (counter=25 from 10), globals as ref args (g_count=3, g_total=600 from 0,0). Out of v1: ref to array element (`func(arr[i])`), ref to struct field (`func(obj.f)`), heap-array vars as ref args, signature checking on the caller side (today silent). Float& and char& work but untested in v1. Previous: "1.4.2" — completes the dispatch-table pattern: `struct CmdEntry { char name[12]; cmd_handler handler; }` declares a struct with a typedef'd fn-ptr field; `cmds[i].handler = do_on;` assigns; `cmds[i].handler(args);` calls indirectly through the struct field. Three idempotent patches in patch_fnptrs_v2.mjs: (1) parser postfix accepts `(args)` after MemberAccess/MemberArrayAccess and produces a CallExpr with `callee` set to the access node (no name); (2) compileCallExpr detects callee-on-member-access, looks up the fn-ptr signature via the field's resolved type, pushes args, compiles the member access (emits LOAD_X to get the address from the struct slot), emits OP_CALL_INDIRECT; (3) exprLeavesValue extended to read the field signature for void-call detection. VM unchanged — uses the OP_CALL_INDIRECT shipped in v1.4.1. Validated on .39 via examples/test_fnptrs_v2.tc: 3-entry CmdEntry table populated with `cmds[i].handler = do_X`, looped-dispatched via `cmds[i].handler(arg)`, all three handlers (DO_ON, DO_OFF, DO_SET args=[42]) invoked correctly with the char[] arg propagated. Out of scope: function-pointer fields with array suffix `cmds[0].handlers[i](args)`, fn-ptr ARRAY fields. Previous: "1.4.1" — typedef-based fn-ptr types let scripts hold and call function references at runtime, enabling clean dispatch tables and callback-style APIs. New syntax: `typedef int (*cmp_fn)(int, int);` declares a fn-ptr type; `cmp_fn fn;` declares a variable; `fn = my_function;` assigns a named function's address; `fn(a, b)` calls indirectly. Works for locals, globals, and function parameters (e.g. `int run_op(cmp_fn f, int a, int b) { return f(a, b); }`). One new VM opcode `OP_CALL_INDIRECT 0x56`: pops u16 target from data stack instead of reading next 2 bytecode bytes, otherwise identical frame setup to OP_CALL. Bare function-name expression (no parens) emits PUSH_I32 with the function's bytecode address — uses big-endian 4-byte encoding to match existing PUSH_I32 / tc_read_i32 semantics; high two bytes always 0 since bytecode addresses fit in 16 bits. Forward references (calling a function defined later in the source) handled by a new `fnAddrPatches` queue that resolves after the function-compile pass alongside the existing forward-CALL patches. Implementation in patch_fnptrs_v1.mjs (11 idempotent patches against the IDE) + 1 new opcode handler in firmware. Validated end-to-end on .39 (tasmota32s3-devkit) via examples/test_fnptrs_v1.tc — all 4 patterns: local fn-ptr with two reassignments (7, 12), dispatch-by-id (9, 20), global fn-ptr with reassignment (Hello world! / Hi Tasmota.), fn-ptr as function parameter (30, 200). Two notable bugs found and fixed during validation: (1) initial PUSH_I32 byte order was little-endian, but firmware reads big-endian → indirect calls jumped to truncated addresses ending up at offset 0 and re-entering main() in an infinite loop; (2) compileExprStmt's exprLeavesValue() didn't know fn-ptr calls, defaulting to true → emitted POP for void fn-ptr calls → stack underflow on the 2nd void indirect call. Out of v1: function-pointer struct fields (interaction with Phase E pending), inline fn-ptr type syntax `void (*p)(int)` without typedef, comparison operators (==, !=) on fn-ptrs, returning fn-ptrs from functions, anonymous function literals. Previous: "1.4.0" — `struct Tag { int x; float y; char name[16]; }` defines a record type. Local + global + persist'd struct vars, positional initializer (`Point p = {1, 2}`), array of struct (`WriteLog wlog[16]`), char-array fields with `strcpy/sprintf %s`, nested structs (`Rect{Point tl; Point br}`), whole-struct assignment (`b = a` between matching tags) including array<->var both directions, struct as function parameter (by value), struct as return value, `sizeof(StructTag)` returns slot count at compile time. Implementation in `patch_structs_v1.mjs` (18 idempotent patches against the IDE). VM unchanged — uses existing 1D-array opcodes (LOAD/STORE_LOCAL/GLOBAL/HEAP_ARR) with compile-time field offsets and per-slot copy unrolling. Struct values follow TinyC's int32 slot model: each `int`/`char`/`float` field is 1 slot, char-array fields take their full slot count, nested structs flatten into the containing struct's layout. Heap-promotion follows existing rules: structs of ≤16 slots stack, larger ones (or array-of-struct totaling >16) auto-promote to heap. Return-by-value uses the existing `Op.RET` (which preserves data stack across frame teardown) — callee pushes N field values, caller pops them into the receiving local using a per-function temp slot for the offset/value swap. Validated end-to-end on .39 via `examples/test_structs_v1.tc` (11 test cases): basic field access (10/20/30), positional init, global+char-field, array indexed read/write, char-array field with strcpy+sprintf %s, nested struct (Rect.tl/br with 4-slot Point inner = 4 total slots, off-by-N bug fixed), whole-struct copy (var→var, arr[i]→var, var→arr[i]), function param (got 99,11), function return (z=42,84), sizeof (Point=2 WriteLog=4 Sample=18 Rect=4). Known v1 limitations: persist hash includes struct slotCount but NOT field-name list — silently reordering fields within a struct decl after persist data exists won't invalidate the .pvs file (workaround: delete .pvs manually, or add/remove a field which DOES invalidate). Also out of v1: self-referential structs (`struct Node { Node next; }` — needs pointers), 2D-array fields, struct equality `a==b`, designated initializers, function-pointer fields. Previous: "1.3.38" — `char/int/float buf[N][M]`. Full element read/write `buf[i][j] = …`, row passing `func(buf[i])` to char[]/int[]/float[] params, sprintf("%s", buf[i]) recognizer for char 2D, `strcpy/strcat/strcmp` on rows. Compiles to existing 1D heap-array opcodes via `i*M + j` flattening + `ADDR_HEAP_OFF` for row refs — VM unchanged. Row references require heap storage (auto-promoted at >16 elements; hard error otherwise with a clear message). Validated with `examples/test_2d.tc` (char) and `examples/test_2d_phase2.tc` (int + float + sprintf %s) on .39: int 2D writes/reads (ltab[r][c] = r*10+c → ltab[2][3]=23 ✓), float 2D (coef[1][1]=0.500 ✓), sprintf("%s", msgs[i]) in for-loop ✓. Patch script `patch_2d_arrays.mjs` is idempotent: applies cleanly to a fresh tinyc_ide.html.gz on each release rebuild. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)`. Element access `buf[i][j]` compiles to flat index `i*M + j` against the existing 1D heap-array opcodes. Single-index access `buf[i]` produces a row reference (via `ADDR_HEAP_OFF`, an existing opcode) when the result is used in a `char[]` parameter context — so `processChannel(buf[i], len)` and `strcpy(buf[i], "x")` work cleanly. Limited to `char` 2D for now; row-reference semantics requires heap storage (auto-promoted at >16 elements, so any practical 2D dimension qualifies). VM unchanged — pure compiler/IDE work. Validated end-to-end via `examples/test_2d.tc` on .39 with element access, constant + variable index row passing, strcpy/strcat/strcmp on rows, and a UDF accepting char[]. Phase 2 (deferred) covers `int/float buf[R][C]` and `sprintf("%s", buf[i])` recognizer. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)` move count int32 elements between file and memory as 4-byte little-endian. Same syscall serves int[] and float[] alike (both are int32 in memory; the on-disk bit pattern is identical). Motivating use case: chart history files that survive `persist` layout-hash invalidation. The existing `persist` mechanism is right for layout-coupled scalars (where reading wrong-named data is dangerous), but hostile for time-series chart arrays — every persist-var add/remove blows away hours of accumulated history. Scripts can now keep charts in regular globals and save/load to a dedicated named file via these syscalls, independent of persist. New IDs 286/287; documented in TinyC_Reference.md. Pattern is reusable for any binary blob (calibration tables, lookup tables, etc.). Previous: "1.3.36"    // Autoexec spawn — additionally gated on `TasmotaGlobal.uptime >= TC_AUTOEXEC_MIN_UPTIME` (default 3 s). 1.3.35 deferred the spawn from FUNC_INIT to first FUNC_LOOP, which on this hardware is uptime ~134 ms. Empirically that's still inside the Wi-Fi/RF coex bring-up window: `serialBegin` from main() claims the UART but receives ZERO bytes. (Verified on 2026.05.03 ttgo47 build with heatpump_map.tcb — Tasmota's own download server doesn't come up until uptime ~2.4 s, indicating WifiHasIP went true around then; before that the UART subsystem isn't stable.) Adding the uptime gate makes the autoexec spawn wait until the Wi-Fi/RF coex is past its bring-up phase. main() then runs in a fully quiet environment and serialBegin works without any script-side delay or BootInit hook. Override via `-DTC_AUTOEXEC_MIN_UPTIME=N` for slow networks. Manual TinyCRun mid-life is unaffected. Previous: "1.3.35" — Autoexec spawn deferred from FUNC_INIT to first FUNC_LOOP. Root cause analysis: TinyC's main() runs in its own FreeRTOS task (`tc_vm_task`) spawned during xdrv_124's FUNC_INIT. The task gets scheduled when loopTask yields — which it does while other drivers' FUNC_INITs are still running and Wi-Fi/RF coex is initializing. main() ends up calling `serialBegin` (or any peripheral begin) concurrently with this platform init, the UART claim returns OK but the GPIO matrix routing gets clobbered, and zero bytes ever arrive on RX. In-tree Tasmota drivers don't see this race because they all run synchronously on loopTask in FUNC_INIT, single-threaded. The historical workaround was `delay(15000)` at the top of main() — the 15 seconds let Wi-Fi/RF coex + every late driver fully settle before serialBegin ran. Fix: split TinyCLoadSettings into two phases. FUNC_INIT only loads `/tinyc.cfg` and populates `Tinyc->slot_config[]`; the actual TinyCStartVM() loop moves to a new `TinyCStartAutoexec()` called once on the first non-paused FUNC_LOOP. By that point every other driver's FUNC_INIT has run — main() spawns into a quiet environment and user `serialBegin`/`i2cBegin`/`spiBegin` in main() works without any delay or BootInit hook. The BootInit callback added in 1.3.31 is kept (still useful for users who want to keep main() lean and put hardware init in a separately-named function), but it's now an opt-in convenience instead of a workaround for a timing bug. `TC_BOOT_INIT_MIN_UPTIME` define from 1.3.34 removed (no longer relevant). Manual TinyCRun mid-life is unaffected — that path didn't have the race in the first place since Tasmota was already past FUNC_INIT. Validated against `examples/heatpump_map.tc` with bookkeeping-only main() + serialBegin in BootInit + 15-second delay removed. Previous: "1.3.34" — BootInit cold-boot uptime gate (`TC_BOOT_INIT_MIN_UPTIME = 3 s`). 1.3.33 fired BootInit on the first FUNC_LOOP after main() returned, but on a script with bookkeeping-only main, that fires within ~600 ms of cold boot — much too early for serialBegin: the UART claim succeeds (handle returned) but NO bytes ever arrive. Empirically this is the same race that motivated the historical 15-second `delay()` workaround in main(): Tasmota's late-init phase (WiFi-up RF coex, SerialBridge, console/OTA listeners) needs several seconds to settle before peripheral hardware is stable. New gate: only dispatch BootInit at FUNC_LOOP when `TasmotaGlobal.uptime >= TC_BOOT_INIT_MIN_UPTIME`. 3 s is the minimum that lets WiFi come up cleanly on a typical network. Mid-life TinyCRun reloads are unaffected — uptime is already large so the gate is moot, BootInit fires immediately after main returns. Override via `-DTC_BOOT_INIT_MIN_UPTIME=N` if 3 s is too short for a particular board (the user's empirical 15 s window suggests some hardware needs more — observe at `addLog` "BootInit fired at uptime N s" and bump if your script still misses bytes). Previous: "1.3.33" — BootInit gate fix — use `s->vm.halted` (with mutex) instead of `!s->task_running`. The 1.3.32 implementation gated dispatch on `!s->task_running` which is wrong for any script with a `TaskLoop` callback: TaskLoop keeps the slot's FreeRTOS task alive forever after main() returns, so `task_running` stays true and BootInit never fires. (heatpump_map.tc has TaskLoop for the email watchdog — that's how this surfaced. 0 frames after reload because serialBegin in BootInit never ran.) Correct gate: hold the slot's vm_mutex, check `s->vm.halted && error == TC_OK`, fire `tc_vm_call_callback_id`, clear `boot_init_pending` — all atomic against concurrent TaskLoop callbacks (which momentarily set halted=false during their own invocations). Also early-clear the pending flag when the script doesn't define BootInit at all (cb_index < 0) to avoid scanning the same slot every FUNC_LOOP forever. Previous: "1.3.32" — BootInit dispatch — per-slot, fires once per VM run instead of once per device boot. The 1.3.31 implementation gated dispatch on a static-global one-shot (`tc_boot_init_fired`) which only fired on the very first non-paused FUNC_LOOP at cold boot — meaning any TinyCStop+TinyCRun reload silently SKIPPED BootInit, breaking the dev workflow (every script reload would lose hardware init). New gate: per-slot `s->boot_init_pending` (in TcSlot) — set to `true` in `TinyCStartVM` right after tc_vm_load, cleared after dispatch. FUNC_LOOP scans all slots; for each loaded slot with `boot_init_pending && !task_running` (i.e. main() has returned), dispatch BootInit and clear the flag. Net semantics: BootInit fires exactly once per VM run, after main() exits, on the first FUNC_LOOP that follows. Cold-boot autoexec works (~50 ms after FUNC_INIT chain settles); manual TinyCRun reload works (immediately after main returns); post-upload restart works (via the existing TinyCStartVM call). Validated against `examples/heatpump_map.tc` migrated to use BootInit() for `serialBegin` (removed the historical 15-second `delay()` workaround at the top of `main()`). Previous: "1.3.31" — New `BootInit` callback — fires once on the first FUNC_LOOP, after every other Tasmota driver's FUNC_INIT has run and all template-defined GPIOs are configured. Equivalent of Scripter's `>BS` section. Solves a long-standing pain point where `serialBegin()` (and other peripheral inits) called from `main()` race Tasmota's own driver init and crash or silently fail to bind a pin — users had to insert a multi-second `delay()` at the top of main to work around it. New idiom: keep `main()` for VM-side bookkeeping (allocations, persist load, addCommand, etc.) and put hardware init (`serialBegin`, `i2cBegin`, `spiBegin`, peripheral config writes) in `void BootInit() { ... }`. By the time BootInit fires, Tasmota's GPIO+peripheral setup has fully completed; WiFi may or may not be up yet (use `OnWifiConnect`/`OnInit` for that). Wired analogously to `tc_init_done` (FUNC_NETWORK_UP one-shot for OnInit) — new static `tc_boot_init_fired` gates a single dispatch on first FUNC_LOOP. cb_index slot inserted in the middle of TcCallbackId enum (between EVERY_SECOND and ON_INIT) so all subsequent IDs renumber by +1; safe because nothing serializes these IDs across firmware versions and any in-flight `vm->cb_index[]` is always re-resolved at `tc_vm_load`. IDE CALLBACK_NAMES in lock-step (tinyc_ide.html.gz) so the compiler keeps `BootInit` in the function table instead of dead-code-eliminating it. CLAUDE.md callback section updated. Previous: "1.3.30" — pwlRequest — fully drop the handshake timeout caps that 1.3.24..1.3.29 were trying. Decisive new evidence: the unmodified Scripter Powerwall.h runs for months on the SAME firmware where our TinyC pwlRequest sticks within ~30 connect cycles. Same library, same Powerwall, same chip — only difference left was that we set tc_basic_client.setTimeout(10) + tc_ssl_client.setHandshakeTimeout(10) before connect; Scripter sets neither. Hypothesis: occasional ECDSA handshakes exceed the cap, aborted mid-handshake, leaves BearSSL state half-initialized, cumulative corruption. Reverting to exact Scripter pattern (only setTimeout(3000) + 2-arg connect). Worst-case stuck window goes back up to ~30 s but the script-side pwl-stale watchdog (5 min) catches the rare actual-stuck case via Restart 1. Previous: "1.3.29" — pwlRequest 10-second handshake timeout cap (sweet spot between aborting ECDSA and unbounded lwIP hangs). 1.3.28 removed all caps to fix ECDSA handshake aborting at 3 s — but then a stuck BearSSL session caused 120-s lwIP TCP-connect hangs (the ESP-IDF lwIP default), holding the VM mutex for 2 minutes per failed call. 10 s is well above ECDSA's ~5 s cost and 12× shorter than lwIP default. Pairs with examples/powerwall.tc lower reboot threshold (PWL_REBOOT_THRESHOLD 6 → 3) so when @R doesn't unstick BearSSL (observed: it usually doesn't) we fall back to chip reboot in ~30 s instead of after multiple 5-min backoff cycles. Previous: "1.3.28" — pwlRequest connect-timeout caps removed (1.3.24/25/26 reverted). Tesla rolled the Powerwall local-API cert from RSA to ECDSA; ECDSA handshakes on ESP32 BearSSL take 4-5 s (EC point math), which our wobbler-protection caps (setHandshakeTimeout(3), 3-arg connect with 3000ms, tc_basic_client.setTimeout(3)) were aborting before completion. Symptom: every pwlRequest returned -1 in 6228 ms (= 2 retries × 3 s) regardless of actual Powerwall reachability — the Scripter's same-library `Powerwall` class kept working because it never had these caps. Reverted to the Scripter pattern: only `setTimeout(3000)` (which BSSL_TCP_Client interprets as 3000 SECONDS — effectively no timeout) and 2-arg `connect()`. Wobbler recovery now relies entirely on the script-side circuit breaker (cookie wipe → @R → reboot escalation in examples/powerwall.tc), which still works because individual operations either succeed in normal time or block on the BSSL default ~30 s and then fail. Worst-case stuck window is back up to ~30 s per failed call but normal operation works again. Previous: "1.3.27" — pwlRequest("@R") — SSL reset without device reboot. Adds a new `@R` command to tc_call2pwl that tears down the BSSL_TCP_Client session AND the underlying WiFiClient socket, briefly pauses for lwIP to release, then re-binds and re-inits ssl config + buffer sizes + insecure mode, and clears the auth cookie. Lets the powerwall.tc script recover from a stuck BearSSL state (the recurring failure mode where every pwlRequest times out at 6 s regardless of Powerwall reachability) without escalating to `tasmCmd("Restart 1")`. The script's circuit breaker now does @R at PWL_RESET_THRESHOLD (3 consecutive FAST fails) and only escalates to chip reboot at PWL_REBOOT_THRESHOLD (6 fails) if @R didn't help. Existing `@D` (config), `@C` (cts serials), `@N` (clear cookie) commands unchanged. Previous: "1.3.26" — pwlRequest connect() with explicit timeout. 1.3.24+25 set tc_basic_client.setTimeout(3) AND tc_ssl_client.setHandshakeTimeout(3) — but neither reliably caps the BSSL_TCP_Client `connect(host, port)` call on Arduino-ESP32 core 3.x. Observed 37-second hangs on a single failed call despite both timeouts. Switched to the explicit 3-arg `connect(host, port, timeout_ms)` overload (BSSL_TCP_Client.h line 130) which bounds the whole connect+handshake phase. Worst-case stuck window per failed call now ~3 s × TC_PWL_RETRIES = 6 s instead of 37 s. The setTimeout/setHandshakeTimeout calls stay (they bound read/write phases) but the connect cap is now what it always should have been. Combined with the script-side circuit breaker (cookie wipe + 4× backoff + skip-remaining), Powerwall wobblers now cause one ~3 s mutex hold instead of cascading multi-call freezes — device stays HTTP-responsive throughout. Previous: "1.3.25" — pwlRequest SSL-handshake timeout cap. 1.3.24 capped TCP connect (`tc_basic_client.setTimeout(3)`) which dropped the worst-case stuck window from ~60 s to ~36 s — but the SSL handshake itself has its own ~30 s default in BSSL_TCP_Client and was now the dominant cost (observed 36.6 s timeout per failed call). Now also calls `tc_ssl_client.setHandshakeTimeout(3)` (BSSL_TCP_Client API, seconds) to bound the handshake phase. Combined: TCP connect 3 s + SSL handshake 3 s + read/write 3-5 s; with TC_PWL_RETRIES=2 on connect, worst case ~6 s per failed pwlRequest call instead of 36+ s. Pairs with the script-side circuit breaker in examples/powerwall.tc — single failed call now causes ~6 s mutex hold (HTTP server recovers between calls), cookie wipe + 4× backoff prevents repeated hits, device stays usable through Powerwall wobblers. Previous: "1.3.24" — pwlRequest TCP connect-timeout cap. tc_pwl_get_cookie / tc_pwl_get_request both call `tc_ssl_client.connect()` which on Arduino-ESP32 inherits a ~30-s default TCP-connect timeout — the `setTimeout(3000)` set on the SSL client right above only bounds read/write. Combined with TC_PWL_RETRIES=2 + delay(100), worst case = ~60 s of held VM mutex when the Powerwall is unresponsive. During that hold the device looks completely "stuck" from the LAN side: HTTP server can't respond, multiple cadences pile up in TaskLoop, cascade of 3× 60-s timeouts froze a test device for ~3 minutes. Now also calls `tc_basic_client.setTimeout(3)` (Arduino WiFiClient API, seconds) which DOES bound the connect phase. Worst case drops to ~6 s (2 retries × 3 s). Pairs well with the script-side circuit breaker in examples/powerwall.tc which now backs off + clears the auth cookie on consecutive failures. Previous: "1.3.23" — pwlRequest now accepts a runtime char[] buffer (was: string-literal only). The SYS_PWL_REQUEST handler used to call `tc_get_const_str(vm, ci)` which only reads from the bytecode constant pool — meaning the whole credential string ("@Dip,email,password") had to be hardcoded in the .tc source. That forced either committing credentials or sprinkling `<POWERWALL_IP>` placeholders that broke the build for everyone else. Now uses the same dual-source `tc_ref_to_cstr` pattern that SPRINTF_STR was fixed to use a few releases back: copies up to 160 chars (fits @D ip,email,password) into a stack buffer regardless of whether the ref is a const-pool string literal or a heap/local char[]. IDE BUILTIN tinyc_ide.html.gz updated in lock-step (pwlRequest's `constArgs: [0]` → `strArgs: [0]`) so the compiler stops rejecting non-literal first arguments. Net effect: scripts can now do `char cmd[160]; sprintf(cmd, "@D%s,%s,%s", ip, email, pw); pwlRequest(cmd);` with credentials read at runtime from /powerwall.cfg — no more TESLA_EMAIL/PASSWORD/IP defines needed in user_config_override.h, no more credentials in the firmware binary, no more credentials in the .tc source. Pattern is identical to /pool_pump.cfg loading in examples/pool_pump.tc — see examples/powerwall.tc's load_pwl_config() for the canonical implementation. String-literal callsites (the existing `pwlRequest("/api/meters/aggregates")` etc) keep working unchanged because tc_ref_to_cstr handles const-pool refs transparently. Previous: "1.3.22" — sprintf %%-escape fix in `tc_sprintf_float`. The custom Arduino-safe float formatter (which bypasses libc snprintf because Arduino strips %f support) hand-walks the format string and copies prefix/suffix bytes verbatim around the float-spec replacement. The hunt loop correctly *skips* `%%` while searching for the active spec, but the prefix/suffix copy loops were emitting `%%` literally — producing e.g. "85 %% (12.98 kWh)" instead of "85 % (12.98 kWh)" on `sprintf(buf,"%d %% (%.2f kWh)",pct,kwh)`. Visible in any TinyC sprintf with `%%` adjacent to a float spec; the int path uses real snprintf and was already correct. Fixed both the prefix and suffix byte-walk loops to detect `%%` pairs and emit a single `%` (one extra `c++` per pair). No format-string semantic change for existing call sites that didn't use `%%`. Previous: "1.3.21" — UDP `global` send-side self-heal: when WiFi degrades, Arduino UDP can wedge multicast `endPacket()` while the upper-layer `udp_connected` flag stays true — silencing all `global` broadcasts from a slot until that slot is restarted. Symptom seen on a heat-pump device .31 whose `hp_in/hp_out/hp_at/hp_run` UDP globals stopped reaching subscriber slots even though the VM kept executing and `store_reg()` kept assigning. Receive side already auto-recovered via inactivity watchdog (`tc_udp_poll`); send side now mirrors that — `tc_udp_send/_array/_str` check `endPacket()`'s return value and on failure call `tc_udp_send_fail_recover()` which throttle-rebinds the multicast socket (`tc_udp_init()`). Throttle is `TC_UDP_REINIT_THROTTLE_MS = 5000` so a genuinely-down network can't cause continuous re-bind churn (every assignment to a UDP global would otherwise trigger). Logs at INFO when a re-init fires. Same logic transparently helps any future scripted-UDP/`udpSend` path that goes through these helpers. Previous: "1.3.20" — Symmetric crypto syscalls (360–365): aesEcb / aesCbc (AES-128, in-place on TinyC char[] buffers), hmacSha256, sha256, plus hex2bin / bin2hex byte-twiddling helpers. ESP32-only via mbedtls (already linked for HTTPS/MQTT-TLS); ESP8266 path stubs return 0/no-op. Motivating use case: TinyC scripts speaking the Tuya local protocol (v3.3 = AES-128-ECB) so users can drive Smart-Life-controlled devices (pool heat pumps, plugs, switches, dehumidifiers) directly from Tasmota without a cloud round-trip or a separate bridge. Also enables custom signed REST APIs (HMAC-SHA256), encrypted SML decoders not covered by AmsLib, and per-device MQTT-TLS fingerprinting. Buffers follow TinyC convention (one byte per int32 slot, low 8 bits used); lengths are in bytes and must fit the ref's allocated capacity. AES-CBC stack-allocates up to 4 KB per call, falls back to malloc above; HMAC/SHA bounded at 1024 B key / 4 KB data — bigger payloads should be hashed in chunks via repeated SHA-256 of a hash-state buffer (future enhancement). Tuya v3.4 (ECDH+AES-GCM) not exposed yet — most Smart-Life devices are still v3.3. IDE BUILTINS + symbol-table entries for the 6 functions are wired (refArgs[] / strArgs[] / intArgs[] in tinyc_ide.html.gz) — first user is examples/pool_pump.tc, validated end-to-end on ESP32-S3. Previous: "1.3.19" — Cross-VM share table + PSRAM-backed bytecode + IDE strcmp/sprintf fixes. (1) New 8-syscall `share*` API (340–347) lets two TinyC slots exchange named scalars/strings via a driver-global 32-entry table (~2.6 KB DRAM, mutex-protected on ESP32). Use this when one program outgrows a single slot and is split across two — e.g. Andreas's BYD/Speedwire/EEBus stack. Missing-key reads return 0/0.0/"" without error; `shareHas`/`shareDelete` complete the model. (2) `TC_MAX_PROGRAM` 65536 → 131072 with PSRAM fallback: `s->program` and `vm->const_data` allocate from internal DRAM first, only spill to `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` on OOM (ESP32 only). Small/normal programs stay in fast static RAM; only edge-case 100+ KB scripts (or scripts on devices with fragmented heap) reach PSRAM. AddLog INFO line emitted when PSRAM path is taken. (3) IDE: 4-site emitByte-truncation bug fixed — `emit(Op.SYSCALL); emitByte(Syscall.X)` truncated ids ≥256 to `id & 0xFF`, silently rerouting STRCMP_CONST=275 to SYS_MATH_POW=19 (so `strcmp(arr,"literal")` returned NaN bits 0x7FC00000 = 2143289344, breaking every `if (strcmp(...) == 0)` branch). Same bug hit FILE_WRITE_STR=276, LOG_LEVEL=269, LOG_LEVEL_STR=270. All four sites now use the existing `emitSyscall(id)` helper which auto-picks SYSCALL2 (u16) for ids ≥256. (4) IDE: `inferType(CallExpr)` had a hardcoded float-builtin list (sqrt/sin/cos/.../atof) and ignored the symbol-table `returnFloat: true` flag, so `sprintf(buf,"%.2f",shareGetFloat(...))` saw valType='int' and emitted I2F → reinterpreted bits → printed 1056964608.00 (= 0.5f bit-pattern). Now also returns 'float' when `BUILTINS[name].returnFloat === true`; future float-returning builtins work automatically.   Previous: "1.3.18" — Constant pool cap raised 512→1024 on ESP32 (Andreas BYD/Speedwire/EEBus scripts hit 440/512). "1.3.17" — TC_ERR_BOUNDS rich log + RET-time SP-balance check + compiler float→int narrowing warning.
 #define TC_FILE_NAME       "/autoexec.tcb"
 #ifdef ESP8266
 #define TC_MAX_PERSIST     64          // ESP8266: keep the table small (simple programs, tight RAM)
@@ -351,9 +351,17 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // minimal script repeatedly (`TinyCRun 0 /min.tcb`) and read the per-phase
 // deltas in the console — the phase whose `free=` keeps dropping across reloads
 // is the culprit. No-op (and zero code) in normal builds.
-#if defined(ESP8266) && defined(TINYC_HEAP_DEBUG)
+// Build with -DTINYC_HEAP_DEBUG to get it. Was ESP8266-only until 2026-08-08;
+// widened to ESP32 while hunting the ~1 KB-per-slot-restart leak, which is
+// where the phase markers below come from. Off by default, zero code.
+#if defined(TINYC_HEAP_DEBUG)
+#ifdef ESP32
+  #define TC_HEAPLOG(tag) AddLog(LOG_LEVEL_INFO, PSTR("TCHEAP %-15s free=%6u maxblk=%6u"), \
+      PSTR(tag), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap())
+#else
   #define TC_HEAPLOG(tag) AddLog(LOG_LEVEL_INFO, PSTR("TCHEAP %-15s free=%5u maxblk=%5u"), \
       PSTR(tag), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize())
+#endif
 #else
   #define TC_HEAPLOG(tag) do{}while(0)
 #endif
@@ -387,6 +395,24 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
   #define TC_CALLBACK_MAX_INSTR 20000  // instruction limit per callback (ESP8266)
 #else
   #define TC_CALLBACK_MAX_INSTR 200000 // instruction limit per callback (ESP32)
+#endif
+
+// How long a TaskLoop body may hold the VM before the driver takes the mutex
+// away from it for one tick. Must stay well under TC_WEB_CB_WAIT (250 ms) or a
+// web render would time out waiting for a compute-heavy body; 20 ms means a
+// page render waits at most one budget for its turn.
+#ifndef TC_TASKLOOP_BUDGET_MS
+#define TC_TASKLOOP_BUDGET_MS 20
+#endif
+
+// How many 1 KB frame-locals buffers a VM keeps for reuse instead of returning
+// them to the heap (see tc_frame_alloc). One already covers plain leaf calls;
+// the rest absorb recursion that oscillates in depth. Worst case this holds
+// TC_FRAME_CACHE KB per VM, and only after calls that deep actually happened.
+#ifdef ESP8266
+  #define TC_FRAME_CACHE 1
+#else
+  #define TC_FRAME_CACHE 4
 #endif
 #define TC_CALLBACK_NAME_MAX 20        // max callback name length (longest: OnMqttDisconnect=16+1)
 
@@ -462,6 +488,44 @@ enum TcOp {
   // Heap ref with slot offset — for strcpy(arr[i].field, ...)
   OP_ADDR_HEAP_OFF  = 0xA6,  // u8 handle; pop offset -> push ref: 0xC0000000 | (offset<<16) | handle
   OP_REF_OFF        = 0xA7,  // pop off, pop ref -> push ref advanced by off slots (tag-aware; heap refs add into the offset bits, local/global into the index; const-pool refs unchanged)
+
+  // ── Superinstructions (0xB0+) ────────────────────────────────────────────
+  // Fused sequences the compiler's peephole emits in place of the equivalent
+  // opcode run. They add no expressiveness: every one of them must behave
+  // EXACTLY like the sequence it replaces, so a program compiles the same
+  // either way and the unfused form stays valid forever.
+  //
+  // Why they exist: TinyC is a stack VM, so `sum = sum * 3` costs four opcodes
+  // (load, push, multiply, store) where a register VM spends one, because its
+  // operands live IN the instruction. Measured 2026-08-08 on the bench_int
+  // loop: 33 opcodes per iteration against roughly 10 for Berry, which is the
+  // whole of the 3.2x gap on integer arithmetic — per opcode TinyC is actually
+  // the faster of the two (275 ns vs about 400). Fusing the common shapes buys
+  // most of the register-VM win without a register allocator: the compiler
+  // keeps emitting stack code and a peephole rewrites the runs.
+  //
+  // ⚠️ APPEND-ONLY, like the syscall table. Never renumber, never change the
+  // meaning of an existing one — a .tcb in the field encodes these numbers.
+  OP_LK_OP_ST       = 0xB1,  // (src u8, k i8, op u8, dst u8) locals[dst] = locals[src] OP k
+                             // Replaces LOAD_LOCAL·PUSH_I8·<op>·STORE_LOCAL.
+  OP_LL_OP_ST       = 0xB2,  // (a u8, b u8, op u8, dst u8)   locals[dst] = locals[a] OP locals[b]
+                             // Replaces LOAD_LOCAL·LOAD_LOCAL·<op>·STORE_LOCAL.
+                             // `op` is the ORDINARY opcode number of the operation (OP_ADD, OP_MUL, ...),
+                             // so one superinstruction covers every operator instead of one per operator,
+                             // and the compiler simply passes along the opcode it would otherwise have emitted.
+  OP_LK32_OP_ST     = 0xB3,  // (src u8, k i32, op u8, dst u8) locals[dst] = locals[src] OP k
+                             // Wide-constant twin of 0xB1. Three bytes bigger; code size is not
+                             // the bottleneck, and it covers every constant an i8 cannot hold.
+  OP_LL_CMP_JZ      = 0xB4,  // (a u8, b u8, cmp u8, target u16)  if !(locals[a] CMP locals[b]) goto target
+  OP_LK32_CMP_JZ    = 0xB5,  // (a u8, k i32, cmp u8, target u16) if !(locals[a] CMP k) goto target
+                             // The loop head. Runs once per iteration of EVERY loop, so this is the
+                             // broadest of the fusions even though it saves the same three opcodes
+                             // as the others. Branch-on-FALSE, matching the JZ it replaces.
+  OP_INC_LOCAL      = 0xB0,  // (idx u8, delta i8) locals[idx] += delta, no stack effect.
+                             // Replaces LOAD_LOCAL·DUP·PUSH_I8·ADD·STORE_LOCAL·POP,
+                             // i.e. `i++` USED AS A STATEMENT: six opcodes, of which
+                             // the DUP and the POP exist only to produce a value that
+                             // is then thrown away.
   // Constants
   OP_LOAD_CONST   = 0x90,
 };
@@ -1047,6 +1111,26 @@ enum TcSyscall {
   SYS_BLE_DONE              = 420, // () -> int          0=pending, >0=result length ready, <0=failed
   SYS_BLE_RESULT            = 421, // (buf_ref) -> int   copy received notify/read bytes; returns len
 
+  // BLE "SPP": a PERSISTENT GATT-client connection for continuous serial-style traffic
+  // (BlueRadios/Nordic-UART-style peripherals), as opposed to the one-shot connect->op->
+  // disconnect model above (SYS_BLE_TARGET..SYS_BLE_RESULT), which is right for a device
+  // that wakes, reports once, and sleeps, but drops the link before a second notify can
+  // ever arrive -- wrong for a stream. Service/characteristic UUIDs are STRING literals
+  // (16-bit "180a" or full 128-bit), unlike the one-shot family's int16-only svc/chr —
+  // most UART-style services use a proprietary 128-bit UUID, which int16 cannot reach.
+  SYS_BLE_SPP_TARGET        = 535, // (mac_ref, addrtype, svc_uuid) -> int   set persistent target; 1=ok
+  SYS_BLE_SPP_CONNECT       = 536, // () -> int          connect (BLOCKS -- TaskLoop only); 1=ok, 0=failed
+  SYS_BLE_SPP_STATE         = 537, // () -> int          1=connected, 0=not
+  SYS_BLE_SPP_SUB           = 538, // (notify_uuid) -> int   subscribe to a notify/indicate characteristic; 1=ok
+  SYS_BLE_SPP_AVAIL         = 539, // () -> int          bytes queued from notifications, not yet read
+  SYS_BLE_SPP_READ          = 540, // (buf_ref, max) -> int   drain queued notify bytes (like sppRead)
+  SYS_BLE_SPP_WRITE         = 541, // (chr_uuid, buf_ref, len) -> int   write WITHOUT dropping the connection; 1=ok
+  SYS_BLE_SPP_CLOSE         = 542, // () -> int          disconnect
+  // One-shot: connect, list every service+characteristic (UUID + R/W/N/I flags) as text,
+  // disconnect. Run this FIRST against an unknown device -- there is no datasheet lookup
+  // for a proprietary UUID, the device has to be asked.
+  SYS_BLE_GATT_DUMP         = 543, // (mac_ref, addrtype, out_buf) -> int   bleGattDump(): text length
+
   // BLE GATT server (peripheral) — device advertises a service a phone/central connects to.
   // Poll-based, mirrors the client. NimBLE server build + notify run on the main task; the VM
   // sets request flags + buffers. props bitmask: BLE_READ=1 | BLE_WRITE=2 | BLE_NOTIFY=4.
@@ -1490,6 +1574,11 @@ typedef struct {
   uint16_t globals_size;
   // Frames
   TcFrame  frames[TC_MAX_FRAMES];
+  // Reuse cache for frame locals — see tc_frame_alloc(). Buffers are only ever
+  // put here after a real call has allocated one, so a VM that never calls a
+  // function costs nothing extra.
+  int32_t  *frame_cache[TC_FRAME_CACHE];
+  uint8_t  frame_cache_n;
   uint8_t  fp;
   uint8_t  frame_count;
   // Constants (dynamically allocated in tc_vm_load)
@@ -1636,6 +1725,13 @@ struct TcSlot {
   int32_t  extract_handle;
   uint32_t extract_file_pos;
   uint32_t extract_last_epoch;
+  // How often a web-render callback (WebCall/WebPage/WebUI/JsonCall/WebOn) was
+  // SKIPPED because this slot's VM was busy. Every skip is a silently empty
+  // block in the served page -- a missing sensor row, a missing canvas. Without
+  // a counter the only symptom is "the display flickers", which reads as a
+  // browser or network problem and costs an evening. Shown as "WebSkip" by the bare `TinyC`
+  // console command and in the TinyCInfo web rows. Rolf, 2026-08-07.
+  uint16_t web_cb_skips;
 #ifdef ESP32
   // FreeRTOS task for VM execution (main() and TaskLoop)
   TaskHandle_t task_handle;
@@ -1945,9 +2041,17 @@ static TcSlot *tc_slot_alloc(void) {
   return s;
 }
 
+// Defined further down with the rest of the frame machinery.
+static void tc_free_all_frames(TcVM *vm);
+static void tc_frame_cache_drain(TcVM *vm);
+
 // Helper: free a slot (caller must stop VM and free program first)
 static void tc_slot_free(TcSlot *s) {
   if (!s) return;
+  // Frame locals and their reuse cache — the slot is going away, so anything
+  // still parked has to go back to the heap or it is lost with the struct.
+  tc_free_all_frames(&s->vm);
+  tc_frame_cache_drain(&s->vm);
   if (s->program) { free(s->program); s->program = nullptr; }
   if (s->vm.stack) { free(s->vm.stack); s->vm.stack = nullptr; s->vm.stack_size = 0; }
   if (s->vm.globals) { free(s->vm.globals); s->vm.globals = nullptr; s->vm.globals_size = 0; }
@@ -3635,30 +3739,92 @@ static void tc_output_flush_mqtt(void) {
   s->output[0] = '\0';
 }
 
+// Integer binary operator, selected by the ORDINARY opcode number of the
+// operation. The superinstructions (0xB1/0xB2) route through this so the fused
+// and the unfused form can never drift apart: there is one definition of what
+// OP_DIV does, not one per dispatch path per fusion.
+// FLOATS DELIBERATELY ABSENT — the compiler's peephole refuses float operands,
+// because an integer ADD on an IEEE bit pattern yields a denormal, not a+1.
+// Returns TC_OK, or an error (division by zero, unknown operator) in *err.
+static inline int32_t tc_binop_i(uint8_t op, int32_t a, int32_t b, int *err) {
+  switch (op) {
+    case OP_ADD:     return a + b;
+    case OP_SUB:     return a - b;
+    case OP_MUL:     return a * b;
+    case OP_DIV:     if (!b) { *err = TC_ERR_DIV_ZERO; return 0; } return a / b;
+    case OP_MOD:     if (!b) { *err = TC_ERR_DIV_ZERO; return 0; } return a % b;
+    case OP_BIT_AND: return a & b;
+    case OP_BIT_OR:  return a | b;
+    case OP_BIT_XOR: return a ^ b;
+    case OP_SHL:     return a << b;
+    case OP_SHR:     return a >> b;
+    case OP_EQ:      return a == b ? 1 : 0;
+    case OP_NEQ:     return a != b ? 1 : 0;
+    case OP_LT:      return a <  b ? 1 : 0;
+    case OP_GT:      return a >  b ? 1 : 0;
+    case OP_LTE:     return a <= b ? 1 : 0;
+    case OP_GTE:     return a >= b ? 1 : 0;
+    default:         *err = TC_ERR_BAD_OPCODE; return 0;   // crafted bytecode
+  }
+}
+
 /*********************************************************************************************\
- * Frame locals: dynamic allocation
- * Each frame's locals[] is malloc'd on OP_CALL and freed on OP_RET.
- * This saves ~2KB+ RAM on ESP8266 vs static arrays in every frame.
+ * Frame locals: dynamic allocation, with a small per-VM reuse cache
+ * Each frame's locals[] is 1 KB (TC_MAX_LOCALS int32). Allocating it per call
+ * saves ~2KB+ RAM on ESP8266 vs static arrays in every frame — but paying a
+ * heap round trip per FUNCTION CALL is what made calls the slowest thing TinyC
+ * does. Measured on an S3, 2026-08-08: 11.8 us per call, identical for a
+ * zero-argument and a one-argument function, i.e. entirely fixed per-frame cost
+ * and nothing to do with the arguments — about 43 opcodes' worth at 276 ns.
+ *
+ * Frames are a STACK, so a buffer freed by a returning call is exactly what the
+ * next call needs. A cache of a few buffers therefore hits essentially always:
+ * a leaf call from depth d frees at d+1 and the next leaf allocates at d+1, so
+ * even ONE entry covers the common case; the rest cover oscillating recursion.
+ * The cache lives in the VM and dies with it — no locking (each TcVM is used by
+ * one task at a time), no memory retained across a slot reload.
+ *
+ * The zeroing stays: TinyC has always handed out zeroed locals and scripts rely
+ * on it. It is ~256 word stores, a fraction of the heap round trip it replaces.
 \*********************************************************************************************/
 
 // Allocate locals for a frame, returns false on OOM
-static bool tc_frame_alloc(TcFrame *frame) {
+static bool tc_frame_alloc(TcVM *vm, TcFrame *frame) {
+  if (vm && vm->frame_cache_n) {
+    frame->locals = vm->frame_cache[--vm->frame_cache_n];
+    memset(frame->locals, 0, TC_MAX_LOCALS * sizeof(int32_t));
+    return true;
+  }
   frame->locals = (int32_t *)calloc(TC_MAX_LOCALS, sizeof(int32_t));
   return (frame->locals != nullptr);
 }
 
 // Free locals for a frame (safe to call if already freed)
-static void tc_frame_free(TcFrame *frame) {
+static void tc_frame_free(TcVM *vm, TcFrame *frame) {
   if (frame->locals) {
-    free(frame->locals);
+    if (vm && vm->frame_cache_n < TC_FRAME_CACHE) {
+      vm->frame_cache[vm->frame_cache_n++] = frame->locals;
+    } else {
+      free(frame->locals);
+    }
     frame->locals = nullptr;
+  }
+}
+
+// Hand the cached buffers back to the heap — called when the VM is torn down,
+// so a stopped slot does not sit on up to TC_FRAME_CACHE KB it no longer needs.
+static void tc_frame_cache_drain(TcVM *vm) {
+  if (!vm) return;
+  while (vm->frame_cache_n) {
+    free(vm->frame_cache[--vm->frame_cache_n]);
+    vm->frame_cache[vm->frame_cache_n] = nullptr;
   }
 }
 
 // Free all allocated frames (call on VM stop/reset/reload)
 static void tc_free_all_frames(TcVM *vm) {
   for (int i = 0; i < TC_MAX_FRAMES; i++) {
-    tc_frame_free(&vm->frames[i]);
+    tc_frame_free(vm, &vm->frames[i]);
   }
   vm->frame_count = 0;
   vm->fp = 0;
@@ -3801,6 +3967,11 @@ static void tc_free_worker_vm(TcVM *w) {
   if (!w) return;
   tc_close_vm_files(w);    // close any files THIS worker left open (owner-keyed, no leak)
   tc_free_all_frames(w);   // frame locals (private)
+  // ⚠️ MUST follow free_all_frames, which parks the buffers in the cache rather
+  // than returning them. Without this a worker would leak up to TC_FRAME_CACHE KB
+  // on EVERY spawnTask/finish cycle, and a script that spawns per event would
+  // bleed the heap dry over hours.
+  tc_frame_cache_drain(w);
   tc_heap_free_all(w);     // worker heap (private)
   if (w->stack) free(w->stack);
   // Detach aliases so nothing can accidentally double-free the primary's arrays.
@@ -5561,6 +5732,17 @@ void tc_ble_glue_register(void);
 int  tc_ble_gatt_start(const uint8_t *mac, int addrtype, int svc, int chr, int notify, const uint8_t *wbuf, int wlen);
 int  tc_ble_gatt_poll(void);                  // 0=pending, 1=done(result ready), <0=failed (GEN_STATE_*)
 int  tc_ble_gatt_copy(uint8_t *out, int max); // copy result bytes into out, return len, release the op
+// BLE "SPP" — a PERSISTENT GATT client, independent of the one-shot queue above. Own
+// NimBLEClient, own notify ring. UUIDs are strings (16-bit "180a" or full 128-bit).
+void tc_ble_spp_target(const uint8_t *mac, int addrtype, const char *svc);
+int  tc_ble_spp_connect(void);                          // BLOCKS -- call from TaskLoop only
+int  tc_ble_spp_state(void);                             // 1=connected, 0=not
+int  tc_ble_spp_sub(const char *chruuid);                // subscribe notify/indicate; 1=ok
+int  tc_ble_spp_available(void);                         // queued notify bytes
+int  tc_ble_spp_read(uint8_t *out, int max);             // drain the ring
+int  tc_ble_spp_write(const char *chruuid, const uint8_t *buf, int len);  // write, keep the link up
+void tc_ble_spp_close(void);
+int  tc_ble_gatt_dump(const uint8_t *mac, int addrtype, char *out, int max);  // one-shot: list services+chars
 // GATT server (peripheral) bridge — defined in xdrv_79_tinyc_ble_glue.ino. NimBLE server build +
 // notify run on the main task (tc_ble_srv_loop); these only set request flags / copy buffers.
 void tc_ble_srv_init(const char *name);             // begin config + request BLE up + set adv name
@@ -15098,6 +15280,86 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       TC_PUSH(vm, i);
       break;
     }
+    // ── BLE "SPP" — persistent GATT client, for continuous serial-style traffic ─
+    case SYS_BLE_SPP_TARGET: {           // bleSppTarget(macbuf, addrtype, "svc-uuid") -> 1/0
+      int32_t cs   = TC_POP(vm);
+      int32_t type = TC_POP(vm);
+      int32_t mref = TC_POP(vm);
+      int32_t *mb  = tc_resolve_ref(vm, mref);
+      const char *svc = tc_get_const_str(vm, cs);
+      if (!mb || !svc) { TC_PUSH(vm, 0); break; }
+      uint8_t mac[6];
+      for (int i = 0; i < 6; i++) mac[i] = (uint8_t)(mb[i] & 0xff);
+      tc_ble_spp_target(mac, type, svc);
+      TC_PUSH(vm, 1);
+      break;
+    }
+    case SYS_BLE_SPP_CONNECT: {          // bleSppConnect() -> 1/0; BLOCKS -- TaskLoop only
+      TC_PUSH(vm, tc_ble_spp_connect());
+      break;
+    }
+    case SYS_BLE_SPP_STATE: {            // bleSppState() -> 1=connected, 0=not
+      TC_PUSH(vm, tc_ble_spp_state());
+      break;
+    }
+    case SYS_BLE_SPP_SUB: {              // bleSppSub("notify-uuid") -> 1/0
+      int32_t cs = TC_POP(vm);
+      const char *uuid = tc_get_const_str(vm, cs);
+      TC_PUSH(vm, uuid ? tc_ble_spp_sub(uuid) : 0);
+      break;
+    }
+    case SYS_BLE_SPP_AVAIL: {            // bleSppAvailable() -> queued notify bytes
+      TC_PUSH(vm, tc_ble_spp_available());
+      break;
+    }
+    case SYS_BLE_SPP_READ: {             // bleSppRead(buf, max) -> len; drains the notify ring
+      int32_t n   = TC_POP(vm);
+      int32_t ref = TC_POP(vm);
+      int32_t *buf = tc_resolve_ref(vm, ref);
+      if (!buf || n <= 0) { TC_PUSH(vm, 0); break; }
+      int32_t kap = tc_ref_maxlen(vm, ref);
+      if (n > kap) { n = kap; }
+      TC_UBUF(tmp, 256);
+      if (n > (int32_t)sizeof(tmp)) { n = sizeof(tmp); }
+      int got = tc_ble_spp_read(tmp, n);
+      for (int i = 0; i < got; i++) { buf[i] = (int32_t)tmp[i]; }
+      TC_PUSH(vm, got);
+      break;
+    }
+    case SYS_BLE_SPP_WRITE: {            // bleSppWrite("chr-uuid", buf, len) -> 1/0; keeps the link up
+      int32_t n   = TC_POP(vm);
+      int32_t ref = TC_POP(vm);
+      int32_t cs  = TC_POP(vm);
+      const char *uuid = tc_get_const_str(vm, cs);
+      int32_t *buf = tc_resolve_ref(vm, ref);
+      if (!uuid || !buf || n <= 0) { TC_PUSH(vm, 0); break; }
+      int32_t kap = tc_ref_maxlen(vm, ref);
+      if (n > kap) { n = kap; }
+      TC_UBUF(tmp, 128);
+      if (n > (int32_t)sizeof(tmp)) { n = sizeof(tmp); }
+      for (int i = 0; i < n; i++) { tmp[i] = (uint8_t)(buf[i] & 0xff); }
+      TC_PUSH(vm, tc_ble_spp_write(uuid, tmp, n));
+      break;
+    }
+    case SYS_BLE_SPP_CLOSE: {            // bleSppClose() -> 1
+      tc_ble_spp_close();
+      TC_PUSH(vm, 1);
+      break;
+    }
+    case SYS_BLE_GATT_DUMP: {            // bleGattDump(macbuf, addrtype, outbuf) -> len; BLOCKS briefly
+      int32_t oref = TC_POP(vm);
+      int32_t type = TC_POP(vm);
+      int32_t mref = TC_POP(vm);
+      int32_t *mb  = tc_resolve_ref(vm, mref);
+      if (!mb) { TC_PUSH(vm, 0); break; }
+      uint8_t mac[6];
+      for (int i = 0; i < 6; i++) mac[i] = (uint8_t)(mb[i] & 0xff);
+      TC_BUF(txt, 700);
+      tc_ble_gatt_dump(mac, type, txt, sizeof(txt));
+      TC_PUSH(vm, tc_cstr_to_ref(vm, oref, txt));
+      break;
+    }
+
     // ── BLE GATT server (peripheral) ──────────────────────────────────────────
     case SYS_BLE_SRV_INIT: {             // bleServer(name) -> 1
       int32_t cs = TC_POP(vm);
@@ -15182,6 +15444,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     case SYS_BLE_WRITE_START: TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, -1); break;
     case SYS_BLE_DONE:      TC_PUSH(vm, -1); break;
     case SYS_BLE_RESULT:    TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_TARGET:  TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_CONNECT: TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_STATE:   TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_SUB:     TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_AVAIL:   TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_READ:    TC_POP(vm); TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_WRITE:   TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_BLE_SPP_CLOSE:   TC_PUSH(vm, 1); break;
+    case SYS_BLE_GATT_DUMP:   TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, 0); break;
     case SYS_BLE_SRV_INIT:    TC_POP(vm); TC_PUSH(vm, 0); break;
     case SYS_BLE_SRV_SERVICE: TC_POP(vm); TC_PUSH(vm, 0); break;
     case SYS_BLE_SRV_CHAR:    TC_POP(vm); TC_POP(vm); TC_PUSH(vm, -1); break;
@@ -16871,6 +17142,18 @@ static void tc_scan_watch_indices(TcVM *vm) {
         case OP_LOAD_REF_ARR: case OP_STORE_REF_ARR:
         case OP_SYSCALL:
           skip = 1; break;
+        // Superinstructions — 2-byte operand (see the 0xB0 block in the enum).
+        // ⚠️ Every new opcode MUST be listed here too: this scanner walks the
+        // bytecode at load time to find STORE_WATCH, and an unknown operand
+        // length puts it out of step with the instruction stream, after which
+        // it reads operand bytes as opcodes.
+        case OP_INC_LOCAL:
+          skip = 2; break;
+        case OP_LK_OP_ST: case OP_LL_OP_ST:
+          skip = 4; break;
+        case OP_LL_CMP_JZ:   skip = 5; break;
+        case OP_LK32_OP_ST:  skip = 7; break;
+        case OP_LK32_CMP_JZ: skip = 8; break;
         // 0-byte operand — all the rest (NOP/HALT/POP/DUP/arith/cmp/logic/RET/conv)
         default:
           skip = 0; break;
@@ -16940,9 +17223,28 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
                           ((uint32_t)B(24) << 8) | B(25);
     if (total_size > (uint32_t)size) return TC_ERR_BAD_BINARY;   // truncated upload -> would read OOB
     uint16_t abi_rev = (B(26) << 8) | B(27);                     // B28..header_size-1 reserved (ignored, forward-compat)
-    if (abi_rev != TC_SYSCALL_ABI) {
-      AddLog(LOG_LEVEL_INFO, PSTR("TC: slot bytecode ABI rev %u != firmware %u — recompile with the current IDE (commands may not register)"), abi_rev, TC_SYSCALL_ABI);
+    // Asymmetric on purpose.
+    // OLDER bytecode on newer firmware is fine — the ABI is append-only, so an
+    // old .tcb uses only things that still exist. Warn (the IDE may be stale)
+    // and load.
+    // NEWER bytecode on older firmware is NOT fine and must not be attempted.
+    // Until superinstructions this only meant "an unknown syscall will fail
+    // when reached", which is survivable; now a newer .tcb can contain fused
+    // OPCODES this firmware has no handler for, and that dies with BAD_OPCODE
+    // on the first loop iteration — deep inside a running program, far from the
+    // cause. Refuse at load, where the message can name the actual problem.
+    if (abi_rev > TC_SYSCALL_ABI) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TC: bytecode ABI rev %u is NEWER than this firmware (%u) — refusing to load. Flash newer firmware, or recompile with the matching IDE."),
+             abi_rev, TC_SYSCALL_ABI);
+      return TC_ERR_BAD_BINARY;
     }
+    // A LOWER abi_rev is normal and correct: since the IDE stamps the bytecode's
+    // actual MINIMUM requirement rather than the compiler's own version, a script
+    // that uses nothing recent legitimately asks for very little — that is the whole
+    // point, it lets such a .tcb run on older firmware. Warning about it would fire
+    // on nearly every load and would tell the user to "recompile", which fixes
+    // nothing. Only the newer-than-us direction is a real problem, and it is refused
+    // above.
   } else {
     header_size = (version >= 5) ? 20 : ((version >= 4) ? 18 : ((version >= 3) ? 16 : 14));
     static bool tc_warned_prev6 = false;                         // pre-V6 = older IDE; can't ABI-check. Nudge once/boot.
@@ -16983,6 +17285,7 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
   TC_HEAPLOG("vmload.in");
   // Free any previously allocated dynamic memory
   tc_free_all_frames(vm);
+  tc_frame_cache_drain(vm);   // ⚠️ AFTER free_all_frames — that one FILLS the cache
   tc_heap_free_all(vm);
   if (vm->stack) { free(vm->stack); vm->stack = nullptr; vm->stack_size = 0; }
   if (vm->globals) { free(vm->globals); vm->globals = nullptr; vm->globals_size = 0; }
@@ -17237,7 +17540,7 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
   vm->persist_file[0] = '\0';  // caller sets this before tc_persist_load()
 
   // Allocate frame 0 for main() — program starts here without OP_CALL
-  if (!tc_frame_alloc(&vm->frames[0])) {
+  if (!tc_frame_alloc(vm, &vm->frames[0])) {
     return TC_ERR_STACK_OVERFLOW;  // OOM
   }
 
@@ -17251,6 +17554,10 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
 
 // Forward declaration — tc_vm_step is defined below, called by tc_vm_call_callback
 static int tc_vm_step(TcVM *vm);
+// Defined far below (it needs the computed-goto label block). Declared here so
+// the callback dispatcher above it can run on the direct-threaded loop too.
+static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
+                              int stop_frame, volatile bool *stop_flag);
 
 /*********************************************************************************************\
  * VM: Callback invocation — call a named function after main() has halted
@@ -17294,7 +17601,7 @@ static int tc_vm_call_callback_idx(TcVM *vm, int idx, const char *name) {
   TcFrame *frame = &vm->frames[vm->frame_count];
   frame->return_pc = 0;  // detect return by frame_count drop
   frame->saved_sp = vm->sp;  // host-pushed args live on top; must balance at RET
-  if (!tc_frame_alloc(frame)) {
+  if (!tc_frame_alloc(vm, frame)) {
     vm->halted = true;
     vm->running = false;
     return TC_ERR_STACK_OVERFLOW;
@@ -17303,33 +17610,42 @@ static int tc_vm_call_callback_idx(TcVM *vm, int idx, const char *name) {
   vm->frame_count++;
   vm->pc = vm->code_offset + vm->callbacks[idx].address;
 
-  // Execute with instruction limit
-  uint32_t count = 0;
-  while (vm->frame_count > saved_frame_count && !vm->halted && vm->error == TC_OK) {
-    int err = tc_vm_step(vm);
-    if (err == TC_ERR_PAUSED) {
-      // delay() in callback — execute synchronously (short delays only)
-      if (vm->delayed && vm->delay_until > millis()) {
-        uint32_t wait = vm->delay_until - millis();
-        if (wait > 100) wait = 100;  // cap at 100ms to avoid WDT
-        delay(wait);
-      }
-      vm->delayed = false;
-      continue;  // resume callback execution after delay
-    }
-    if (err != TC_OK) {
-      vm->error = err;
-      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Callback error %d at PC=%u"), err, vm->pc);
-      tc_crash_log(err, vm->pc, vm->instruction_count, name);
-      break;
-    }
-    vm->instruction_count++;
-    if (++count > TC_CALLBACK_MAX_INSTR) {
-      vm->error = TC_ERR_INSTRUCTION_LIMIT;
+  // Execute on the direct-threaded loop, stopping when the callback's own frame
+  // pops. No wall-clock budget: this runs on loopTask with the slot mutex held,
+  // and handing control back mid-callback would only add round trips — the
+  // instruction watchdog is what bounds it.
+  uint32_t start_instr = vm->instruction_count;
+  for (;;) {
+    // Budget is what is LEFT of the callback's allowance, not a fresh helping
+    // per resumption — otherwise a callback that delay()s in a loop would renew
+    // its watchdog on every sleep and never trip it.
+    uint32_t used = vm->instruction_count - start_instr;
+    uint32_t budget = (used >= TC_CALLBACK_MAX_INSTR) ? 1 : (TC_CALLBACK_MAX_INSTR - used);
+    int err = tc_vm_run_slice_ex(vm, budget, 0, (int)saved_frame_count, nullptr);
+    if (err == TC_ERR_INSTRUCTION_LIMIT) {
+      uint32_t count = vm->instruction_count - start_instr;
       AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Instruction limit in '%s' at PC=%u (%u instr)"), name, vm->pc, count);
       tc_crash_log(TC_ERR_INSTRUCTION_LIMIT, vm->pc, count, name);
       break;
     }
+    if (err != TC_OK) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Callback error %d at PC=%u"), err, vm->pc);
+      tc_crash_log(err, vm->pc, vm->instruction_count, name);
+      break;
+    }
+    if (vm->delayed) {
+      // delay() in a callback — served synchronously, because this is loopTask:
+      // there is nobody to hand the wait to. Capped so one script cannot feed
+      // the WDT a delay(30000) from inside EverySecond.
+      if (vm->delay_until > millis()) {
+        uint32_t wait = vm->delay_until - millis();
+        if (wait > 100) wait = 100;
+        delay(wait);
+      }
+      vm->delayed = false;
+      continue;  // resume callback execution after the delay
+    }
+    break;  // halted, or the callback's frame popped — either way it is done
   }
 
   // Restore halted state (globals persist)
@@ -17343,7 +17659,7 @@ static int tc_vm_call_callback_idx(TcVM *vm, int idx, const char *name) {
 
   // Clean up any leftover frames from the callback
   while (vm->frame_count > saved_frame_count) {
-    tc_frame_free(&vm->frames[--vm->frame_count]);
+    tc_frame_free(vm, &vm->frames[--vm->frame_count]);
   }
   vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
 
@@ -17608,7 +17924,7 @@ static int tc_vm_step(TcVM *vm) {
         TcFrame *frame = &vm->frames[vm->frame_count];
         frame->return_pc = vm->pc;
         frame->saved_sp = vm->sp;       // caller's SP (with args on top)
-        if (!tc_frame_alloc(frame)) {
+        if (!tc_frame_alloc(vm, frame)) {
           return TC_ERR_STACK_OVERFLOW;  // OOM
         }
         vm->fp = vm->frame_count;
@@ -17629,7 +17945,7 @@ static int tc_vm_step(TcVM *vm) {
         TcFrame *frame = &vm->frames[vm->frame_count];
         frame->return_pc = vm->pc;
         frame->saved_sp = vm->sp;       // caller's SP (with args on top, fn-ptr already popped)
-        if (!tc_frame_alloc(frame)) {
+        if (!tc_frame_alloc(vm, frame)) {
           return TC_ERR_STACK_OVERFLOW;  // OOM
         }
         vm->fp = vm->frame_count;
@@ -17639,7 +17955,7 @@ static int tc_vm_step(TcVM *vm) {
       break;
 
     case OP_RET:
-      if (vm->frame_count == 0) { tc_frame_free(&vm->frames[0]); vm->halted = true; vm->running = false; break; }
+      if (vm->frame_count == 0) { tc_frame_free(vm, &vm->frames[0]); vm->halted = true; vm->running = false; break; }
       { TcFrame *f = &vm->frames[--vm->frame_count];
         // Post-RET SP should be ≤ caller-at-CALL SP (callee consumed its args,
         // may or may not have left them unused). Higher SP means the callee
@@ -17650,13 +17966,13 @@ static int tc_vm_step(TcVM *vm) {
                  (unsigned)vm->sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
         }
         vm->pc = f->return_pc;
-        tc_frame_free(f);  // free returning frame's locals
+        tc_frame_free(vm, f);  // free returning frame's locals
         vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0; }
       break;
 
     case OP_RET_VAL:
       a = TC_POP(vm);
-      if (vm->frame_count == 0) { tc_frame_free(&vm->frames[0]); TC_PUSH(vm, a); vm->halted = true; vm->running = false; break; }
+      if (vm->frame_count == 0) { tc_frame_free(vm, &vm->frames[0]); TC_PUSH(vm, a); vm->halted = true; vm->running = false; break; }
       { TcFrame *f = &vm->frames[--vm->frame_count];
         // Same leak check as void RET — return value is already popped into `a`,
         // so the remaining stack must not have grown past the CALL-time SP.
@@ -17666,7 +17982,7 @@ static int tc_vm_step(TcVM *vm) {
                  (unsigned)vm->sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
         }
         vm->pc = f->return_pc;
-        tc_frame_free(f);  // free returning frame's locals
+        tc_frame_free(vm, f);  // free returning frame's locals
         vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
         TC_PUSH(vm, a); }
       break;
@@ -17905,6 +18221,64 @@ static int tc_vm_step(TcVM *vm) {
     case OP_SYSCALL:
       idx = tc_read_u8(vm);
       return tc_syscall(vm, idx);
+    case OP_LL_CMP_JZ: case OP_LK32_CMP_JZ: {
+      uint8_t c1 = tc_read_u8(vm);
+      int32_t rhs;
+      if (op == OP_LK32_CMP_JZ) { rhs = tc_read_i32(vm); }
+      else { uint8_t c2 = tc_read_u8(vm);
+             if (c2 >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+             if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+             rhs = vm->frames[vm->fp].locals[c2]; }
+      uint8_t cop = tc_read_u8(vm);
+      addr = tc_read_u16(vm);
+      if (c1 >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      int cerr = TC_OK;
+      int32_t truth = tc_binop_i(cop, vm->frames[vm->fp].locals[c1], rhs, &cerr);
+      if (cerr != TC_OK) return cerr;
+      if (truth == 0) vm->pc = vm->code_offset + addr;   // branch on FALSE, like JZ
+      break;
+    }
+    case OP_LK32_OP_ST: {
+      uint8_t w1 = tc_read_u8(vm);
+      int32_t wk = tc_read_i32(vm);
+      uint8_t wop = tc_read_u8(vm);
+      uint8_t wdst = tc_read_u8(vm);
+      if (w1 >= TC_MAX_LOCALS || wdst >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      int werr = TC_OK;
+      int32_t wr = tc_binop_i(wop, vm->frames[vm->fp].locals[w1], wk, &werr);
+      if (werr != TC_OK) return werr;
+      vm->frames[vm->fp].locals[wdst] = wr;
+      break;
+    }
+    case OP_LK_OP_ST: case OP_LL_OP_ST: {
+      uint8_t s1 = tc_read_u8(vm);
+      int32_t rhs;
+      if (op == OP_LK_OP_ST) { rhs = (int32_t)(int8_t)tc_read_u8(vm); }
+      else                   { uint8_t s2 = tc_read_u8(vm);
+                               if (s2 >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+                               if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+                               rhs = vm->frames[vm->fp].locals[s2]; }
+      uint8_t bop = tc_read_u8(vm);
+      uint8_t dst = tc_read_u8(vm);
+      if (s1 >= TC_MAX_LOCALS || dst >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      int berr = TC_OK;
+      int32_t r = tc_binop_i(bop, vm->frames[vm->fp].locals[s1], rhs, &berr);
+      if (berr != TC_OK) return berr;
+      vm->frames[vm->fp].locals[dst] = r;
+      break;
+    }
+    // ── Superinstruction: locals[idx] += delta, kein Stapeleffekt ──
+    case OP_INC_LOCAL: {
+      idx = tc_read_u8(vm);
+      int8_t d = (int8_t)tc_read_u8(vm);
+      if (idx >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      vm->frames[vm->fp].locals[idx] += (int32_t)d;
+      break;
+    }
     case OP_SYSCALL2: {
       uint16_t idx2 = tc_read_u16(vm);
       return tc_syscall(vm, idx2);
@@ -17922,7 +18296,32 @@ static int tc_vm_step(TcVM *vm) {
  * Uses computed-goto dispatch on GCC for ~20-30% speedup over switch().
 \*********************************************************************************************/
 
-static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
+// Run bytecode on the direct-threaded loop until one of the stop conditions
+// fires. Every ESP32 execution path goes through here; the caller tells the
+// exits apart by inspecting the VM afterwards:
+//
+//   return != TC_OK            -> error (already stored in vm->error)
+//   vm->halted                 -> the program ended (HALT, or RET from frame 0)
+//   vm->delayed                -> delay() is pending; the CALLER sleeps, because
+//                                 only the caller knows whether it may release
+//                                 the slot mutex first
+//   vm->frame_count <= stop_frame -> the dispatched function returned
+//   otherwise                  -> a budget expired or *stop_flag went true;
+//                                 call again to continue
+//
+// stop_frame  frame depth at which to hand control back; -1 = only stop on halt.
+//             A callback pushes one frame, so its caller passes the depth it saw
+//             before the push and gets control back the moment that frame pops.
+// max_instr   instruction budget, 0 = unlimited. Checked every 64 instructions,
+//             so it is honoured to within 64 — fine for a watchdog, and it keeps
+//             the check off the per-instruction path.
+// budget_ms   wall-clock budget, 0 = none. A task context wants a budget anyway:
+//             it is what lets the caller drop the mutex periodically so web
+//             callbacks can get in during a long compute-only loop body.
+// stop_flag   optional external abort (task_stop / stop_requested), also polled
+//             every 64 instructions.
+static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
+                              int stop_frame, volatile bool *stop_flag) {
   vm->running = true;
 
   // Check for non-blocking delay before entering hot loop
@@ -17941,9 +18340,18 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   // branch-prediction penalty of a single switch indirect branch.
   // ════════════════════════════════════════════════════════════════════
 
-  // Dispatch table (0x00 – 0xA5, 166 entries)
+  // Dispatch table — FULL uint8 range on purpose, 256 entries.
+  // ⚠️ It used to be sized 0xA6 (= 166 valid indices, 0x00..0xA5) while opcodes
+  // already went up to 0xA7. Two consequences, both silent: the initialiser
+  // `_dispatch[0xA6] = ...` wrote ONE PAST THE END into whatever static data
+  // followed, and every fetch of an opcode >= 0xA6 read past the end and jumped
+  // through that garbage — the `? :` null-guard only covers indices inside the
+  // array. Any bytecode using OP_ADDR_HEAP_OFF (2D-array row refs) or OP_REF_OFF
+  // could land anywhere. Sizing to the full 0x100 makes an out-of-range opcode
+  // structurally impossible: every uint8 now has a slot, unused ones stay null
+  // and route to _vm_bad_op. Costs 1 KB instead of 664 B, once.
   // C++ doesn't support designated initializers, so build at runtime on first call
-  static const void *_dispatch[0xA6] = {};
+  static const void *_dispatch[0x100] = {};
   static bool _dispatch_init = false;
   if (!_dispatch_init) {
     memset((void*)_dispatch, 0, sizeof(_dispatch));
@@ -17979,6 +18387,7 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     _dispatch[0x50] = &&_op_jmp;  _dispatch[0x51] = &&_op_jz;
     _dispatch[0x52] = &&_op_jnz;  _dispatch[0x53] = &&_op_call;
     _dispatch[0x54] = &&_op_ret;  _dispatch[0x55] = &&_op_ret_val;
+    _dispatch[0x56] = &&_op_call_indirect;
     // Variables
     _dispatch[0x60] = &&_op_load_local;   _dispatch[0x61] = &&_op_store_local;
     _dispatch[0x62] = &&_op_load_global;  _dispatch[0x63] = &&_op_store_global;
@@ -17992,14 +18401,29 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     // Address refs
     _dispatch[0x78] = &&_op_addr_local; _dispatch[0x79] = &&_op_addr_global;
     // Syscall & const
-    _dispatch[0x80] = &&_op_syscall; _dispatch[0x90] = &&_op_load_const;
+    // ⚠️ 0x81 (SYSCALL2, the 16-bit syscall id) was MISSING. Every syscall
+    // numbered >= 256 is emitted as SYSCALL2 — which today is nearly all of
+    // them — so without this entry the fast path aborted with BAD_OPCODE on
+    // the first modern builtin. That is the single reason this loop could not
+    // carry general script execution, and it looked like "the fast path is
+    // only for the 8266" rather than "the fast path is unfinished".
+    _dispatch[0x80] = &&_op_syscall; _dispatch[0x81] = &&_op_syscall2;
+    _dispatch[0x90] = &&_op_load_const;
     // Heap
     _dispatch[0xA0] = &&_op_load_heap;  _dispatch[0xA1] = &&_op_store_heap;
     _dispatch[0xA2] = &&_op_addr_heap;
+    // Reference parameters / array refs (int& params, 2D row passing)
+    _dispatch[0xA3] = &&_op_load_ref_arr; _dispatch[0xA4] = &&_op_store_ref_arr;
     // Watch
     _dispatch[0xA5] = &&_op_store_watch;
-    // Heap address with offset
+    // Heap address with offset, and ref-offset arithmetic
     _dispatch[0xA6] = &&_op_addr_heap_off;
+    _dispatch[0xA7] = &&_op_ref_off;
+    // Superinstructions
+    _dispatch[0xB0] = &&_op_inc_local;
+    _dispatch[0xB1] = &&_op_lk_op_st;  _dispatch[0xB2] = &&_op_ll_op_st;
+    _dispatch[0xB3] = &&_op_lk32_op_st;
+    _dispatch[0xB4] = &&_op_ll_cmp_jz; _dispatch[0xB5] = &&_op_lk32_cmp_jz;
     _dispatch_init = true;
   }
 
@@ -18030,12 +18454,23 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   #define _RD_F32() i2f(_RD_I32())
 
   // ── Dispatch macro ──
+  // All three budget checks live behind the 64-instruction mask, so the cost per
+  // instruction stays one increment, one masked test and the PC bounds check.
+  // Granularity of 64 is irrelevant for a watchdog and for a millisecond budget.
   #define NEXT() do { \
     _count++; \
-    if ((_count & 0x3F) == 0 && millis() - _start > 10) goto _vm_yield; \
+    if ((_count & 0x3F) == 0) { \
+      if (max_instr && _count >= max_instr) goto _vm_budget; \
+      if (budget_ms && (millis() - _start) > budget_ms) goto _vm_yield; \
+      if (stop_flag && *stop_flag) goto _vm_yield; \
+    } \
     if (_pc < _coff || _pc >= _coff + _csz) { _err = TC_ERR_BOUNDS; goto _vm_exit; } \
     _op = _RD_U8(); \
     goto *(_dispatch[_op] ? _dispatch[_op] : &&_vm_bad_op); \
+  } while(0)
+  // Hand control back the moment the dispatched function's frame pops.
+  #define RET_CHECK() do { \
+    if (stop_frame >= 0 && (int)vm->frame_count <= stop_frame) goto _vm_yield; \
   } while(0)
 
   // ── First instruction fetch ──
@@ -18123,7 +18558,7 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
       TcFrame *frame = &vm->frames[vm->frame_count];
       frame->return_pc = _pc;
       frame->saved_sp = _sp;                        // caller SP w/ args on top
-      if (!tc_frame_alloc(frame)) { _err = TC_ERR_STACK_OVERFLOW; goto _vm_exit; }
+      if (!tc_frame_alloc(vm, frame)) { _err = TC_ERR_STACK_OVERFLOW; goto _vm_exit; }
       vm->fp = vm->frame_count;
       vm->frame_count++;
       _pc = _coff + _addr;
@@ -18131,7 +18566,7 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     NEXT();
   _op_ret:
     if (vm->frame_count == 0) {
-      tc_frame_free(&vm->frames[0]);
+      tc_frame_free(vm, &vm->frames[0]);
       vm->halted = true; vm->running = false;
       goto _vm_exit;
     }
@@ -18143,14 +18578,15 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
                (unsigned)_sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
       }
       _pc = f->return_pc;
-      tc_frame_free(f);
+      tc_frame_free(vm, f);
       vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
     }
+    RET_CHECK();
     NEXT();
   _op_ret_val:
     _a = TC_IPOP();
     if (vm->frame_count == 0) {
-      tc_frame_free(&vm->frames[0]);
+      tc_frame_free(vm, &vm->frames[0]);
       TC_IPUSH(_a);
       vm->halted = true; vm->running = false;
       goto _vm_exit;
@@ -18163,10 +18599,11 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
                (unsigned)_sp, (unsigned)f->saved_sp, (unsigned)f->return_pc);
       }
       _pc = f->return_pc;
-      tc_frame_free(f);
+      tc_frame_free(vm, f);
       vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
       TC_IPUSH(_a);
     }
+    RET_CHECK();
     NEXT();
 
   // Variables
@@ -18356,10 +18793,168 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
     if (scerr != TC_OK) { _err = scerr; goto _vm_exit; }
     NEXT();
   }
+  // 16-bit syscall id — the form used by every builtin numbered >= 256.
+  _op_syscall2: {
+    uint16_t _idx2 = _RD_U16();
+    vm->sp = _sp; vm->pc = _pc;
+    int scerr = tc_syscall(vm, _idx2);
+    _sp = vm->sp; _pc = vm->pc;
+    if (scerr == TC_ERR_PAUSED) {
+      goto _vm_yield;
+    }
+    if (scerr != TC_OK) { _err = scerr; goto _vm_exit; }
+    NEXT();
+  }
+
+  // Indirect call through a function pointer — same frame setup as _op_call,
+  // but the target address is popped off the stack instead of read from the
+  // bytecode. Args were pushed first, then the fn-ptr value.
+  _op_call_indirect: {
+    _a = TC_IPOP();
+    _addr = (uint16_t)(_a & 0xFFFF);
+    if (vm->frame_count >= TC_MAX_FRAMES) { _err = TC_ERR_FRAME_OVERFLOW; goto _vm_exit; }
+    vm->sp = _sp; vm->pc = _pc;                   // return_pc must be current
+    TcFrame *frame = &vm->frames[vm->frame_count];
+    frame->return_pc = _pc;
+    frame->saved_sp = _sp;                        // caller SP, fn-ptr already popped
+    if (!tc_frame_alloc(vm, frame)) { _err = TC_ERR_STACK_OVERFLOW; goto _vm_exit; }
+    vm->fp = vm->frame_count;
+    vm->frame_count++;
+    _pc = _coff + _addr;
+    NEXT();
+  }
+
+  // Read through a reference parameter (int& / char[] / 2D row).
+  // ⚠️ An out-of-range READ pushes 0 rather than faulting — deliberate, see the
+  // switch-path comment: a stray sub-ref read must not halt the whole slot.
+  // Writes below still fault, so nothing is corrupted silently.
+  _op_load_ref_arr: {
+    _idx = _RD_U8();
+    _a = TC_IPOP();                               // index
+    if ((uint32_t)_idx >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int32_t _ref = vm->frames[vm->fp].locals[_idx];
+    vm->sp = _sp; vm->pc = _pc;                   // tc_resolve_ref may inspect vm state
+    int32_t *_buf = tc_resolve_ref(vm, _ref);
+    int32_t _maxlen = _buf ? tc_ref_maxlen(vm, _ref) : 0;
+    if (!_buf || _a < 0 || _a >= _maxlen) { TC_IPUSH(0); NEXT(); }
+    TC_IPUSH(_buf[_a]);
+    NEXT();
+  }
+  _op_store_ref_arr: {
+    _idx = _RD_U8();
+    _b = TC_IPOP();                               // value
+    _a = TC_IPOP();                               // index
+    if ((uint32_t)_idx >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int32_t _ref = vm->frames[vm->fp].locals[_idx];
+    vm->sp = _sp; vm->pc = _pc;
+    int32_t *_buf = tc_resolve_ref(vm, _ref);
+    if (!_buf) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    int32_t _maxlen = tc_ref_maxlen(vm, _ref);
+    if (_a < 0 || _a >= _maxlen) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    _buf[_a] = _b;
+    NEXT();
+  }
+
+  // Advance a reference by N slots — TAG-AWARE. A heap ref (tag 3) keeps its
+  // 8-bit handle in the LOW byte and the offset at bits 16..29, so a plain add
+  // would walk into the handle and land on a different (or dead) array.
+  // Const-pool refs (tag 3 + bit15) cannot be offset and pass through unchanged.
+  // ── Superinstruction: Schleifenkopf, Sprung bei FALSCH (wie das JZ, das es ersetzt) ──
+  _op_ll_cmp_jz:
+  _op_lk32_cmp_jz: {
+    uint8_t _c1 = _RD_U8();
+    int32_t _crhs;
+    if (_op == OP_LK32_CMP_JZ) { _crhs = _RD_I32(); }
+    else {
+      uint8_t _c2 = _RD_U8();
+      if (_c2 >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+      if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+      _crhs = vm->frames[vm->fp].locals[_c2];
+    }
+    uint8_t _cop = _RD_U8();
+    _addr = _RD_U16();
+    if (_c1 >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int _cerr = TC_OK;
+    int32_t _truth = tc_binop_i(_cop, vm->frames[vm->fp].locals[_c1], _crhs, &_cerr);
+    if (_cerr != TC_OK) { _err = _cerr; goto _vm_exit; }
+    if (_truth == 0) { _pc = _coff + _addr; }
+    NEXT();
+  }
+  _op_lk32_op_st: {
+    uint8_t _w1 = _RD_U8();
+    int32_t _wk = _RD_I32();
+    uint8_t _wop = _RD_U8();
+    uint8_t _wdst = _RD_U8();
+    if (_w1 >= TC_MAX_LOCALS || _wdst >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int _werr = TC_OK;
+    int32_t _wr = tc_binop_i(_wop, vm->frames[vm->fp].locals[_w1], _wk, &_werr);
+    if (_werr != TC_OK) { _err = _werr; goto _vm_exit; }
+    vm->frames[vm->fp].locals[_wdst] = _wr;
+    NEXT();
+  }
+  // ── Superinstructions: locals[dst] = locals[src] OP (konstante | locals[b]) ──
+  _op_lk_op_st:
+  _op_ll_op_st: {
+    // _op ist noch der gerade geholte Opcode -- daran haengt, ob rechts eine
+    // Konstante oder ein zweiter Local steht.
+    uint8_t _s1 = _RD_U8();
+    int32_t _rhs;
+    if (_op == OP_LK_OP_ST) { _rhs = (int32_t)(int8_t)_RD_U8(); }
+    else {
+      uint8_t _s2 = _RD_U8();
+      if (_s2 >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+      if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+      _rhs = vm->frames[vm->fp].locals[_s2];
+    }
+    uint8_t _bop = _RD_U8();
+    uint8_t _dst = _RD_U8();
+    if (_s1 >= TC_MAX_LOCALS || _dst >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int _berr = TC_OK;
+    int32_t _r = tc_binop_i(_bop, vm->frames[vm->fp].locals[_s1], _rhs, &_berr);
+    if (_berr != TC_OK) { _err = _berr; goto _vm_exit; }
+    vm->frames[vm->fp].locals[_dst] = _r;
+    NEXT();
+  }
+  // ── Superinstruction: locals[idx] += delta, kein Stapeleffekt ──
+  // Ersetzt LOAD_LOCAL·DUP·PUSH_I8·ADD·STORE_LOCAL·POP.
+  _op_inc_local: {
+    _idx = _RD_U8();
+    int8_t _d = (int8_t)_RD_U8();
+    if (_idx >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    vm->frames[vm->fp].locals[_idx] += (int32_t)_d;
+    NEXT();
+  }
+  _op_ref_off: {
+    int32_t _off = TC_IPOP();
+    int32_t _ref = TC_IPOP();
+    uint32_t _uref = (uint32_t)_ref;
+    if ((_uref >> 30) == 3 && !(_uref & 0x8000)) {
+      int32_t _noff = (int32_t)((_uref >> 16) & 0x3FFF) + _off;
+      if (_noff < 0) _noff = 0;
+      if (_noff > 0x3FFF) _noff = 0x3FFF;
+      _ref = (int32_t)(0xC0000000u | ((uint32_t)_noff << 16) | (_uref & 0xFF));
+    } else if ((_uref >> 30) != 3) {
+      _ref = (int32_t)(_uref + (uint32_t)_off);
+    }
+    TC_IPUSH(_ref);
+    NEXT();
+  }
 
   // ── Exit labels ──
   _vm_bad_op:
     _err = TC_ERR_BAD_OPCODE;
+    goto _vm_exit;
+  // Instruction watchdog. Reported as an error so a runaway callback is caught;
+  // the callback dispatcher clears it again after cleanup (see the long note
+  // there — leaving it set would poison every later dispatch on that slot).
+  _vm_budget:
+    _err = TC_ERR_INSTRUCTION_LIMIT;
     goto _vm_exit;
   _vm_yield:
     vm->sp = _sp; vm->pc = _pc;
@@ -18378,6 +18973,7 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   #undef _RD_I32
   #undef _RD_F32
   #undef NEXT
+  #undef RET_CHECK
 
 #else
   // ════════════════════════════════════════════════════════════════════
@@ -18386,18 +18982,30 @@ static int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
   uint32_t count = 0;
   uint32_t start_ms = millis();
 
-  while (vm->running && !vm->halted && vm->error == TC_OK && count < max_instr) {
+  while (vm->running && !vm->halted && vm->error == TC_OK) {
+    if (stop_frame >= 0 && (int)vm->frame_count <= stop_frame) break;
+    if (stop_flag && *stop_flag) break;
     int err = tc_vm_step(vm);
     if (err == TC_ERR_PAUSED) return TC_OK;
-    if (err != TC_OK) return err;
+    if (err != TC_OK) { vm->error = err; return err; }
     count++;
     vm->instruction_count++;
+    if (max_instr && count >= max_instr) { vm->error = TC_ERR_INSTRUCTION_LIMIT; return vm->error; }
     if ((count & 0x3F) == 0) {
-      if (millis() - start_ms > 10) return TC_OK;
+      if (budget_ms && (millis() - start_ms) > budget_ms) return TC_OK;
     }
   }
   return vm->error;
 #endif // __GNUC__
+}
+
+// Backwards-compatible wrapper — the pre-existing signature and EXACTLY the
+// previous behaviour: no frame stop, no external abort, the old hard-coded
+// 10 ms budget, and max_instr ignored (the direct-threaded path never honoured
+// it). The ESP8266 per-tick slice calls this, so its timing is untouched.
+static inline int tc_vm_run_slice(TcVM *vm, uint32_t max_instr) {
+  (void)max_instr;
+  return tc_vm_run_slice_ex(vm, 0, 10, -1, nullptr);
 }
 
 /*********************************************************************************************\
@@ -18413,6 +19021,7 @@ static void tc_vm_task(void *param) {
   tc_current_slot = slot;  // set for output functions
 
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM task started (%s)"), slot->filename);
+  TC_HEAPLOG("task.in");
 
   // Phase 1: Execute main()
   while (!slot->task_stop && !vm->halted && vm->error == TC_OK) {
@@ -18431,25 +19040,25 @@ static void tc_vm_task(void *param) {
       if (slot->task_stop) break;
     }
 
-    // Execute a batch of instructions, then yield
-    uint32_t count = 0;
-    while (!vm->halted && vm->error == TC_OK && count < 256 && !slot->task_stop) {
-      int err = tc_vm_step(vm);
-      if (err == TC_ERR_PAUSED) break;
-      if (err != TC_OK) {
-        vm->error = err;
-        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Runtime error %d at PC=%u after %u instr"),
-          err, vm->pc, vm->instruction_count);
-        tc_crash_log(err, vm->pc, vm->instruction_count, "main");
-        break;
-      }
-      count++;
-      vm->instruction_count++;
+    // Execute a batch, then yield. This used to step ONE instruction per call
+    // through tc_vm_step() — a non-inlinable call plus a halted/error/PC-bounds
+    // check per instruction, on top of this loop's own condition chain. That is
+    // where the ~161 cycles per opcode went (measured on an S3 at 240 MHz,
+    // 2026-08-08). The direct-threaded loop keeps PC, SP and the code pointer in
+    // registers and only writes them back when it hands control back.
+    // 20 ms rather than an instruction count: the point of the batch is to let
+    // the WDT and the scheduler breathe, and that is a time property.
+    int err = tc_vm_run_slice_ex(vm, 0, 20, -1, &slot->task_stop);
+    if (err != TC_OK) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Runtime error %d at PC=%u after %u instr"),
+        err, vm->pc, vm->instruction_count);
+      tc_crash_log(err, vm->pc, vm->instruction_count, "main");
     }
 
     yield();
   }
 
+  TC_HEAPLOG("task.mainend");
   slot->main_done = true;   // Phase 1 (main) finished — unblocks the serial autoexec loader
 
   // Phase-1 persist restore: main() has now allocated the program's heap arrays, so
@@ -18460,6 +19069,7 @@ static void tc_vm_task(void *param) {
   // leaves the heap state suspect).
   if (vm->halted && vm->error == TC_OK) { tc_persist_load(vm, true); }
 
+  TC_HEAPLOG("task.prepersist");
   // Cleanup after main() exits
   tc_free_all_frames(vm);
   tc_close_vm_files(vm);   // only THIS vm's handles -- leave other slots' open files alone
@@ -18495,59 +19105,68 @@ static void tc_vm_task(void *param) {
           TcFrame *frame = &vm->frames[vm->frame_count];
           frame->return_pc = 0;
           frame->saved_sp = vm->sp;   // see tc_vm_call_callback_idx — needed for RET leak check
-          if (tc_frame_alloc(frame)) {
+          if (tc_frame_alloc(vm, frame)) {
             vm->fp = vm->frame_count;
             vm->frame_count++;
             vm->pc = vm->code_offset + tl_addr;
 
-            uint32_t count = 0;
-            while (vm->frame_count > saved_frame_count && !vm->halted && vm->error == TC_OK && !slot->task_stop) {
-              int err = tc_vm_step(vm);
-              if (err == TC_ERR_PAUSED) {
-                if (vm->delayed) {
-                  vm->halted = true;
-                  vm->running = false;
-                  tc_current_slot = nullptr;  // clear during delay
-                  if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-                  int32_t remaining = (int32_t)(vm->delay_until - millis());
-                  while (remaining > 0 && !slot->task_stop) {
-                    int32_t chunk = (remaining > 50) ? 50 : remaining;
-                    vTaskDelay(chunk / portTICK_PERIOD_MS);
-                    remaining = (int32_t)(vm->delay_until - millis());
-                  }
-                  vm->delayed = false;
-                  if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
-                  tc_current_slot = slot;  // restore after reacquire
-                  vm->halted = false;
-                  vm->running = true;
-                  if (slot->task_stop) break;
-                }
-                continue;
-              }
+            // One TaskLoop() body per pass of this loop. The slice runs it on the
+            // direct-threaded path and hands control back the moment the body's
+            // frame pops (stop_frame), on delay(), on error, or after 20 ms.
+            for (;;) {
+              int err = tc_vm_run_slice_ex(vm, 0, TC_TASKLOOP_BUDGET_MS,
+                                           (int)saved_frame_count, &slot->task_stop);
               if (err != TC_OK) {
-                vm->error = err;
                 AddLog(LOG_LEVEL_ERROR, PSTR("TCC: TaskLoop error %d at PC=%u"), err, vm->pc);
                 tc_crash_log(err, vm->pc, vm->instruction_count, "TaskLoop");
                 break;
               }
-              count++;
-              vm->instruction_count++;
-              // Yield periodically to feed WDT (no instruction limit in TaskLoop)
-              if ((count & 0xFFFF) == 0) {
+              if (vm->delayed) {
+                // delay() inside the body: drop the mutex for the whole sleep so
+                // web callbacks and other slots can use the VM meanwhile. halted
+                // must be set BEFORE releasing — that flag is what tells a
+                // callback the slot is safe to enter.
                 vm->halted = true;
                 vm->running = false;
+                tc_current_slot = nullptr;  // clear during delay
                 if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-                vTaskDelay(1);
+                int32_t remaining = (int32_t)(vm->delay_until - millis());
+                while (remaining > 0 && !slot->task_stop) {
+                  int32_t chunk = (remaining > 50) ? 50 : remaining;
+                  vTaskDelay(chunk / portTICK_PERIOD_MS);
+                  remaining = (int32_t)(vm->delay_until - millis());
+                }
+                vm->delayed = false;
                 if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
-                tc_current_slot = slot;
+                tc_current_slot = slot;  // restore after reacquire
                 vm->halted = false;
                 vm->running = true;
                 if (slot->task_stop) break;
+                continue;
               }
+              if (vm->halted) break;                              // HALT inside the body
+              if (vm->frame_count <= saved_frame_count) break;    // TaskLoop() returned
+              if (slot->task_stop) break;
+              // Budget expired mid-body. This replaces the old every-65536-
+              // instructions yield, and it is the better trigger: a body that
+              // computes without ever calling delay() would otherwise hold the
+              // mutex for as long as it runs, and every web callback in that
+              // window renders empty. Time is what the callbacks care about,
+              // not instruction count — and the count would drift anyway now
+              // that instructions are several times cheaper.
+              vm->halted = true;
+              vm->running = false;
+              if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+              vTaskDelay(1);
+              if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+              tc_current_slot = slot;
+              vm->halted = false;
+              vm->running = true;
+              if (slot->task_stop) break;
             }
 
             while (vm->frame_count > saved_frame_count) {
-              tc_frame_free(&vm->frames[--vm->frame_count]);
+              tc_frame_free(vm, &vm->frames[--vm->frame_count]);
             }
             vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
           }
@@ -18585,6 +19204,7 @@ static void tc_vm_task(void *param) {
   slot->task_running = false;
   slot->task_handle = nullptr;
   tc_current_slot = nullptr;
+  TC_HEAPLOG("task.exit");
   vTaskDelete(NULL);
 }
 #endif  // ESP32
@@ -18606,8 +19226,99 @@ static void tc_vm_task(void *param) {
 #else
 #define TC_WEB_CB_WAIT 0xFFFFFFFFUL   // ESP8266: single-slot, no vm_mutex -- value unused
 #endif
+
+// A web render fans one callback out over ALL slots, so a per-slot bounded wait
+// can still sum to TC_MAX_VMS x 250 ms on a page where every slot is busy. Bound
+// the WHOLE pass instead: tc_web_pass_begin() opens a budget, and the per-slot
+// wait below is clamped to whatever is left of it. Outside a pass the budget is
+// 0 = inactive and the per-slot wait applies unchanged (single-slot paths like
+// WebOn/WebUI, which already have their own halted-wait).
+#ifndef TC_WEB_PASS_BUDGET_MS
+#define TC_WEB_PASS_BUDGET_MS 400
+#endif
+
+static uint32_t tc_web_pass_deadline = 0;
+static inline void tc_web_pass_begin(void) { tc_web_pass_deadline = millis() + TC_WEB_PASS_BUDGET_MS; }
+static inline void tc_web_pass_end(void)   { tc_web_pass_deadline = 0; }
+
+// Can a callback be dispatched into this slot RIGHT NOW? All four conditions,
+// not just halted.
+//
+// frame_count (Andreas C6 wedge; frame-depth map -> N=1): the slot may be halted
+// yet parked DEEP in a call chain -- a while(1) TaskLoop suspended at a delay()
+// inside a read sub-call sits at frame_count >= 2 with the mutex free. Dispatching
+// there stacks a callback frame ON TOP of the suspended frames: frame growth plus
+// the TaskLoop+WebCall NULL-locals race. Only its shallow base tick (<= 1) and
+// event-driven slots (main returned, 0) are safe.
+// worker_borrowed: a spawnTask worker parks at its base delay() with frame_count
+// == 1, so it passes the depth test, but it OWNS the VM -- stacking onto its live
+// base frame corrupts it (pc=0 / NULL-locals). Mirrors the UDP-global RX guard.
+//
+// ⚠️ Every place that WAITS for a slot must wait on THIS, never on vm.halted
+// alone. A TaskLoop parked at a delay() one function deep IS halted, with the
+// mutex free — so a halted-only wait returns "ready" instantly and the dispatch
+// is then refused by the frame_count gate a few lines later. Measured on .39,
+// 2026-08-07: with the delay() moved one frame deep, WebCall 0/20, WebPage 2/20
+// and even the 1500 ms webOn wait 0/20, while WebSkip climbed to 129. Waiting on
+// the wrong predicate is indistinguishable from not waiting at all.
+static inline bool tc_slot_dispatchable(const TcSlot *s) {
+  return s->vm.halted && s->vm.error == TC_OK
+      && s->vm.frame_count <= 1 && !s->vm.worker_borrowed;
+}
+
+// Is this slot worth rendering into the page right now?
+//
+// ⚠️ Read the history before "simplifying" this back to a plain `s->vm.halted`.
+// The web-render call sites used to test halted UNLOCKED and with ZERO wait, and
+// `continue` on false. On a slot whose TaskLoop does work + delay(10), halted is
+// false for roughly half of every iteration, so half of all page renders dropped
+// that slot's block ENTIRELY -- no row, no canvas, no log line, no error. Measured
+// by Rolf 2026-08-07 on max30102.tc: WebCall 11/12, WebPage 4/8, while the /pulse
+// webOn endpoint (which DOES wait, see TC_WEBON_HALTED_WAIT_MS) delivered 25/25 on
+// the same device in the same minute. That contrast is what pinned it down.
+//
+// The unlocked read stays a HINT -- tc_slot_callback re-checks under the mutex,
+// which is the only race-free place. What changes is that a busy MOMENT no longer
+// means "nothing to render": we wait for the slot's next idle window, bounded by
+// the pass budget so a wedged slot cannot stall the whole page.
+//
+// may_wait=false reverts to the old zero-wait probe. Pass it when this call is
+// NESTED inside a running VM -- sensorGet() re-enters the JsonCall fan-out from
+// inside a script's own callback, and there a 400 ms wait would land squarely in
+// the caller's TaskLoop. A telemetry line that is one poll late costs nothing; a
+// sensorGet() that suddenly takes 400 ms costs the whole loop.
+static bool tc_slot_web_ready(TcSlot *s, const char *name, bool may_wait = true) {
+  if (!s || !s->loaded || s->vm.error != TC_OK) { return false; }
+  // ⚠️ Nothing to render means nothing to wait for AND nothing to report lost.
+  // Most scripts define one or two of WebCall/WebPage/WebUI/JsonCall, so without
+  // this the fan-out waits on -- and counts a skip for -- callbacks that do not
+  // exist. Measured on .39: a script with no JsonCall showed WebSkip climbing to
+  // 26 while all three of its real endpoints delivered 20/20. A counter that
+  // cries wolf is worse than no counter, because it sends the next person
+  // hunting a loss that never happened.
+  if (name && !tc_has_callback(&s->vm, name)) { return false; }
+  if (tc_slot_dispatchable(s)) { return true; }
+  if (!may_wait) { return false; }
+#ifdef ESP32
+  // No pass open (single-slot path): fall back to the per-slot budget.
+  uint32_t deadline = tc_web_pass_deadline ? tc_web_pass_deadline
+                                           : (millis() + TC_WEB_PASS_BUDGET_MS);
+  while ((int32_t)(deadline - millis()) > 0) {
+    delay(1);                      // yields to the VM task and feeds the WDT
+    if (tc_slot_dispatchable(s)) { return true; }
+    if (s->vm.error != TC_OK) { return false; }
+  }
+  if (s->web_cb_skips < 0xFFFF) { s->web_cb_skips++; }
+#endif
+  return false;
+}
+
 static void tc_slot_callback(TcSlot *s, const char *name, uint32_t wait_ticks = 0xFFFFFFFFUL) {
   if (!s || !s->loaded) return;
+  // Script doesn't define it: no wait, no mutex, and above all no skip counted --
+  // see tc_slot_web_ready(). (cb_index/callbacks are load-time data, so this
+  // unlocked read is race-free; tc_slot_callback_id() takes the same shortcut.)
+  if (!tc_has_callback(&s->vm, name)) return;
 #ifdef ESP32
 #ifdef USE_TINYC_WORKER_VM
   // A worker VM (Option 2) may hold vm_mutex through a blocking op (httpGet). Never block
@@ -18615,35 +19326,47 @@ static void tc_slot_callback(TcSlot *s, const char *name, uint32_t wait_ticks = 
   // skips this tick and fires later, in the worker's next delay() window.
   if (s->has_worker_vm && wait_ticks == 0xFFFFFFFFUL) wait_ticks = 0;
 #endif
-  if (s->vm_mutex && xSemaphoreTake(s->vm_mutex, (TickType_t)wait_ticks) != pdTRUE) return;
+  // ⚠️ Web renders must RETRY, not take-once. The dispatchable window of a busy
+  // TaskLoop can be a single tick wide, and between our check and our take the
+  // loop is free to start its next iteration -- a single take-then-check loses
+  // that race almost every time, which looks exactly like not waiting at all.
+  // So: take, decide UNDER the mutex (the only race-free place), and on a miss
+  // release and try again until the budget is gone.
+  bool web = (wait_ticks == TC_WEB_CB_WAIT);
+  uint32_t deadline = 0;
+  if (web) {
+    deadline = tc_web_pass_deadline ? tc_web_pass_deadline
+                                    : (millis() + TC_WEB_PASS_BUDGET_MS);
+  }
+  for (;;) {
+    uint32_t take = wait_ticks;
+    if (web) {
+      int32_t left_ms = (int32_t)(deadline - millis());
+      if (left_ms < 0) { left_ms = 0; }
+      uint32_t left = pdMS_TO_TICKS((uint32_t)left_ms);
+      if (left < take) { take = left; }
+    }
+    if (!s->vm_mutex || xSemaphoreTake(s->vm_mutex, (TickType_t)take) == pdTRUE) {
+      if (tc_slot_dispatchable(s)) { break; }     // -> dispatch below, mutex held
+      if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+    }
+    if (!web || (int32_t)(deadline - millis()) <= 0) {
+      if (s->vm.error == TC_OK && s->web_cb_skips < 0xFFFF) { s->web_cb_skips++; }
+      return;
+    }
+    delay(1);
+  }
 #else
   (void)wait_ticks;
-#endif
-  if (!s->vm.halted || s->vm.error != TC_OK) {
-#ifdef ESP32
-    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
-#endif
+  if (!tc_slot_dispatchable(s)) {
+    if (s->vm.error == TC_OK && s->web_cb_skips < 0xFFFF) { s->web_cb_skips++; }
     return;
   }
-  // Reentrancy gate (Andreas C6 wedge; frame-depth map -> N=1). The slot is
-  // halted, but if it parked DEEP in a call chain (a while(1) TaskLoop suspended
-  // at delay() inside a read sub-call: frame_count >= 2, mutex free during the
-  // delay) rather than at its shallow base tick (frame_count <= 1), dispatching
-  // a callback now stacks it ON TOP of the suspended frames -> frame growth +
-  // the TaskLoop+WebCall NULL-locals race. Skip; the periodic sweep retries once
-  // the TaskLoop unwinds to its base tick. Event-driven slots (main returned,
-  // frame_count 0) and base-tick parks (1) still dispatch -> no starving.
-  // ALSO skip when a spawnTask worker has BORROWED this VM (worker_borrowed): it
-  // parks at its base delay() with frame_count==1 (passes the >1 gate) but it OWNS
-  // the VM — stacking a callback frame on the worker's live base frame corrupts it
-  // (pc=0 / NULL-locals; the worker's base frame is the one with return_pc=0). This
-  // mirrors the UDP-global RX guard (~line 3069) which already rejects borrowed VMs.
-  if (s->vm.frame_count > 1 || s->vm.worker_borrowed) {
-#ifdef ESP32
-    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
 #endif
-    return;
-  }
+  // Everything is checked in tc_slot_dispatchable() above -- halted, no error,
+  // frame depth, worker ownership -- and, on ESP32, checked while HOLDING the
+  // mutex. Do not re-add a separate gate here: a second check outside that
+  // decision point is what made the wait above wait on the wrong thing.
   tc_current_slot = s;
   tc_vm_call_callback(&s->vm, name);
   tc_current_slot = nullptr;
@@ -18744,6 +19467,7 @@ static void TinyCSetPersistFile(TcSlot *s, const char *tcb_path) {
 
 // Helper: stop the VM in a specific slot
 static void TinyCStopVM(TcSlot *s) {
+  TC_HEAPLOG("stopvm.in");
   if (!Tinyc || !s) return;
   if (s->torn_down) return;   // already fully torn down (e.g. the double-stop on a reload:
                               // CmndTinyCRun + TinyCLoadFile both stop). A 2nd teardown-save
@@ -18857,6 +19581,7 @@ static void TinyCStopVM(TcSlot *s) {
   }
 #endif
   s->torn_down = true;   // teardown complete — a redundant 2nd stop is now a no-op (guarded above)
+  TC_HEAPLOG("stopvm.out");
 }
 
 // Helper: start the VM in a specific slot
@@ -18959,7 +19684,9 @@ static bool TinyCStartVM(TcSlot *s) {
   BaseType_t ret = xTaskCreate(tc_vm_task, taskname, TC_VM_TASK_STACK, s, 1, &s->task_handle);
 #else
   // Dual-core ESP32/S3 -- pin to core 1
+  TC_HEAPLOG("startvm.pretask");
   BaseType_t ret = xTaskCreatePinnedToCore(tc_vm_task, taskname, TC_VM_TASK_STACK, s, 1, &s->task_handle, 1);
+  TC_HEAPLOG("startvm.posttask");
 #endif
   if (ret != pdPASS) {
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Failed to create task for %s"), s->filename);

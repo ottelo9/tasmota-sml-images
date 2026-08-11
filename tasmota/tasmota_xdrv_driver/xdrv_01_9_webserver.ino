@@ -424,10 +424,7 @@ const char HTTP_COUNTER[] PROGMEM =
   "<br><div id='t' style='text-align:center;'></div>";
 
 const char HTTP_END[] PROGMEM =
- "<p></p><div style='text-align:center;font-size:11px;'><hr>" // Änderung von ottelo
-  "<a href='https://ottelo.jimdofree.com' target='_blank' style='color:#aaa;'>Tasmota %s %s</a><br>"
-  "<a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota developed " D_BY " Theo Arends</a>"
-  "</div>"
+  "<p></p><div style='text-align:right;font-size:11px;'><hr><a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota %s %s " D_BY " Theo Arends</a></div>"
   "</div>"
   "</body>"
   "</html>";
@@ -759,8 +756,47 @@ void WifiManagerBegin(bool reset_only) {
 
 /*-------------------------------------------------------------------------------------------*/
 
+#ifdef ESP32
+// Bound how long the loopTask can block pushing one response to a slow / non-draining
+// client. Without this, sendContent() blocks indefinitely on a stalled TCP send buffer;
+// the per-chunk feedLoopWDT() in _WSContentSend then keeps the WDT fed, so the old
+// self-healing Task-WDT reboot never happens -> PERMANENT web wedge under repeated
+// reloads of a big page on a contended single core (Andreas .144 /zeiten, tips after
+// 6-12 sequential reloads, stays dead until power-cycle).
+#ifndef WS_SEND_BUDGET_MS
+#define WS_SEND_BUDGET_MS 8000      // total per-response send budget (ms)
+#endif
+static uint32_t ws_send_t0 = 0;     // millis() at which the current response started sending
+static bool ws_send_armed = false;  // budget anchored for the request being handled
+#include <lwip/sockets.h>   // setsockopt / SOL_SOCKET / SO_SNDTIMEO for the per-send cap in
+                            // WSSendBudgetArm -- self-sufficient (not every device config pulls
+                            // lwip sockets in transitively; e.g. a build without USE_FTP)
+
+// Anchor the budget and cap each individual write. Called from WSContentBegin for regular
+// chunked pages, and lazily from _WSContentSend for responses that never go through
+// WSContentBegin -- e.g. Scripter >on1 handlers writing a raw HTTP response with wcs/wcf.
+void WSSendBudgetArm(void) {
+  int _wsfd = Webserver->client().fd();
+  if (_wsfd >= 0) {
+    // Per-write cap: SO_SNDTIMEO makes each send() give up after 2 s instead of blocking
+    // forever on a full send buffer.
+    struct timeval _wstv = { 2, 0 };
+    setsockopt(_wsfd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&_wstv, sizeof(_wstv));
+  }
+  ws_send_t0 = millis();
+  ws_send_armed = true;
+}
+#endif  // ESP32
+
 void PollDnsWebserver(void) {
   if (DnsServer) { DnsServer->processNextRequest(); }
+#ifdef ESP32
+  // Disarm per request, not per response: the budget must be re-anchored for every
+  // request handled below. A handler that sends without WSContentBegin would otherwise
+  // measure against the previous response's start time and, once that is older than the
+  // budget, drop the connection before writing a single byte.
+  ws_send_armed = false;
+#endif
   if (Webserver) { Webserver->handleClient(); }
 }
 
@@ -854,33 +890,10 @@ void WSSend(int code, int ctype, const String& content)
  * HTTP Content Chunk handler
 \*********************************************************************************************/
 
-#ifdef ESP32
-// Bound how long the loopTask can block pushing one chunked response to a slow /
-// non-draining client. Without this, sendContent() blocks indefinitely on a stalled
-// TCP send buffer; the per-chunk feedLoopWDT() in _WSContentSend then keeps the WDT
-// fed, so the old self-healing Task-WDT reboot never happens -> PERMANENT web wedge
-// under repeated reloads of a big page on a contended single core (Andreas .144
-// /zeiten, tips after 6-12 sequential reloads, stays dead until power-cycle).
-#ifndef WS_SEND_BUDGET_MS
-#define WS_SEND_BUDGET_MS 8000      // total per-response send budget (ms)
-#endif
-static uint32_t ws_send_t0 = 0;     // millis() at chunked-response start
-#include <lwip/sockets.h>   // setsockopt / SOL_SOCKET / SO_SNDTIMEO for the per-send cap in
-                            // WSContentBegin -- self-sufficient (not every device config pulls
-                            // lwip sockets in transitively; e.g. a build without USE_FTP)
-#endif
-
 void WSContentBegin(int code, int ctype) {
   Webserver->client().flush();
 #ifdef ESP32
-  // Per-write cap: SO_SNDTIMEO makes each send() give up after 2 s instead of blocking
-  // forever on a full send buffer. ws_send_t0 anchors the total-budget check below.
-  int _wsfd = Webserver->client().fd();
-  if (_wsfd >= 0) {
-    struct timeval _wstv = { 2, 0 };
-    setsockopt(_wsfd, SOL_SOCKET, SO_SNDTIMEO, (const void *)&_wstv, sizeof(_wstv));
-  }
-  ws_send_t0 = millis();
+  WSSendBudgetArm();                               // see PollDnsWebserver
 #endif
   WSHeaderSend();
   Webserver->setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -899,11 +912,14 @@ void _WSContentSend(const char* content, size_t size) {  // Lowest level sendCon
   // (Andreas .144, addr2line = esp_vApplicationIdleHook). Resetting here per chunk keeps a
   // long send under the WDT without disabling it (a genuine stall between chunks still trips).
   feedLoopWDT();
+  // Responses that bypass WSContentBegin (Scripter >on1 writing a raw HTTP response with
+  // wcs/wcf) reach the wire here first -- anchor the budget on their first byte.
+  if (!ws_send_armed) { WSSendBudgetArm(); }
   // Total-send budget: if pushing this response has already blocked the loopTask too
   // long (slow/stalled client), drop the connection and stop -- the loop is freed
-  // within the budget instead of wedging forever. SO_SNDTIMEO (set in WSContentBegin)
-  // bounds each individual write; this bounds the sum. Inert for normal fast clients
-  // (a full page sends in well under the budget, so this never fires).
+  // within the budget instead of wedging forever. SO_SNDTIMEO (set when arming) bounds
+  // each individual write; this bounds the sum. Inert for normal fast clients (a full
+  // page sends in well under the budget, so this never fires).
   if ((uint32_t)(millis() - ws_send_t0) > WS_SEND_BUDGET_MS) {
     Webserver->client().stop();
     return;

@@ -1342,8 +1342,13 @@ void CmndTinyC(void) {
     if (!s) continue;
     if (!first) ResponseAppend_P(PSTR(","));
     first = false;
+    // WebSkip = web-render callbacks (WebCall/WebPage/WebUI/JsonCall) this slot was
+    // too busy to serve. Each one is a block that was silently left out of a served
+    // page, so a rising count is the direct answer to "why does my display flicker /
+    // why is the chart sometimes missing" -- the answer is the slot's own TaskLoop,
+    // not the browser. Give it more delay(), or move the drawing to a webOn endpoint.
     ResponseAppend_P(PSTR("{\"Slot\":%d,\"Loaded\":%d,\"Running\":%d,\"Size\":%d,"
-      "\"PC\":%d,\"SP\":%d,\"Instr\":%u,\"Error\":\"%s\",\"File\":\"%s\"}"),
+      "\"PC\":%d,\"SP\":%d,\"Instr\":%u,\"WebSkip\":%u,\"Error\":\"%s\",\"File\":\"%s\"}"),
       i,
       s->loaded ? 1 : 0,
       s->running ? 1 : 0,
@@ -1351,6 +1356,7 @@ void CmndTinyC(void) {
       s->vm.pc - s->vm.code_offset,
       s->vm.sp,
       s->vm.instruction_count,
+      s->web_cb_skips,
       tc_error_str(s->vm.error),
       s->filename[0] ? s->filename : "");
   }
@@ -1432,6 +1438,10 @@ void CmndTinyCReset(void) {
   TcSlot *s = Tinyc->slots[slot_num];
   if (!s) { ResponseCmndChar_P(TC_NOT_INIT); return; }
   TinyCStopVM(s);  // frees frame locals and heap
+  // ⚠️ MUST come before the memset below: TinyCStopVM parks the frame-locals
+  // buffers in the VM's reuse cache instead of returning them, and the memset
+  // would then zero the only pointers to them. See tc_frame_alloc().
+  tc_frame_cache_drain(&s->vm);
   // Free remaining dynamic VM allocations before zeroing struct
   if (s->vm.stack) { free(s->vm.stack); }
   if (s->vm.globals) { free(s->vm.globals); }
@@ -4429,11 +4439,17 @@ static void HandleTinyCWebOn(uint8_t handler_num) {
     Webserver->send(503, "text/plain", "TinyC not ready");
     return;
   }
-  { uint32_t _t0 = millis();
-    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
-      delay(20); yield();
+  { // ⚠️ Wait for DISPATCHABLE, not for halted. A TaskLoop parked at a delay()
+    // one function deep is halted with the mutex free, so a halted-only wait
+    // returns instantly and tc_slot_callback then refuses on frame depth -- the
+    // 1500 ms below bought nothing. Measured 0 of 20 on .39, 2026-08-07.
+    // delay(2), not delay(20): the usable window between two TaskLoop iterations
+    // is about one tick wide, and a 20 ms poll steps straight over it.
+    uint32_t _t0 = millis();
+    while (!tc_slot_dispatchable(s) && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(2); yield();
     } }
-  if (!s->vm.halted) {
+  if (!tc_slot_dispatchable(s)) {
     Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
     return;
   }
@@ -4714,11 +4730,17 @@ static void HandleTinyCUI(void) {
     Webserver->send(503, "text/plain", "TinyC not ready");
     return;
   }
-  { uint32_t _t0 = millis();
-    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
-      delay(20); yield();
+  { // ⚠️ Wait for DISPATCHABLE, not for halted. A TaskLoop parked at a delay()
+    // one function deep is halted with the mutex free, so a halted-only wait
+    // returns instantly and tc_slot_callback then refuses on frame depth -- the
+    // 1500 ms below bought nothing. Measured 0 of 20 on .39, 2026-08-07.
+    // delay(2), not delay(20): the usable window between two TaskLoop iterations
+    // is about one tick wide, and a 20 ms poll steps straight over it.
+    uint32_t _t0 = millis();
+    while (!tc_slot_dispatchable(s) && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(2); yield();
     } }
-  if (!s->vm.halted) {
+  if (!tc_slot_dispatchable(s)) {
     Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
     return;
   }
@@ -4796,6 +4818,13 @@ static void HandleTinyCUI(void) {
 static void TinyCShow(bool json) {
   if (!Tinyc) return;
 
+  // One budget for the whole fan-out (JsonCall / WebCall over up to TC_MAX_VMS
+  // slots), so waiting for a busy slot cannot multiply by the slot count. Saved
+  // and restored rather than just cleared: sensorGet() inside a JsonCall can
+  // re-enter this function, and the inner pass must not end the outer one.
+  uint32_t saved_pass = tc_web_pass_deadline;
+  if (!saved_pass) { tc_web_pass_begin(); }   // nested call inherits the outer budget
+
   if (json) {
     // Iterate all slots for JSON output
     for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
@@ -4831,7 +4860,18 @@ static void TinyCShow(bool json) {
       // the cosmetic spawnTask UI-disappear case; if that case becomes a real
       // problem, address it via xSemaphoreTake-with-timeout in tc_slot_callback
       // rather than by removing the pre-check.
-      if (s->loaded && s->vm.halted && s->vm.error == TC_OK && s != tc_sensor_get_slot) {
+      // 2026-08-07: that is now what happens. The pre-check stays (it still keeps
+      // the fan-out off a slot that is genuinely errored/unloaded), but the halted
+      // half of it goes through tc_slot_web_ready(), which WAITS for the slot's next
+      // idle window instead of dropping its block for this render. See the long
+      // comment at tc_slot_web_ready() -- the zero-wait version silently emptied
+      // half of all renders on any slot with a fast TaskLoop.
+      // ⚠️ Order matters: test the re-entry guard BEFORE tc_slot_web_ready(), or the
+      // slot that is right now executing sensorGet() (its own VM running, so never
+      // halted) burns the whole wait budget before being skipped anyway. And when we
+      // ARE inside a sensorGet, nobody may wait at all — see may_wait.
+      if (s != tc_sensor_get_slot &&
+          tc_slot_web_ready(s, "JsonCall", tc_sensor_get_slot == nullptr)) {
         tc_slot_callback(s, "JsonCall", TC_WEB_CB_WAIT);
       }
     }
@@ -4848,12 +4888,14 @@ static void TinyCShow(bool json) {
         if (s->running) { strcpy_P(status, PSTR("Running")); }
         else if (s->loaded) { strcpy_P(status, PSTR("Loaded")); }
         else { strcpy_P(status, PSTR("Empty")); }
+        // web_cb_skips: renders this slot was too busy for. Anything but 0 means
+        // parts of THIS page were silently left out at some point.
         if (i == 0) {
-          WSContentSend_PD(PSTR("{s}TinyC{m}%s (%d bytes){e}"),
-            status, s->program_size);
+          WSContentSend_PD(PSTR("{s}TinyC{m}%s (%d bytes, %u skips){e}"),
+            status, s->program_size, s->web_cb_skips);
         } else {
-          WSContentSend_PD(PSTR("{s}TinyC[%d]{m}%s (%d bytes){e}"),
-            i, status, s->program_size);
+          WSContentSend_PD(PSTR("{s}TinyC[%d]{m}%s (%d bytes, %u skips){e}"),
+            i, status, s->program_size, s->web_cb_skips);
         }
       }
       // Call user's WebCall() on this slot — pre-check restored 2026-05-07,
@@ -4863,7 +4905,7 @@ static void TinyCShow(bool json) {
       // full-width cell, with its own nested table so the 2-column layout is
       // preserved) so multiple scripts on the main page are visually separated
       // with a gap. webCard(0) opts a slot out (s->web_nocard) -> bare rows.
-      if (s->loaded && s->vm.halted && s->vm.error == TC_OK) {
+      if (tc_slot_web_ready(s, "WebCall")) {
         bool card = (!s->web_nocard) && tc_has_callback(&s->vm, "WebCall");
         if (card) {
           WSContentSend_P(PSTR(
@@ -4879,6 +4921,7 @@ static void TinyCShow(bool json) {
     }
   }
 #endif
+  tc_web_pass_deadline = saved_pass;
 }
 
 /*********************************************************************************************\
@@ -5723,7 +5766,11 @@ struct TcSpawnTask {
   TaskHandle_t  handle;
   TcSlot       *slot;
   uint8_t       slot_idx;         // 0..TC_MAX_VMS-1
-  volatile uint8_t stop_requested;
+  // bool, not uint8_t: the VM slice takes a `volatile bool*` abort flag (same as
+  // slot->task_stop), and it polls it directly so killTask aborts a compute-only
+  // worker within 64 instructions instead of at the next budget. Only ever 0/1,
+  // same size and layout as before.
+  volatile bool stop_requested;
   volatile uint8_t running;       // 1 while FreeRTOS task alive
 #ifdef USE_TINYC_WORKER_VM
   TcVM         *worker_vm;        // Option 2: the worker's OWN VM (NULL = borrow shared VM)
@@ -5837,7 +5884,7 @@ static void tc_spawn_task_body(void *param) {
     frame->saved_sp = vm->sp;   // consistency: every other frame ctor sets this
                                 // (tc_vm_call_callback_idx / OP_CALL / tc_vm_task);
                                 // without it the RET leak-check compares vs garbage.
-    if (!tc_frame_alloc(frame)) {
+    if (!tc_frame_alloc(vm, frame)) {
       vm->halted = true; vm->running = false;
       tc_current_slot = nullptr;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
@@ -5851,58 +5898,54 @@ static void tc_spawn_task_body(void *param) {
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') running on slot %d"), name, entry->slot_idx);
 
-    uint32_t count = 0;
-    while (vm->frame_count > saved_frame_count
-           && !vm->halted
-           && vm->error == TC_OK
-           && !entry->stop_requested
-           && slot->loaded) {
-      int err = tc_vm_step(vm);
-      if (err == TC_ERR_PAUSED) {
-        if (vm->delayed) {
-          // Release mutex during the actual sleep so other work can proceed.
-          vm->halted = true;
-          vm->running = false;
-          tc_current_slot = nullptr;
-          if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-          int32_t remaining = (int32_t)(vm->delay_until - millis());
-          while (remaining > 0 && !entry->stop_requested && slot->loaded) {
-            int32_t chunk = (remaining > 50) ? 50 : remaining;
-            vTaskDelay(pdMS_TO_TICKS(chunk));
-            remaining = (int32_t)(vm->delay_until - millis());
-          }
-          vm->delayed = false;
-          if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
-          tc_current_slot = slot;
-          if (entry->stop_requested || !slot->loaded) break;
-          vm->halted = false;
-          vm->running = true;
-        }
-        continue;
-      }
+    // Worker body on the direct-threaded loop. Only stop_requested fits the
+    // slice's single stop flag; slot->loaded is checked out here, which is
+    // close enough — the slice hands control back at least every budget.
+    for (;;) {
+      int err = tc_vm_run_slice_ex(vm, 0, TC_TASKLOOP_BUDGET_MS,
+                                   (int)saved_frame_count, &entry->stop_requested);
       if (err != TC_OK) {
-        vm->error = err;
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') err %d at PC=%u"), name, err, vm->pc);
         tc_crash_log(err, vm->pc, vm->instruction_count, name);
         break;
       }
-      count++;
-      vm->instruction_count++;
-      // Yield periodically to feed WDT and let other work run.
-      if ((count & 0xFFFF) == 0) {
-        vm->halted = true; vm->running = false;
+      if (vm->delayed) {
+        // Release mutex during the actual sleep so other work can proceed.
+        vm->halted = true;
+        vm->running = false;
+        tc_current_slot = nullptr;
         if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-        vTaskDelay(1);
+        int32_t remaining = (int32_t)(vm->delay_until - millis());
+        while (remaining > 0 && !entry->stop_requested && slot->loaded) {
+          int32_t chunk = (remaining > 50) ? 50 : remaining;
+          vTaskDelay(pdMS_TO_TICKS(chunk));
+          remaining = (int32_t)(vm->delay_until - millis());
+        }
+        vm->delayed = false;
         if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
-        vm->halted = false; vm->running = true;
+        vm->halted = false;
+        vm->running = true;
+        continue;
       }
+      if (vm->halted) break;
+      if (vm->frame_count <= saved_frame_count) break;   // worker function returned
+      if (entry->stop_requested || !slot->loaded) break;
+      // Budget expired — same hand-back as before, on a time trigger instead of
+      // every 65536 instructions (see the TaskLoop note in vm.h).
+      vm->halted = true; vm->running = false;
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+      vTaskDelay(1);
+      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      tc_current_slot = slot;
+      if (entry->stop_requested || !slot->loaded) break;
+      vm->halted = false; vm->running = true;
     }
 
     // Clean up callback frame
     while (vm->frame_count > saved_frame_count) {
-      tc_frame_free(&vm->frames[--vm->frame_count]);
+      tc_frame_free(vm, &vm->frames[--vm->frame_count]);
     }
     vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
 
@@ -5980,7 +6023,7 @@ static void tc_worker_vm_body(void *param) {
     TcFrame *frame = &vm->frames[0];
     frame->return_pc = 0;
     frame->saved_sp = 0;
-    if (!tc_frame_alloc(frame)) {
+    if (!tc_frame_alloc(vm, frame)) {
       vm->halted = true; vm->running = false;
       tc_current_slot = nullptr;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
@@ -5993,54 +6036,49 @@ static void tc_worker_vm_body(void *param) {
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: workerVM('%s') running on slot %d (own VM)"), name, entry->slot_idx);
 
-    uint32_t count = 0;
-    while (vm->frame_count > 0
-           && !vm->halted
-           && vm->error == TC_OK
-           && !entry->stop_requested
-           && slot->loaded) {
-      int err = tc_vm_step(vm);
-      if (err == TC_ERR_PAUSED) {
-        if (vm->delayed) {
-          // Release the mutex during the sleep so primary callbacks run.
-          vm->halted = true; vm->running = false;
-          tc_current_slot = nullptr;
-          if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-          int32_t remaining = (int32_t)(vm->delay_until - millis());
-          while (remaining > 0 && !entry->stop_requested && slot->loaded) {
-            int32_t chunk = (remaining > 50) ? 50 : remaining;
-            vTaskDelay(pdMS_TO_TICKS(chunk));
-            remaining = (int32_t)(vm->delay_until - millis());
-          }
-          vm->delayed = false;
-          if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
-          tc_current_slot = slot;
-          if (entry->stop_requested || !slot->loaded) break;
-          vm->halted = false; vm->running = true;
-        }
-        continue;
-      }
+    // Own-VM worker: its base frame IS frame 0, so it is done when the frame
+    // stack empties — stop_frame 0, unlike the borrowed-VM worker above which
+    // stops at the depth it found.
+    for (;;) {
+      int err = tc_vm_run_slice_ex(vm, 0, TC_TASKLOOP_BUDGET_MS,
+                                   0, &entry->stop_requested);
       if (err != TC_OK) {
-        vm->error = err;
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: workerVM('%s') err %d at PC=%u"), name, err, vm->pc);
         tc_crash_log(err, vm->pc, vm->instruction_count, name);
         break;
       }
-      count++;
-      vm->instruction_count++;
-      if ((count & 0xFFFF) == 0) {
+      if (vm->delayed) {
+        // Release the mutex during the sleep so primary callbacks run.
         vm->halted = true; vm->running = false;
+        tc_current_slot = nullptr;
         if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
-        vTaskDelay(1);
+        int32_t remaining = (int32_t)(vm->delay_until - millis());
+        while (remaining > 0 && !entry->stop_requested && slot->loaded) {
+          int32_t chunk = (remaining > 50) ? 50 : remaining;
+          vTaskDelay(pdMS_TO_TICKS(chunk));
+          remaining = (int32_t)(vm->delay_until - millis());
+        }
+        vm->delayed = false;
         if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
         vm->halted = false; vm->running = true;
+        continue;
       }
+      if (vm->halted) break;
+      if (vm->frame_count == 0) break;                   // worker function returned
+      if (entry->stop_requested || !slot->loaded) break;
+      vm->halted = true; vm->running = false;
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+      vTaskDelay(1);
+      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      tc_current_slot = slot;
+      if (entry->stop_requested || !slot->loaded) break;
+      vm->halted = false; vm->running = true;
     }
 
     while (vm->frame_count > 0) {
-      tc_frame_free(&vm->frames[--vm->frame_count]);
+      tc_frame_free(vm, &vm->frames[--vm->frame_count]);
     }
     vm->halted = true; vm->running = false;
     tc_output_flush();
@@ -6441,14 +6479,30 @@ bool Xdrv124(uint32_t function) {
       TinyCFsRestartRetry();   // (B) re-start any slot whose post-write restart failed
       TinyCPrefixReheal();     // re-arm a loaded slot's command prefix if it was lost without a main() re-run
 #ifdef ESP32
-      // lwIP TCP-PCB census every ~10 s: warn when the 16-slot pool is filling. A TIME_WAIT
-      // pile-up from socket churn (web auto-refresh / un-RST-closed connects) exhausts the pool
-      // and wedges the whole net stack (no ping/HTTP) until it ages out — the self-healing freeze.
+      // lwIP TCP-PCB census every ~10 s. Warns when ACTIVE connections pile up — those are
+      // the ones nobody is closing, and they do not go away on their own.
+      //
+      // ⚠️ TIME_WAIT IS DELIBERATELY NOT PART OF THE THRESHOLD. It used to be (`_a + _tw >= 12`)
+      // and that was wrong twice over:
+      //   * TIME_WAIT is harmless. lwIP reclaims it on demand — tcp_alloc() kills the oldest
+      //     TIME_WAIT pcb when the pool is empty (core/tcp.c, tcp_kill_timewait()), then the
+      //     oldest LAST_ACK. A full TIME_WAIT list costs nothing but a reclaim.
+      //   * It fires constantly on a HEALTHY device. Every closed HTTP request sits in
+      //     TIME_WAIT for 2*TCP_MSL = 120 s, so a single browser tab on the Tasmota web UI
+      //     (auto-refresh every few seconds) parks the count at 16/16 permanently. Measured
+      //     2026-08-04 on an idle S3 with NO TinyC program loaded at all: polling it from a
+      //     shell held time_wait at 16, and it decayed to below 12 exactly 120 s after the
+      //     last request. The warning was reporting its own observer.
+      //
+      // A line that cries wolf during normal operation trains everyone to ignore it — and it
+      // sent this author down the wrong path while investigating a real port-80 outage
+      // (ottelo9/tasmota-sml-images#52). ACTIVE is the number that matters: connections that
+      // stay open and never close exhaust the socket layer for good, and only a reboot helps.
       { static uint8_t tc_pcb_tick = 0;
         if (++tc_pcb_tick >= 10) { tc_pcb_tick = 0;
           uint8_t _a, _tw; tc_pcb_census(&_a, &_tw);
-          if (_a + _tw >= 12) {
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: lwIP TCP PCBs active=%u time_wait=%u (pool=16) - net-wedge risk, check socket churn"), _a, _tw);
+          if (_a >= 8) {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: lwIP TCP PCBs active=%u (pool=16, time_wait=%u) - connections not closing?"), _a, _tw);
           }
         }
       }
@@ -6617,11 +6671,17 @@ bool Xdrv124(uint32_t function) {
       // Wrap charts in block container to prevent inline-block cascading width expansion
       WSContentSend_P(PSTR("<div style='display:block;width:100%%;overflow:hidden'>"));
       // Call user's WebPage() on all active slots
+      // tc_slot_web_ready() instead of a raw `s->vm.halted`: WebPage() is the
+      // WHOLE drawing program of a script, so dropping it costs the entire canvas
+      // -- Rolf measured 4 of 8 renders lost on a slot whose TaskLoop ran at
+      // delay(10), which looks exactly like "the page sometimes has no chart".
+      tc_web_pass_begin();
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
         TcSlot *s = Tinyc->slots[i];
-        if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) continue;
+        if (!tc_slot_web_ready(s, "WebPage")) continue;
         tc_slot_callback(s, "WebPage", TC_WEB_CB_WAIT);
       }
+      tc_web_pass_end();
       WSContentSend_P(PSTR("</div>"));
       // Inject JavaScript for widget interactions on main page (all slots)
       {
