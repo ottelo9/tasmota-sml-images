@@ -1036,6 +1036,22 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
     if (!stack_thunk_light_get_stack_bot()) break;
 #endif // ESP8266
 
+    // The context and the two record buffers are allocated ONCE, in the
+    // constructor, and never checked afterwards. When that allocation failed —
+    // 4 KB + 4 KB contiguous on a fragmented heap, which is exactly the state a
+    // device reaches after hours of reconnecting on a weak link — the engine was
+    // still handed the null buffers here and read through them during the
+    // handshake: a load fault at NULL + an offset inside the buffer
+    // (Hermann 2026-07-04: MCAUSE 0x5, MTVAL 0x0000070e = 1806, well inside the
+    // 4 KB receive buffer; the chain was Every250mSeconds -> MqttCheck ->
+    // MqttReconnect). Failing the connect instead turns a reset into a retry —
+    // MQTT simply tries again later, by which time the heap may have recovered.
+    if (!_sc || !_iobuf_in || !_iobuf_out) {
+      DEBUG_BSSL("_connectSSL: no TLS buffers (out of memory)\n");
+      setLastError(ERR_OOM);
+      break;
+    }
+
     _ctx_present = true;
     _eng = &_sc->eng; // Allocation/deallocation taken care of by the _sc shared_ptr
 

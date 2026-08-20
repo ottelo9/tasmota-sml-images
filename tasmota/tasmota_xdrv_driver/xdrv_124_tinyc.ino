@@ -33,11 +33,21 @@
 #define XDRV_124  124
 
 // Default TinyC bytecode repository (used when /tinyc_repo.cfg is not present)
+// and default URL for the TinyC IDE itself, which `TinyCIde` uses to
+// self-update the served /tinyc_ide.html.gz.
+//
+// Both are #ifndef so a build can point at its OWN repository from
+// user_config_override.h — whoever ships images with their own bytecode
+// collection needs the drop-down to list THEIR programs, not ours
+// (Hans, 2026-08-16). Both stay overridable at run time as before:
+// `/tinyc_repo.cfg` for the repository, `TinyCIde <url>` for the IDE.
+#ifndef TINYC_DEFAULT_REPO
 #define TINYC_DEFAULT_REPO "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/bytecode"
+#endif
 
-// Default URL for the TinyC IDE itself (one level up from the bytecode repo).
-// Used by `TinyCIde` to self-update the served /tinyc_ide.html.gz from the repo.
+#ifndef TINYC_DEFAULT_IDE_URL
 #define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/tinyc_ide.html.gz"
+#endif
 
 // Global pause flag — set by filesystem upload handler (xdrv_50) to pause VM during uploads
 bool tc_global_pause = false;
@@ -104,6 +114,33 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
 #include "include/xdrv_124_tinyc_vm.h"
+#include "include/xdrv_124_tinyc_repoide.h"   // /tcrepo page (USE_TINYC_REPO_IDE)
+
+// Stack per VM task. Starts from TC_VM_TASK_STACK, changeable with
+// `TinyCStack <bytes>` and remembered in /tinyc_stack.cfg (gemu 2026-08-17:
+// 12 kB per slot is not always needed). Takes effect on the next slot start.
+uint16_t tc_vm_stack_bytes = TC_VM_TASK_STACK;
+
+#ifdef ESP32
+static void TinyCLoadStackCfg(void) {
+#ifdef USE_UFILESYS
+  if (!ufsp) return;
+  File f = ufsp->open("/tinyc_stack.cfg", "r");
+  if (!f) return;
+  char buf[16] = {0};
+  int n = f.readBytes(buf, sizeof(buf) - 1);
+  f.close();
+  if (n <= 0) return;
+  long v = strtol(buf, nullptr, 10);
+  if (v >= TC_VM_STACK_MIN && v <= TC_VM_STACK_MAX) {
+    tc_vm_stack_bytes = (uint16_t)v;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM task stack %u B (from /tinyc_stack.cfg)"),
+           (unsigned)tc_vm_stack_bytes);
+  }
+#endif  // USE_UFILESYS
+}
+#endif  // ESP32
+
 #ifdef ESP8266
 #include <coredecls.h>   // can_yield() — used to skip the VM tick in a can't-yield
                          // (ctx:sys / re-entrant) context, avoiding a __yield panic
@@ -573,6 +610,7 @@ static void TinyCLoadSettings(void) {
     return;
   }
   uint8_t slot = 0;
+  bool cfg_stale = false;      // a line pointed at a file that is no longer there
   while (f.available() && slot <= TC_MAX_VMS) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -596,6 +634,23 @@ static void TinyCLoadSettings(void) {
 
     fname.trim();
     if (fname.length() > 0) {
+      // A slot whose file is gone keeps NOTHING. Deleting a .tcb (over /ufsd,
+      // or after TinyCUnload) left the name standing in /tinyc.cfg, so the
+      // status kept naming a file that no longer exists and the web page kept
+      // showing it — nothing broke, but every reader had to find out the hard
+      // way (gemu 2026-08-18). Cleared here rather than at delete time because
+      // a .tcb can go by any route: /ufsd, "Delete All", a script, or a
+      // filesystem that was reformatted underneath us.
+      if (!fs->exists(fname.c_str())) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: %s is gone — entry dropped"),
+               slot, fname.c_str());
+        Tinyc->slot_config[slot].filename[0] = '\0';
+        Tinyc->slot_config[slot].autoexec = false;
+        Tinyc->slot_config[slot].cmd_prefix[0] = '\0';
+        cfg_stale = true;
+        slot++;
+        continue;
+      }
       // Store config (lightweight — no RAM allocation for the VM)
       strlcpy(Tinyc->slot_config[slot].filename, fname.c_str(), sizeof(Tinyc->slot_config[slot].filename));
       Tinyc->slot_config[slot].autoexec = (autoexec != 0);
@@ -605,6 +660,9 @@ static void TinyCLoadSettings(void) {
     slot++;
   }
   f.close();
+  // Write the cleaned-up file back, so the dead names are gone for good
+  // instead of being dropped again on every boot.
+  if (cfg_stale) TinyCSaveSettings();
   // NOTE: autoexec slots are NOT started here. They're started later
   // from the first FUNC_LOOP via TinyCStartAutoexec() — see comment
   // in the FUNC_LOOP handler. Doing it here (during FUNC_INIT) caused
@@ -742,6 +800,8 @@ static void TinyCInit(void) {
   // Create the file-handle reservation mutex ONCE here (loopTask, before any VM task
   // spawns) so tc_alloc_file_handle() has no lazy first-call race across slot tasks.
   if (!tc_file_handle_mutex) tc_file_handle_mutex = xSemaphoreCreateMutex();
+  // Eingestellte Stackgroesse holen, BEVOR der erste Slot startet.
+  TinyCLoadStackCfg();
 #endif
   // calloc() zeroes memory but doesn't call C++ constructors for embedded objects.
   // WiFiUDP (NetworkUDP) needs proper construction or begin() crashes (NULL deref).
@@ -924,7 +984,9 @@ void CmndCheckPartition(void);
 void CmndTinyCIde(void);
 #ifdef ESP32
 void CmndTinyCStack(void);
+void CmndTinyCHttpRx(void);
 #endif
+void CmndTinyCUnload(void);
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -933,9 +995,9 @@ void CmndMatterCryptoTest(void);
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info|Ide"
+  "|Run|Stop|Reset|Exec|Info|Ide|Unload"
 #ifdef ESP32
-  "|Chkpt|Stack"
+  "|Chkpt|Stack|HttpRx"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
@@ -947,9 +1009,9 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
-  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload
 #ifdef ESP32
-  , &CmndCheckPartition, &CmndTinyCStack
+  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
@@ -1430,6 +1492,52 @@ void CmndTinyCStop(void) {
   ResponseCmndDone();
 }
 
+// UNLOAD a slot: stop the VM and give back everything the loader took -- the
+// bytecode buffer and the pre-sized VM heap. This is the difference between
+// "stop" and "free": a stopped slot still holds its program, which is why
+// stopping does not help when an allocation fails (Hans, 2026-08-17: slot
+// loaded and NOT running, largest free block still 16 284 B).
+// Returns the bytes the program buffer had, 0 if there was nothing to free.
+static uint32_t TinyCUnloadSlot(uint8_t slot_num) {
+  if (!Tinyc || slot_num >= TC_MAX_VMS) return 0;
+  TcSlot *s = Tinyc->slots[slot_num];
+  if (!s) return 0;
+  const uint32_t hatte = s->program_size;
+  TinyCStopVM(s);  // frees frame locals and heap
+  // ⚠️ MUST come before the memset below: TinyCStopVM parks the frame-locals
+  // buffers in the VM's reuse cache instead of returning them, and the memset
+  // would then zero the only pointers to them. See tc_frame_alloc().
+  tc_frame_cache_drain(&s->vm);
+  // The VM heap and the UDP-global table, unconditionally.
+  //
+  // TinyCStopVM() frees them too — but it returns early when the slot is
+  // already flagged torn_down, and NOTHING clears that flag on a load that
+  // does not also start the program. Every upload runs through here first, so
+  // the flag is set before tc_vm_load() installs the new program, and the next
+  // unload skips the teardown. The memset below then zeroes the only pointer
+  // to a heap that was never freed. Measured on the C3 (2026-08-18): upload a
+  // program declaring 9000 slots, TinyCUnload, and 1 KB of 40 comes back —
+  // once per upload, until the device is rebooted. Both calls are idempotent.
+  tc_free_all_frames(&s->vm);
+  tc_heap_free_all(&s->vm);
+  if (s->vm.udp_globals) { free(s->vm.udp_globals); s->vm.udp_globals = nullptr; s->vm.udp_global_count = 0; }
+  if (s->vm.stack) { free(s->vm.stack); }
+  if (s->vm.globals) { free(s->vm.globals); }
+  if (s->vm.constants) { free(s->vm.constants); }
+  if (s->vm.const_data) { free(s->vm.const_data); }
+  memset(&s->vm, 0, sizeof(TcVM));
+  s->torn_down = false;           // the VM is gone; a later load starts clean
+  if (s->program) { free(s->program); s->program = nullptr; }
+  s->program_size = 0;
+  s->loaded = false;
+  s->filename[0] = '\0';          // nothing is loaded — the name would be a claim
+  s->cmd_prefix_saved[0] = '\0';
+  TinyCClearDurablePrefix(slot_num);
+  s->output_len = 0;
+  s->output[0] = '\0';
+  return hatte;
+}
+
 void CmndTinyCReset(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
   char *p = XdrvMailbox.data;
@@ -1442,12 +1550,19 @@ void CmndTinyCReset(void) {
   // buffers in the VM's reuse cache instead of returning them, and the memset
   // would then zero the only pointers to them. See tc_frame_alloc().
   tc_frame_cache_drain(&s->vm);
-  // Free remaining dynamic VM allocations before zeroing struct
+  // Free remaining dynamic VM allocations before zeroing struct. Heap and UDP
+  // globals unconditionally: TinyCStopVM() above skips its teardown on an
+  // already torn_down slot, and the memset then loses the pointers (see
+  // TinyCUnloadSlot).
+  tc_free_all_frames(&s->vm);
+  tc_heap_free_all(&s->vm);
+  if (s->vm.udp_globals) { free(s->vm.udp_globals); s->vm.udp_globals = nullptr; s->vm.udp_global_count = 0; }
   if (s->vm.stack) { free(s->vm.stack); }
   if (s->vm.globals) { free(s->vm.globals); }
   if (s->vm.constants) { free(s->vm.constants); }
   if (s->vm.const_data) { free(s->vm.const_data); }
   memset(&s->vm, 0, sizeof(TcVM));  // zero all fields and pointers
+  s->torn_down = false;             // VM wiped — a later load starts clean
   s->cmd_prefix_saved[0] = '\0';   // deliberate reset — drop the sticky prefix too
                                    // (it lives in TcSlot, not TcVM, so the memset
                                    // above doesn't clear it).
@@ -1456,6 +1571,25 @@ void CmndTinyCReset(void) {
   s->output[0] = '\0';
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d reset"), slot_num);
   ResponseCmndDone();
+}
+
+// TinyCUnload <slot> — give the slot's memory back: the bytecode buffer and the
+// VM heap the loader allocated. `TinyCStop` only stops the program, `TinyCReset`
+// only wipes the VM state; both leave the ~30 kB bytecode buffer allocated, so
+// neither helps when something else needs a big contiguous block (Hans,
+// 2026-08-17). The .tcb stays on the filesystem and autoexec still points at
+// it, so a reboot brings the program back.
+void CmndTinyCUnload(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  char *p = XdrvMailbox.data;
+  uint16_t len = XdrvMailbox.data_len;
+  uint8_t slot_num = tc_parse_cmd_slot(&p, &len);
+  const uint32_t frei_vorher = ESP_getMaxAllocHeap();
+  const uint32_t hatte = TinyCUnloadSlot(slot_num);
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d unloaded (%u B program), largest block %u -> %u"),
+         slot_num, (unsigned)hatte, (unsigned)frei_vorher, (unsigned)ESP_getMaxAllocHeap());
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Unload\":{\"Slot\":%d,\"Freed\":%u,\"MaxBlock\":%u}}"),
+             slot_num, (unsigned)hatte, (unsigned)ESP_getMaxAllocHeap());
 }
 
 void CmndTinyCExec(void) {
@@ -1649,6 +1783,12 @@ static void HandleTinyCPage(void) {
       cs->output_len = 0;
       cs->output[0] = '\0';
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM slot %d reset (web)"), cmd_slot);
+    } else if (cmd == "unload") {
+      // "clear the slot" — a stop keeps the bytecode and the VM allocations, so the
+      // RAM only comes back here (mi-hol, discussion #118). Works on a slot that is
+      // merely loaded, not running.
+      const uint32_t frei = TinyCUnloadSlot(cmd_slot);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM slot %d unloaded (web), %u bytes free'd"), cmd_slot, frei);
     } else if (cmd == "load" && Webserver->hasArg(F("file"))) {
 #ifdef USE_UFILESYS
       String file = Webserver->arg(F("file"));
@@ -1701,7 +1841,30 @@ static void HandleTinyCPage(void) {
         }
         total += count;
       }
-      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Deleted %d .tcb files"), total);
+      // The slot list must go with them. Deleting the files left every slot
+      // still listed at the top of the page, because /tinyc.cfg was untouched:
+      // an autoexec entry pointing at a file that no longer exists, and a
+      // "loaded" line for a program nobody can reload (Hans, 2026-08-17).
+      // "Delete all" means all: stop what runs, forget what was configured.
+      // ⚠️ The row shows `slot->filename` and falls back to the CONFIG name --
+      // clearing only one of the two leaves the entry standing (measured: page
+      // still listed "laeufer.tcb (0B)" after the first version of this fix).
+      // UNLOAD, not just stop: "delete all" is how Hans read it -- "und somit
+      // alle aus dem Speicher löschen". A stopped slot still holds its bytecode
+      // buffer, so the files would be gone while the memory stayed, and the row
+      // would sit there as "Rdy" with no name to show. Measured after the first
+      // version of this fix: page clean, status still Loaded=1.
+      int vergessen = 0;
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TinyCUnloadSlot(i);
+        if (Tinyc->slot_config[i].filename[0]) vergessen++;
+        Tinyc->slot_config[i].filename[0] = '\0';
+        Tinyc->slot_config[i].cmd_prefix[0] = '\0';
+        Tinyc->slot_config[i].autoexec = false;
+      }
+      TinyCSaveSettings();
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Deleted %d .tcb files, cleared %d slot entries"),
+             total, vergessen);
 #endif
     }
   }
@@ -1769,7 +1932,8 @@ static void HandleTinyCPage(void) {
         "<input type='hidden' name='slot' value='%d'>"
         "<button name='cmd' value='run' class='button' style='background:%s'>&#x25B6;</button>"
         "<button name='cmd' value='stop' class='button' style='background:%s'>&#x25A0;</button>"
-        "<button name='cmd' value='reset' class='button'>&#x21BB;</button>"
+        "<button name='cmd' value='reset' class='button' title='Reset the VM (keeps the program loaded)'>&#x21BB;</button>"
+        "<button name='cmd' value='unload' class='button' title='Clear the slot: give the bytecode and the VM RAM back'>&#x23CF;</button>"
         "<button name='cmd' value='autoexec' class='button' style='background:%s' title='Auto-execute on boot'>A</button>"
         "</form></div>"), si,
         active ? "#555" : "#47c266",    // Run: grey when active, green when idle
@@ -1829,7 +1993,7 @@ static void HandleTinyCPage(void) {
         "<br><div style='display:flex;gap:8px'>"
         "<button name='cmd' value='load' class='button'>Load into Slot</button>"
         "<button name='cmd' value='delall' class='button bred'"
-        " onclick=\"return confirm('Delete all .tcb files?')\">"
+        " onclick=\"return confirm('Delete all .tcb files, stop all slots and clear the slot list?')\">"
         "Delete All .tcb</button>"
         "</div></form></p></fieldset>"));
 
@@ -1913,7 +2077,11 @@ static void HandleTinyCPage(void) {
   WSContentSend_P(PSTR(
     "<fieldset><legend><b> Upload Program </b></legend>"
     "<form class='tc-upload' method='POST' action='/tc_upload' enctype='multipart/form-data'"
-    " onsubmit=\"this.action='/tc_upload?slot='+this.querySelector('[name=uslot]').value\">"
+    // The size goes into the URL, like every other client does it: the browser
+    // knows it, and the handler must not have to allocate for the worst case.
+    " onsubmit=\"var f=this.querySelector('[name=tcb]').files[0];"
+    "this.action='/tc_upload?slot='+this.querySelector('[name=uslot]').value"
+    "+(f?'&fsz='+f.size:'')\">"
     "<div style='display:flex;gap:8px;align-items:center'>"
     "<input type='file' name='tcb' accept='.tcb' style='flex:1'>"
     "<select name='uslot' style='width:auto'>"));
@@ -1952,7 +2120,8 @@ static void HandleTinyCPage(void) {
     "var b=this;b.disabled=1;b.textContent='Updating...';"
     "fetch('/cm?cmnd=TinyCIde').then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
     "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes). Re-open the IDE.');}"
-    "else{b.disabled=0;b.textContent='Update IDE';alert('IDE update failed (error '+d.error+'). The old IDE was kept.');}})"
+    "else{b.disabled=0;b.textContent='Update IDE';"
+    "alert('IDE update failed: '+(d.msg||('error '+d.error))+'\\n\\nThe old IDE was kept.');}})"
     ".catch(e=>{b.disabled=0;b.textContent='Update IDE';alert('IDE update request failed.');});\" "
     "class='button'>Update IDE</button>"
     "</p>"
@@ -1969,6 +2138,16 @@ static void HandleTinyCPage(void) {
     "if(u)document.getElementById('ide_url').value=u;"
     "document.getElementById('ide_url').onchange=function(){"
     "localStorage.setItem('tinyc_ide_url',this.value)};</script>"));
+#endif
+#ifdef USE_TINYC_REPO_IDE
+  // The other way round: no IDE on the device at all. /tcrepo is a ~4 KB page
+  // that pulls the compiler out of the repo into the browser and installs a
+  // repo example straight into a slot.
+  WSContentSend_P(PSTR(
+    "<p style='text-align:center'>"
+    "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run example from repo</button>"
+    "</p>"
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>Nothing stored on the device: the browser fetches the compiler from the repo, compiles there and uploads the .tcb. Needs internet in the browser.</p>"));
 #endif
   WSContentSend_P(PSTR("</fieldset>"));
 
@@ -2305,10 +2484,21 @@ void TinyCPrefixReheal(void) {
 // IDE). The ~150-190 KB LittleFS/SD write is bracketed by TinyCFsWritePause
 // (stops VM tasks so none touch flash during the cache-disabled close) + a
 // loop-WDT hold, mirroring the /ufsu big-write path. Returns bytes (>0) or <0.
+// The HTTP status of the last attempt, 0 when nothing reached the wire. Without
+// it -3 has to guess, and it guessed wrong: a GitHub rate limit (429) was
+// reported as "not enough RAM" (measured 2026-08-17).
+static int tc_ide_http = 0;
+
 static int tc_fetch_ide(const char *url) {
   if (!ufsp || !url || !url[0]) return -1;
   const char *dst = "/tinyc_ide.html.gz";
   const char *tmp = "/tinyc_ide.html.gz.tmp";
+  // A crash during an in-place write leaves a 0-byte IDE behind, and the /ide
+  // handler would serve that as if it were a page (Hans, 2026-08-17: reset
+  // mid-write, file left at 0 bytes). Too small to be an IDE = not an IDE.
+  { File old = ufsp->open(dst, "r");
+    if (old) { const uint32_t sz = (uint32_t)old.size(); old.close();
+      if (sz < 1000) ufsp->remove(dst); } }
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
   HTTPClientLight http;
 #else
@@ -2317,18 +2507,121 @@ static int tc_fetch_ide(const char *url) {
 #endif
   http.setTimeout(15000);
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+  // The full 16 kB TLS record buffer, explicitly: raw.githubusercontent.com and
+  // GitHub Pages do NOT answer Maximum Fragment Length Negotiation, so they send
+  // full-size records. With a smaller buffer this connects and then reads zero
+  // bytes (error -5). Scripts get the adaptive size instead — see
+  // tc_https_rx_bytes(); here we know the peer.
+  http.setTlsRxBuffer(TC_HTTPS_RX_MAX);
   bool begun = http.begin(url);
 #else
   bool begun = http.begin(http_client, url);
 #endif
   if (!begun) { AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch begin() failed")); return -2; }
   int code = http.GET();
+  tc_ide_http = code;
+
+  // NOTHING ON THE WIRE? Then it is very likely the 16.7 kB buffer that could
+  // not be allocated -- and the memory is held by LOADED programs, not by
+  // running ones: the loader takes the bytecode buffer plus the pre-sized VM
+  // heap, and neither a stop nor a reset gives them back (Hans, 2026-08-17:
+  // slot loaded, running=0, largest block still 16 284 B).
+  //
+  // So free the slots that are loaded but NOT running and try once more. They
+  // lose nothing: the .tcb is on the filesystem, autoexec still points at it,
+  // and the user asked for an IDE update. Running slots are left alone --
+  // stopping someone's energy manager to update an editor is not a trade we
+  // get to make; the message below names them instead. Same reasoning as the
+  // upload path (9d825e3ed), which frees the slot's own program on a failed
+  // allocation.
+  if (code <= 0 && Tinyc) {
+    uint32_t frei = 0; int n = 0;
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      // `running` is the flag the status page shows and the one that covers
+      // BOTH execution modes (own VM task and main loop); `task_running` alone
+      // would miss a main-loop program and unload it while it runs.
+      if (!s || !s->loaded || s->running || s->task_running) continue;
+      const uint32_t hatte = TinyCUnloadSlot(i);
+      if (hatte) { frei += hatte; n++; }
+    }
+    if (n > 0) {
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE fetch retrying — unloaded %d idle slot%s (%u B), "
+             "largest block now %u B"), n, n == 1 ? "" : "s", (unsigned)frei,
+             (unsigned)ESP_getMaxAllocHeap());
+      http.end();
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+      http.setTlsRxBuffer(TC_HTTPS_RX_MAX);
+      begun = http.begin(url);
+#else
+      begun = http.begin(http_client, url);
+#endif
+      if (begun) code = http.GET();
+      tc_ide_http = code;
+    }
+  }
+
   if (code != HTTP_CODE_OK && code != HTTP_CODE_MOVED_PERMANENTLY) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch HTTP %d"), code);
+    // Split by code: a failed TLS buffer allocation never reaches the wire and
+    // returns <= 0 within ~20 ms, which looks exactly like an unreachable host.
+    // Name the real cause instead (Hans, 2026-08-17) -- but only as a log line,
+    // never as a precondition: ESP_getMaxAllocHeap() understates what malloc()
+    // can still serve, so refusing on it would block attempts that would work.
+    if (code <= 0) {
+      // Which slots still hold memory? Only running ones can be left by now --
+      // the idle ones were freed above. Name them, and name the command that
+      // actually gives their memory back: a stop does not.
+      char laufen[40] = {0};
+      if (Tinyc) {
+        for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+          if (Tinyc->slots[i] && Tinyc->slots[i]->loaded) {
+            char eins[8]; snprintf(eins, sizeof(eins), "%s%d", laufen[0] ? "," : "", i);
+            strncat(laufen, eins, sizeof(laufen) - strlen(laufen) - 1);
+          }
+        }
+      }
+      if (laufen[0]) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch failed (no connection, HTTP %d) — needs ~16.7 kB "
+               "of contiguous RAM, largest free block is %u B. Slot(s) %s still hold their program: "
+               "TinyCUnload <slot> frees it (a stop does not), or reboot with autoexec off."),
+               code, (unsigned)ESP_getMaxAllocHeap(), laufen);
+      } else {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch failed (no connection, HTTP %d) — needs ~16.7 kB "
+               "of contiguous RAM, largest free block is %u B, and no slot holds a program. "
+               "A reboot defragments the heap."),
+               code, (unsigned)ESP_getMaxAllocHeap());
+      }
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch HTTP %d — %s"), code,
+             code == 429 ? "rate-limited, try again later"
+                         : (code == 404 ? "not found, check the URL" : "server refused"));
+    }
     http.end(); return -3;
   }
+  // ROOM FOR A SECOND COPY? The .tmp dance keeps the served IDE intact while the
+  // new one lands, but on a 320 kB filesystem already holding the ~234 kB IDE
+  // there are 28 kB left and the update can NEVER succeed -- exactly for the
+  // users who already have an IDE (Hans, 2026-08-17). When the free space does
+  // not cover the download, drop the old file first and stream straight to the
+  // target: the served IDE is gone for the duration, which is bad, but it is the
+  // only way the update can happen at all. Said out loud in the log.
+  const char *target = tmp;
+  bool in_place = false;
+  {
+    const int32_t clen = http.getSize();          // -1 when the peer chunks
+    const uint32_t free_kb = UfsInfo(1, 0);       // kB
+    const uint32_t need_kb = (clen > 0) ? (uint32_t)((clen + 1023) / 1024) : 0;
+    if (need_kb && free_kb < need_kb + 8) {
+      target = dst;
+      in_place = true;
+      ufsp->remove(dst);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE replaced in place — %u kB free, %u kB needed; "
+             "no room for a second copy, the served IDE is missing until this finishes"),
+             (unsigned)free_kb, (unsigned)need_kb);
+    }
+  }
   TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
-  File f = ufsp->open(tmp, "w");
+  File f = ufsp->open(target, "w");
   int written = 0; bool magic = false; bool write_err = false;
   if (f) {
     WiFiClient *stream = http.getStreamPtr();
@@ -2375,8 +2668,10 @@ static int tc_fetch_ide(const char *url) {
   http.end();
   TinyCFsWriteResume();
   if (written < 1000 || !magic) {                   // reject garbage/short downloads — keep the old IDE
-    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — kept old"), written, magic);
-    ufsp->remove(tmp);
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — %s"),
+           written, magic,
+           in_place ? "no IDE on the filesystem now, retry or upload it" : "kept old");
+    ufsp->remove(target);
     return -5;
   }
   // `written` counts what was DOWNLOADED, not what the FS actually persisted — an
@@ -2385,12 +2680,19 @@ static int tc_fetch_ide(const char *url) {
   // over the live IDE; a truncated-but-gzip-magic file would otherwise pass the
   // check above and brick the served IDE (Andreas, S3-ETH SD/FAT, cut at 12-37 KB).
   uint32_t on_disk = 0;
-  { File vf = ufsp->open(tmp, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
+  { File vf = ufsp->open(target, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
   if (write_err || on_disk != (uint32_t)written) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE write incomplete (%u/%d B on disk%s) — kept old"),
-           on_disk, written, write_err ? ", short-write" : "");
-    ufsp->remove(tmp);
+    // Name the filesystem, not just "short-write" -- that reads like a network
+    // problem while it usually is a full partition.
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE write incomplete (%u/%d B on disk%s), %u kB free — %s"),
+           on_disk, written, write_err ? ", short-write" : "", (unsigned)UfsInfo(1, 0),
+           in_place ? "no IDE on the filesystem now, retry or upload it" : "kept old");
+    ufsp->remove(target);
     return -7;
+  }
+  if (in_place) {                                  // already at its place
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE updated %d bytes from %s"), written, url);
+    return written;
   }
   // Atomically replace the live IDE. Try a direct rename first — LittleFS
   // overwrites atomically, so there is no window where the served IDE is
@@ -2409,6 +2711,27 @@ static int tc_fetch_ide(const char *url) {
 }
 #endif // USE_UFILESYS
 
+// What went wrong, in words. `tc_fetch_ide` returns a number, and a number in a
+// dialog ("error -3") tells nobody what to do -- Hans hits -3 regularly and the
+// answer is always the same: stop a slot, there is not enough contiguous RAM
+// (2026-08-17).
+static const char *tc_ide_fehler(int code) {
+  switch (code) {
+    case -1: return "no filesystem";
+    case -2: return "cannot start the request - check the URL";
+    case -3:
+      if (tc_ide_http == 429) return "the server is rate-limiting us (HTTP 429) - try again later";
+      if (tc_ide_http == 404) return "not found on the server (HTTP 404) - check the URL";
+      if (tc_ide_http > 0)    return "the server refused the request - see the log for the HTTP code";
+      return "no connection. Needs ~16.7 kB of RAM in one piece - "
+             "idle slots were freed automatically; TinyCUnload a running slot, or reboot";
+    case -5: return "download rejected - too short, or not a .gz";
+    case -6: return "cannot replace the old IDE (rename failed)";
+    case -7: return "write incomplete - filesystem full?";
+    default: return "unknown error";
+  }
+}
+
 // TinyCIde [url] — download tinyc_ide.html.gz from the repo (or a given URL) and
 // replace the served IDE on the filesystem. No Tasmota file-manager needed.
 //   TinyCIde            -> default repo (TINYC_DEFAULT_IDE_URL)
@@ -2423,7 +2746,8 @@ void CmndTinyCIde(void) {
   }
   int n = tc_fetch_ide(url);
   if (n > 0) { Response_P(PSTR("{\"TinyCIde\":{\"updated\":%d}}"), n); }
-  else       { Response_P(PSTR("{\"TinyCIde\":{\"error\":%d}}"), n); }
+  else       { Response_P(PSTR("{\"TinyCIde\":{\"error\":%d,\"msg\":\"%s\"}}"),
+                          n, tc_ide_fehler(n)); }
 #else
   ResponseCmndChar_P(PSTR("no filesystem"));
 #endif
@@ -2445,6 +2769,14 @@ static void HandleTinyCUpload(void) {
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload start: %s (slot %d)"), upload.filename.c_str(), slot_num);
 
+    // ⚠️ Web.upload_error is a GLOBAL and nobody clears it for us. One failed
+    // upload (a malloc that could not be served, an oversize file) therefore
+    // made every later upload answer 400 — with no log line of its own, because
+    // no branch here ran — until the device was rebooted. Measured on the C3:
+    // first upload after boot works, all following fail (2026-08-17). It is
+    // this request's error flag, so this request clears it.
+    Web.upload_error = 0;
+
     // Capture uploaded filename (prepend / for filesystem path)
     snprintf(Tinyc->upload_filename, sizeof(Tinyc->upload_filename), "/%s", upload.filename.c_str());
 
@@ -2459,33 +2791,74 @@ static void HandleTinyCUpload(void) {
     }
     TcSlot *s = Tinyc->slots[slot_num];
 
-    // Stop any running program in this slot
-    TinyCStopVM(s);
+    // Clear the slot COMPLETELY, do not just stop it.
+    //
+    // A stopped slot keeps its program and its whole VM memory -- 92 KB in
+    // Hans's case (2026-08-18). The upload then wanted its buffer, and after
+    // that the loader wanted 34 KB of heap in one piece: that did not add up,
+    // the attempt failed, and only the SECOND one worked, because the failed
+    // load had cleared the slot. The content is replaced here anyway, so give
+    // it back now instead of after the failure. Price: if the upload breaks
+    // off, the slot is empty -- but the .tcb is on the filesystem and can be
+    // loaded again.
+    const uint32_t frei_geworden = TinyCUnloadSlot(slot_num);
+    if (frei_geworden) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Upload: slot %d unloaded first (%u B program freed, largest block %u)"),
+             (int)slot_num, (unsigned)frei_geworden,
+#ifdef ESP32
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)
+#else
+             (unsigned)ESP.getMaxFreeBlockSize()
+#endif
+      );
+    }
     s->cmd_prefix_saved[0] = '\0';   // a new .tcb is being uploaded — drop the old
                                      // program's sticky prefix (new main() re-registers).
     TinyCClearDurablePrefix(slot_num);  // and the persisted copy — new program may differ
     // Allocate upload buffer.
     //
-    // Sizing: the HTTP client may send `?fsz=N` (matches the `/ufsu` upload
-    // convention used by push_tcb.sh) — if present we allocate exactly that
-    // (clamped to TC_MAX_PROGRAM). Without the hint we fall back to the full
-    // TC_MAX_PROGRAM. This avoids the failure mode where a 3 KB .tcb upload
-    // fails because the device's heap is too fragmented to provide a single
-    // contiguous 64 KB block.
+    // Sizing, in this order:
+    //   1. `?fsz=N` from the client (the `/ufsu` convention push_tcb.sh, the
+    //      IDE and the Repository box all follow) — the exact file size.
+    //   2. the request's Content-Length. For a multipart POST that is the file
+    //      plus a few hundred bytes of MIME boundary, so it is an upper bound,
+    //      not a guess.
+    //   3. TC_MAX_PROGRAM.
+    //
+    // Step 2 exists because step 3 is not a fallback on a device without
+    // PSRAM: TC_MAX_PROGRAM is 128 KB, and no ESP32-C3 has that in ONE piece
+    // even freshly booted (Hans, 2026-08-18: 147 kB free, largest block
+    // 114 688 — a 30 689 B upload asked for 131 072 and failed). Every client
+    // that sends `fsz` worked on the same device in the same minute; only the
+    // manual form on /tc, which did not, could never succeed.
     //
     // Allocation strategy: PSRAM first on ESP32 (avoids fragmented internal
     // heap on long-running devices with serial scripts etc.), then internal.
     if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
     size_t alloc_size = TC_MAX_PROGRAM;
+    const char *size_src = "max";
+    bool sized = false;
     if (Webserver->hasArg(F("fsz"))) {
       long fsz = Webserver->arg(F("fsz")).toInt();
       if (fsz > 0) {
         // Add a small headroom (16 B) so an off-by-one in the client's fsz
         // doesn't immediately trip the "too large" branch in UPLOAD_FILE_WRITE.
         size_t hint = (size_t)fsz + 16;
-        if (hint < alloc_size) alloc_size = hint;
+        if (hint < alloc_size) { alloc_size = hint; size_src = "fsz"; sized = true; }
       }
     }
+#ifdef ESP32
+    // No hint: take the body length the client announced. ESP8266's web server
+    // has no accessor for it, and there TC_MAX_PROGRAM is 4 KB anyway, so the
+    // fallback costs nothing.
+    if (!sized) {
+      int clen = Webserver->clientContentLength();
+      if (clen > 0 && (size_t)clen < alloc_size) {
+        alloc_size = (size_t)clen; size_src = "content-length"; sized = true;
+      }
+    }
+#endif
+    (void)sized;
     Tinyc->upload_alloc_size = alloc_size;
 #ifdef ESP32
     Tinyc->upload_buf = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2495,10 +2868,44 @@ static void HandleTinyCUpload(void) {
 #else
     Tinyc->upload_buf = (uint8_t *)malloc(alloc_size);
 #endif
+    // Last resort on a fragmented heap: drop the program THIS slot is holding
+    // and try once more.
+    //
+    // ⚠️ Seit der Slot beim Upload-Start ohnehin geräumt wird (siehe oben),
+    // greift dieser Zweig nur noch, wenn s->program aus einer anderen Quelle
+    // stammt. Er bleibt als Netz stehen, ist aber nicht mehr der Normalfall.
+    //
+    // The old program is a block of nearly the same size, in one piece, and it
+    // is about to be replaced anyway -- freeing it usually hands the allocator
+    // back exactly the hole the new program fits into. Without this a device
+    // that had been running for a while refused a 30 KB upload that went
+    // through immediately after a reboot (Hans, 2026-08-17: free heap 29 KB but
+    // largest block only 9 KB).
+    //
+    // Deliberately only AFTER the normal attempt failed: while memory is
+    // healthy the slot keeps its program until the new one has arrived, so a
+    // failed upload leaves the device as it was. Once we are down here that
+    // trade is already lost -- an upload that cannot allocate leaves the slot
+    // unusable either way, and the .tcb is still on the filesystem.
+    if (!Tinyc->upload_buf && s->program) {
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload malloc(%u) failed, freeing slot %d's program (%u B) and retrying"),
+        (unsigned)alloc_size, (int)slot_num, (unsigned)s->program_size);
+      free(s->program);
+      s->program = nullptr;
+      s->program_size = 0;
+      s->loaded = false;
+#ifdef ESP32
+      Tinyc->upload_buf = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!Tinyc->upload_buf) { Tinyc->upload_buf = (uint8_t *)malloc(alloc_size); }
+#else
+      Tinyc->upload_buf = (uint8_t *)malloc(alloc_size);
+#endif
+    }
+
     if (!Tinyc->upload_buf) {
       Web.upload_error = 1;
-      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload malloc(%u) failed — free heap=%u largest block=%u"),
-        (unsigned)alloc_size,
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload malloc(%u, from %s) failed — free heap=%u largest block=%u"),
+        (unsigned)alloc_size, size_src,
         (unsigned)ESP_getFreeHeap(),
 #ifdef ESP32
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)
@@ -2510,6 +2917,16 @@ static void HandleTinyCUpload(void) {
     }
     Tinyc->upload_received = 0;
     Tinyc->upload_active = true;
+    // What the buffer did to the free run -- the number next to it answers
+    // "why does the loader find no 34 KB in one piece a moment later?"
+    AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Upload buffer %u B from %s, largest block now %u"),
+           (unsigned)alloc_size, size_src,
+#ifdef ESP32
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)
+#else
+           (unsigned)ESP.getMaxFreeBlockSize()
+#endif
+    );
     TC_HEAPLOG("upload.start");
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
@@ -2578,11 +2995,50 @@ static void HandleTinyCUpload(void) {
 #endif
       } else {
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load error: %s"), tc_error_str(err));
-        free(s->program);
-        s->program = nullptr;
-        s->program_size = 0;
-        s->loaded = false;
-        Web.upload_error = 1;
+        bool gerettet = false;
+#ifdef USE_UFILESYS
+        // SECOND ATTEMPT from the file when memory ran out.
+        //
+        // Hans (2026-08-18) did exactly this by hand: first upload fails,
+        // second one goes through. The reason is order, not amount -- the
+        // upload buffer (~31 KB there) sits in the MIDDLE of the space the
+        // slot unload just freed and splits the large free run. The loader
+        // then wants 34 KB IN ONE PIECE and does not find it. Writing the
+        // program out, giving the buffer back and loading from the file puts
+        // both next to each other again -- the same effect as his second
+        // attempt, without anyone having to make it. Measured on the C3
+        // (2026-08-18): a 20 KB buffer left 22 KB largest block, the loader's
+        // 35 KB failed, and the retry from file loaded the slot.
+        if (err == TC_ERR_OUT_OF_MEMORY && ufsp) {
+          const char *saveName = Tinyc->upload_filename[0] ? Tinyc->upload_filename : TC_FILE_NAME;
+          File f = ufsp->open(saveName, "w");
+          bool geschrieben = false;
+          if (f) {
+            geschrieben = (f.write(s->program, s->program_size) == s->program_size);
+            f.close();
+          }
+          free(s->program);                 // Puffer weg -- das ist der Punkt
+          s->program = nullptr;
+          s->program_size = 0;
+          s->loaded = false;
+          if (geschrieben) {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: Load OOM — retrying from %s"), saveName);
+            gerettet = TinyCLoadFile(saveName, slot_num);
+            if (gerettet) {
+              strlcpy(Tinyc->slot_config[slot_num].filename, saveName,
+                      sizeof(Tinyc->slot_config[slot_num].filename));
+              TinyCSaveSettings();
+              AddLog(LOG_LEVEL_INFO, PSTR("TCC: Loaded from file after OOM (slot %d)"), slot_num);
+            }
+          }
+        }
+#endif
+        if (!gerettet) {
+          if (s->program) { free(s->program); s->program = nullptr; }
+          s->program_size = 0;
+          s->loaded = false;
+          Web.upload_error = 1;
+        }
       }
     } else {
       if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
@@ -3756,6 +4212,9 @@ static void HandleTinyCIde(void) {
   bool gzipped = false;
   File f;
   if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
+  // A truncated file (a crash during an in-place update leaves 0 bytes) is not
+  // an IDE -- serving it hands the browser an empty page with no clue why.
+  if (f && f.size() < 1000) { f.close(); }
   if (f) {
     gzipped = true;
   } else {
@@ -4456,6 +4915,9 @@ static void HandleTinyCWebOn(uint8_t handler_num) {
   Tinyc->current_web_handler = handler_num;
   Tinyc->web_content_begun   = 0;
   Tinyc->web_raw_active      = 0;
+  // A webOn handler serves a whole page of its own, so WebChart() has to start
+  // from scratch here as well -- see tc_chart_response_reset().
+  tc_chart_response_reset();
 #ifdef USE_HTTP_KEEPALIVE
   // Per-request opt-in: handler must call webKeepAlive() each iteration
   // to keep the TCP socket open. Reset here so a previously kept-alive
@@ -4750,9 +5212,7 @@ static void HandleTinyCUI(void) {
   TinyC_WebSetVar(si);
 
   // Reset WebChart state before rendering
-  tc_chart_seq = 0;
-  tc_chart_lib_sent = false;
-  tc_chart_time_base = 0;
+  tc_chart_response_reset();
 
   // AJAX mode (m=1): just re-render widgets via WebUI() callback
   if (Webserver->hasArg(F("m"))) {
@@ -5269,6 +5729,9 @@ static void tc_ide_serve_task(void *param) {
   bool gzipped = false;
   File f;
   if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
+  // A truncated file (a crash during an in-place update leaves 0 bytes) is not
+  // an IDE -- serving it hands the browser an empty page with no clue why.
+  if (f && f.size() < 1000) { f.close(); }
   if (f) {
     gzipped = true;
   } else {
@@ -5594,7 +6057,8 @@ static void TC_DLServerLoop(void) {
 
 #endif // ESP32
 
-#ifdef USE_MQTT
+// MQTT-Brücke — siehe den Hinweis in xdrv_124_tinyc_vm.h: hier stand ein
+// `#ifdef USE_MQTT`, das den ganzen Block in jedem Bau entfernt hat.
 /*********************************************************************************************\
  * MQTT subscribe / publish bridge for TinyC scripts
  * Scripts subscribe to external topics via mqttSubscribe("foo/#") and receive
@@ -5732,7 +6196,6 @@ static bool tc_mqtt_data_handler(void) {
 // NOTE: no tc_mqtt_clear() — subs persist across script reloads so in-flight
 // messages aren't lost during a TinyCRun. Scripts that want a clean slate
 // should call mqttUnsubscribe() for their topics in OnExit().
-#endif  // USE_MQTT
 
 /*********************************************************************************************\
  * Dynamic task spawn — spawnTask / killTask / taskRunning (ESP32 only)
@@ -5812,7 +6275,38 @@ bool tc_current_is_spawn_worker() {
 // free; Andreas caught it). xTaskCreate's stack arg is likewise in bytes on ESP-IDF,
 // so VmTaskStack/stack_bytes and this number are the same unit and directly comparable.
 void CmndTinyCStack(void) {
-  Response_P(PSTR("{\"" D_PRFX_TINYC "Stack\":{\"VmTaskStack\":%d"), (int)TC_VM_TASK_STACK);
+  // With a number: set the new size (takes effect on the next slot start).
+  if (XdrvMailbox.payload > 0) {
+    long v = XdrvMailbox.payload;
+    if (v < TC_VM_STACK_MIN) v = TC_VM_STACK_MIN;
+    if (v > TC_VM_STACK_MAX) v = TC_VM_STACK_MAX;
+    tc_vm_stack_bytes = (uint16_t)v;
+#ifdef USE_UFILESYS
+    if (ufsp) {
+      File f = ufsp->open("/tinyc_stack.cfg", "w");
+      if (f) { f.printf("%u\n", (unsigned)tc_vm_stack_bytes); f.close(); }
+    }
+#endif
+    if (tc_vm_stack_bytes < TC_VM_STACK_WARN) {
+      // Not refused, but said out loud: below ~10 kB this is no longer safe for
+      // a script that calls saveVars() from main() -- the path fwrite ->
+      // LittleFS -> SPI flash alone needs some 3 kB.
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM stack %u B — tight; watch StackFreeMin"),
+             (unsigned)tc_vm_stack_bytes);
+    }
+  }
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Stack\":{\"VmTaskStack\":%d,\"Default\":%d"),
+             (int)tc_vm_stack_bytes, (int)TC_VM_TASK_STACK);
+  // The VM tasks themselves -- exactly the number the size is chosen from.
+  if (Tinyc) {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (!s || !s->task_handle || !s->task_running) continue;
+      uint32_t freeb = (uint32_t)uxTaskGetStackHighWaterMark(s->task_handle);
+      ResponseAppend_P(PSTR(",\"tinyc_vm%d\":{\"Slot\":%d,\"StackFreeMin\":%u}"),
+                       i, i, freeb);
+    }
+  }
   tc_spawn_pool_lock();
   for (int i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
     TcSpawnTask *e = &tc_spawn_pool[i];
@@ -5823,6 +6317,34 @@ void CmndTinyCStack(void) {
   }
   tc_spawn_pool_unlock();
   ResponseAppend_P(PSTR("}}"));
+}
+
+// TinyCHttpRx [bytes] — TLS receive buffer for httpGet()/httpPost() from a
+// script. 0 (default) picks it per request: the full 16 kB while the heap can
+// serve one contiguous 16.7 kB block, else 4 kB. Pin it when a peer needs a
+// specific size -- a server that ignores Maximum Fragment Length Negotiation
+// (raw.githubusercontent.com, GitHub Pages) sends full records and reads as
+// "connected, 0 bytes, error -5" with a small buffer, while a 16 kB request
+// that cannot be allocated reads as "unreachable host" with no diagnosis at
+// all (Hans, C3 with a ~30 kB program, 2026-08-17).
+// Runtime only, not persisted: this is a property of the peer a script talks
+// to, and belongs in autoexec next to the script, not in a config file.
+void CmndTinyCHttpRx(void) {
+  if (!Tinyc) { ResponseCmndChar_P(PSTR("not ready")); return; }
+  if (XdrvMailbox.data_len > 0) {
+    long v = XdrvMailbox.payload;
+    if (v <= 0) { v = 0; }                       // 0 = automatic
+    else {
+      if (v < 512) v = 512;
+      if (v > TC_HTTPS_RX_MAX) v = TC_HTTPS_RX_MAX;
+    }
+    Tinyc->https_rx_bytes = (uint16_t)v;
+  }
+  Response_P(PSTR("{\"" D_PRFX_TINYC "HttpRx\":{\"Bytes\":%u,\"Mode\":\"%s\",\"Now\":%u,\"MaxBlock\":%u}}"),
+             (unsigned)Tinyc->https_rx_bytes,
+             Tinyc->https_rx_bytes ? "pinned" : "auto",
+             (unsigned)tc_https_rx_bytes(),
+             (unsigned)ESP_getMaxAllocHeap());
 }
 
 // FreeRTOS task body — executes the user function to completion or stop-request.
@@ -6536,15 +7058,11 @@ bool Xdrv124(uint32_t function) {
       break;
     case FUNC_MQTT_INIT:
       tc_all_callbacks_id(TC_CB_ON_MQTT_CONNECT);
-#ifdef USE_MQTT
       tc_mqtt_resubscribe();
-#endif
       break;
-#ifdef USE_MQTT
     case FUNC_MQTT_DATA:
       result = tc_mqtt_data_handler();
       break;
-#endif
     case FUNC_TIME_SYNCED:
       tc_all_callbacks_id(TC_CB_ON_TIME_SET);
       break;
@@ -6663,11 +7181,7 @@ bool Xdrv124(uint32_t function) {
       }
 #endif
       // Reset WebChart state before calling WebPage()
-      tc_chart_seq = 0;
-      tc_chart_lib_sent = false;
-      tc_chart_width = 0;
-      tc_chart_height = 0;
-      tc_chart_time_base = 0;
+      tc_chart_response_reset();
       // Wrap charts in block container to prevent inline-block cascading width expansion
       WSContentSend_P(PSTR("<div style='display:block;width:100%%;overflow:hidden'>"));
       // Call user's WebPage() on all active slots
@@ -6742,6 +7256,9 @@ bool Xdrv124(uint32_t function) {
       break;
     case FUNC_WEB_ADD_HANDLER:
       WebServer_on(PSTR("/tc"), HandleTinyCPage);
+#ifdef USE_TINYC_REPO_IDE
+      WebServer_on(PSTR("/tcrepo"), HandleTinyCRepoIde);
+#endif
       Webserver->on("/tc_upload", HTTP_POST, HandleTinyCUploadDone, HandleTinyCUpload);
       Webserver->on("/tc_upload", HTTP_OPTIONS, HandleTinyCUploadCORS);
       // CORS preflight handler MUST be registered BEFORE the HTTP_ANY catch-all

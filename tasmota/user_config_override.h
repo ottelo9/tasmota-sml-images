@@ -319,6 +319,24 @@
   #define USE_TINYC          //Enable TinyC VM (XDRV_124)
   #define USE_TINYC_IDE      //Enable self-hosted browser IDE (requires USE_UFILESYS)
 
+  //-- Eigene Quellen statt gemus Repo.
+  //-- REPO    = Ordner mit den .tcb, den die Repository-Box auf /tc anzeigt.
+  //--           Sie liest dort index.txt (eine Datei je Zeile) und laedt die
+  //--           gewaehlte .tcb im Browser direkt in den Slot. Ohne Slash am
+  //--           Ende, den haengt die Seite selbst an. Max. 199 Zeichen.
+  //--           Zur Laufzeit uebersteuerbar mit /tinyc_repo.cfg (leere Datei =
+  //--           Box aus).
+  //-- IDE_URL = Ziel von `TinyCIde`, das die ausgelieferte tinyc_ide.html.gz
+  //--           ersetzt. Vollstaendiger Dateiname, kein Slash dahinter.
+  //-- Wirkt nur mit den #ifndef-Guards in xdrv_124_tinyc.ino (Zeilen 35/42).
+  #define TINYC_DEFAULT_REPO    "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc/bytecode"
+  #define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/tinyc/tinyc_ide.html.gz"
+
+  //-- TLS-Empfangspuffer: seit gemus a52ccc35c waehlt der Treiber selbst
+  //-- zwischen 16384 und 4096, je nach groesstem freiem Block. Kein #define
+  //-- noetig; `TinyCHttpRx <bytes>` klemmt ihn zur Laufzeit fest, falls ein
+  //-- Gegenstelle die Automatik nicht passt (0 = automatisch).
+
 #endif // OTTELO_VARIANT_TC
 
 
