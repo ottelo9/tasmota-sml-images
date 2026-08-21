@@ -19549,13 +19549,15 @@ static inline bool tc_slot_dispatchable(const TcSlot *s) {
 // sensorGet() that suddenly takes 400 ms costs the whole loop.
 static bool tc_slot_web_ready(TcSlot *s, const char *name, bool may_wait = true) {
   if (!s || !s->loaded || s->vm.error != TC_OK) { return false; }
-  // A STOPPED slot has no VM task, so it can never become dispatchable - the
-  // wait below would burn the whole budget on every callback of every request.
-  // Measured on a C3 (Hans, 2026-08-20) with slot 0 loaded but not running:
-  // /tc_api answered instantly, the main page took 3.6 s and its sensor fetch
-  // 5.0 s. Nothing was wrong with the device; it was waiting for a task that
-  // does not exist. Loaded-but-not-running is the normal state after an upload.
-  if (!s->running) { return false; }
+  // No task AND not dispatchable right now: nothing can change that, so the
+  // budget loop below would burn its full time on every callback of every
+  // request. Measured on a C3 (Hans, 2026-08-20) with a freshly uploaded,
+  // never-started slot 0: /tc_api instant, main page 3.6 s, sensor fetch 5.0 s.
+  // ⚠️ NOT `!s->running` alone. A program without TaskLoop ends its task after
+  // main() and is halted-and-dispatchable from then on - callbacks still fire.
+  // Testing running alone drops exactly those programs from every page
+  // (sml_chart: buttons present, not a single row).
+  if (!s->running && !tc_slot_dispatchable(s)) { return false; }
   // ⚠️ Nothing to render means nothing to wait for AND nothing to report lost.
   // Most scripts define one or two of WebCall/WebPage/WebUI/JsonCall, so without
   // this the fan-out waits on -- and counts a skip for -- callbacks that do not
