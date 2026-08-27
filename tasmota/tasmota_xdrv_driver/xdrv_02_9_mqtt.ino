@@ -999,6 +999,10 @@ bool MqttTLSEnabled(void) {
   return Mqtt.mqtt_tls;
 }
 
+#ifndef MQTT_RETRY_CEILING_SECS
+#define MQTT_RETRY_CEILING_SECS 120        // MQTT reconnect backoff ceiling (seconds). Default 120 = upstream. Raise it (e.g. 600 in user_config_override.h) to cut reconnect/DNS churn on a power-starved node during a long outage so the radio can sleep deeper (Hermann/Gantrisch).
+#endif
+
 void MqttDisconnected(int state) {
   /*
   // Possible values for state - PubSubClient.h
@@ -1017,7 +1021,7 @@ void MqttDisconnected(int state) {
   Mqtt.connected = false;
 
   Mqtt.retry_counter = Settings->mqtt_retry * Mqtt.retry_counter_multiplier;
-  if (Mqtt.retry_counter < 120) { Mqtt.retry_counter_multiplier++; }
+  if (Mqtt.retry_counter < MQTT_RETRY_CEILING_SECS) { Mqtt.retry_counter_multiplier++; }
 
   if (MqttClient.connected()) {
     MqttClient.disconnect();

@@ -26,15 +26,14 @@ uint32_t SML_SetOptions(uint32_t in);
 
 // Forward declarations for MQTT bridge helpers — defined in xdrv_124_tinyc.ino
 // (after this header is included). Needed because tc_syscall() below calls them.
-// ⚠️ KEIN `#ifdef USE_MQTT` mehr. Das war nie ein Schalter, den jemand setzt:
-// Tasmota hat ihn 2017 abgeschafft (Changelog 3.1.13, "Add option to disable
-// MQTT as define USE_MQTT" — und wieder entfernt, als MQTT zum Kern wurde).
-// `xdrv_02_9_mqtt.ino` kennt ihn nicht, `MqttPublishPayload` wird immer
-// übersetzt. Unsere Gates haben also NICHT "MQTT abgeschaltet abgefangen",
-// sondern die MQTT-Syscalls in JEDEM Bau herausgeschnitten — mqttPublish,
-// mqttSubscribe, OnMqttData, alles. Gefunden von Hans (2026-08-18), nachdem
-// mqttPublish auf seinem Gerät -1 lieferte; meine eigene Probe am C3 hatte
-// dasselbe gezeigt und ich hatte es für "dieser Bau hat kein MQTT" gehalten.
+// ⚠️ NO `#ifdef USE_MQTT` any more. It was never a switch anybody sets:
+// Tasmota dropped it in 2017 (changelog 3.1.13, "Add option to disable MQTT as
+// define USE_MQTT" — removed again once MQTT became core). `xdrv_02_9_mqtt.ino`
+// does not know it, `MqttPublishPayload` is always compiled. So our gates did
+// NOT "handle MQTT being off", they cut the MQTT syscalls out of EVERY build —
+// mqttPublish, mqttSubscribe, OnMqttData, all of them. Found by Hans
+// (2026-08-18) when mqttPublish returned -1 on his device; my own probe on the
+// C3 had shown the same and I had read it as "this build has no MQTT".
 int tc_mqtt_subscribe(const char *topic);
 int tc_mqtt_unsubscribe(const char *topic);
 
@@ -269,13 +268,13 @@ static FS *tc_file_path(char *path) {
 #ifndef TC_VM_TASK_STACK
   #define TC_VM_TASK_STACK   12288
 #endif
-// ...und zur Laufzeit einstellbar: `TinyCStack <bytes>` schreibt den Wert nach
-// /tinyc_stack.cfg, er gilt ab dem naechsten Start eines Slots. 12 KB je Slot
-// sind auf einem 4-MB-C3 mit drei Slots viel Speicher, den ein einfaches
-// Skript nie braucht -- wie viel es WIRKLICH braucht, sagt dieselbe
-// Bereitstellung als StackFreeMin (gemu 2026-08-17).
-// Untergrenze mit Bedacht: der Pfad saveVars() -> fwrite -> LittleFS ->
-// SPI-Flash frisst allein rund 3 KB (siehe die Absturzgeschichte oben).
+// ...and settable at runtime: `TinyCStack <bytes>` writes the value to
+// /tinyc_stack.cfg and it applies from the next start of a slot. On a 4 MB C3
+// with three slots, 12 KB per slot is a lot of memory a simple script never
+// needs -- how much it REALLY needs is reported by the same facility as
+// StackFreeMin (gemu 2026-08-17).
+// Mind the lower bound: the path saveVars() -> fwrite -> LittleFS -> SPI flash
+// eats about 3 KB on its own (see the crash story above).
 #define TC_VM_STACK_MIN      6144
 #define TC_VM_STACK_MAX      32768
 #define TC_VM_STACK_WARN     10240
@@ -345,13 +344,13 @@ extern uint16_t tc_vm_stack_bytes;
 // appends don't need it). The loader warns (still loads) on a .tcb abi_rev mismatch.
 #include "xdrv_124_tinyc_spp.h"
 
-#define TC_SYSCALL_ABI     24    // V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || VORHER V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || VORHER V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || VORHER V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || VORHER V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
+#define TC_SYSCALL_ABI     27    // V27: NO new syscall -- twelve new OPCODES (0xB6..0xC1) for packed 16-bit arrays, `int16[]` and `uint16[]`. Two bytes per element instead of four: (n+1)/2 slots, element i at ((int16*)base)[i]. Same purpose as byte[], one step finer -- byte[] saves four times the RAM but costs resolution, which is the whole reason WebChartQ's scale and offset exist; an int16 carries a temperature in hundredths of a kelvin, a raw ADC word or a Modbus register with NO decoding, at half the RAM of an int[]. Measured on a 1441-sample ring: float 5.6 KB, int16 2.8 KB, byte 1.4 KB. ⚠️ Signedness lives in the LOAD, not in the storage: STORE_*_I16 writes the same sixteen bits for int16 and uint16 alike, while the compiler picks the sign-extending (0xB6/0xB8/0xBA/0xBC) or zero-extending load (0xBE..0xC1) from the declared type. That is why uint16 costs four opcodes rather than eight. ⚠️ The byte flag in a ref grew into a TWO-BIT field (heap 8-9, global 16-17, local 24-25): 00 = int32, 01 = byte, 10 = int16, 11 = uint16. The 01 is the old byte bit unchanged, so every .tcb in the field still means exactly what it meant -- the ABI step hangs on the new opcodes alone, and the compiler stamps it precisely when it emits one (hook in emit()). An older device refuses the .tcb instead of dying on BAD_OPCODE mid-loop. || PREVIOUS V26: NO new syscall — a BUG FIX that changes what existing ones accept. httpGet, httpPost, smlGetStr and tasmCmd filled their destination buffer with int32 SLOTS while tc_ref_maxlen() already answered in BYTES for a packed byte[]. Handing any of them a byte[] therefore wrote four times the array's size and trampled the neighbouring heap -- silently, and only once a response was long enough to reach past the buffer. All four now go through tc_chr_put(), like the sprintf/strcat family has since 1.6.58. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 26 whenever a byte[] is passed to one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. This is what made the SML family's text buffers convertible: on sml_chart_ct002 they were 18.7 KB of the 26.9 KB contiguous block. || PREVIOUS V25: + SYS_WEB_CHART_Q (545) -- WebChartQ(scale, offset), an affine decode applied to the NEXT WebChart's samples. It exists so a chart can be fed from a PACKED byte[] instead of a float[]: one byte per sample plus a scale/offset carries a temperature at 0.5 K over -40..87.5 degC, a humidity or an SOC at 0.4 %, for a QUARTER of the RAM. That matters because chart ring buffers are the largest single heap consumer on a C3 -- the shipped examples hold three float[1441] rings (5.7 KB each) out of a 64 KB TC_MAX_HEAP, and the heap is claimed as ONE contiguous block at load time. ⚠️ The byte[] side is NOT a pure append even though the syscall is: WebChart (166) is unchanged in number and signature, but the compiler now marks a byte[] array argument with the packed-ref flag bit, and OLDER firmware would strip that bit and read the array as float slots -- garbage, silently, with no missing-syscall complaint to point at it. The compiler therefore stamps abi_rev 25 on any WebChart whose array argument is a byte[] (CodeGenerator._istBytesVar), so an old device refuses the .tcb instead of drawing nonsense. A WebChart on a float[] still compiles byte-identically and keeps its old abi_rev. Also in this release, and needing no ABI at all because it is pure server-side HTML: the per-sample wire form changed from _tcA's [x,y] pairs to _tcAy's bare y-list plus x0/step, since the x axis was always the arithmetic sequence -(count-1-i)*interval + timebase. About 14 bytes per point became about 6 -- a 1441-point series went from ~20 KB of response body to ~8 KB. _tcA stays defined alongside it. || PREVIOUS V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || PREVIOUS V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || PREVIOUS V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || PREVIOUS V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || PREVIOUS V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // REMINDER: when bumping TC_RELEASE, also update the visible <h1> label
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
 // maintained; got stuck at "v1.3.20" through 5 releases until Andreas's
 // Claude flagged it during the v1.5.2 review.
-#define TC_RELEASE         "1.6.55"     // **TinyC 1.6.55: Diagramm-Layout endgueltig geradegezogen — der Nachtrag zu 1.6.54. Ein Diagramm kann sich in Tasmotas Layout NICHT selbst bemassen: die Seite steckt in einem inline-block, der sich nach seinem breitesten Kind richtet. Prozentbreite faellt darin auf die Mindestbreite 340 zusammen (am C3 gemessen: div 330 in einem 410 breiten Container), feste Breite laeuft rechts ueber, sobald der Container schmaler ist — beides hat gemu gesehen, erst zu schmal, dann rechtsbuendig. Jetzt bekommt der CONTAINER die Breite, einmal je Antwort neben der Diagrammbibliothek: `body>div{width:min(96vw,960px);box-sizing:border-box}`, und die Diagramme gehen auf width:100% davon. Damit teilen Diagramme, Knoepfe und Tabellen eine Breite und stehen zentriert wie frueher, passen aber zusaetzlich aufs Telefon. Zweite Regel im selben Block: `.tcc div{padding:0}` — Tasmota polstert JEDES div mit 5 px, auch die, die Google im Diagramm verschachtelt; jede Ebene schob die Zeichnung nach rechts, bis sie ueber die Kartenkante hing (Karte 120..1080, Zeichnung 135..1085). Genau das hat ottelos alter margin-left:-30px-Rahmen ausgeglichen. ⚠️ Skripte, die eigene Google-Charts-Divs ausgeben, brauchen dafuer `class='tcc'` — in sml_chart_common.tc erledigt. || VORHER 1.6.54: Diagramme OHNE WebChartSize sind jetzt so breit wie die Karte statt fest 960 px. Am C3 GEMESSEN (2026-08-19): 970-px-Diagramm in einem 552-px-Sichtfeld — die ganze Seite liess sich waagerecht schieben, auf dem Telefon jedes Mal. Dazu kam, dass zwei Skripte auf derselben Seite VERSCHIEDENE Breiten bekamen: tc_chart_width wird pro Antwort zurueckgesetzt, nicht pro Skript, also wirkt eine feste Breite auf alle NACHFOLGENDEN Skripte weiter und das erste Skript ohne eigene Angabe bekam die Vorgabe 960. Feste Breiten gibt es unveraendert ueber WebChartSize(w, h); WebChartSize(0, h) ist der ausdrueckliche Weg zur Kartenbreite. Die Beispiele setzen jetzt alle 0 und haben den alten Ausgleich margin-left:-30px verloren — der war nur fuer die feste Breite noetig und schob das Diagramm sonst links aus dem Bild (mi-hol, gemu2015/Sonoff-Tasmota#111). DAZU zwei Sachen aus derselben Ecke: die Knoepfe, die ein Skript mit webPageLabel() auf die Hauptseite stellt, verschwinden jetzt beim Anhalten des Slots — sie standen bis zum Neustart weiter da und fuehrten auf einen leeren Slot (mi-hol, Diskussion #118); page_slot[] wusste den Besitzer schon, es hat ihn nur niemand geraeumt. Und die TinyC-Konsole hat einen Knopf zum RAEUMEN des Slots bekommen (⏏, cmd=unload): Anhalten gibt den Bytecode und die VM-Zuteilungen NICHT zurueck, das tut erst TinyCUnload — bisher nur ueber die Kommandozeile. ⚠️ NICHT an Hardware geprueft: beide Aenderungen brauchen eine neue Firmware. DRITTENS (nur IDE, keine Firmware): der #include-Aufloeser der IDE faellt jetzt auf das REPO zurueck, wenn eine Datei weder lokal geladen noch auf dem Geraet liegt — erst examples/, dann examples/common/. Damit tut das, was die "Repo Examples"-Liste verspricht: sml_chart.tc auswaehlen, IP und Slot setzen, Run — vorher starb das am ersten #include. Gegen das echte GitHub geprueft: 4 Includes (auch die verschachtelten) geholt, uebersetzt zu denselben 18500 Byte wie die lokale Uebersetzung. VIERTENS, neu und per `USE_TINYC_REPO_IDE` abschaltbar: `/tcrepo` — eine ~6,5 kB grosse Seite AUS DEM FLASH, die ein Repo-Beispiel direkt in einen Slot bringt, OHNE dass die IDE auf dem Geraet liegt. Der Browser holt den Compiler aus dem Repo (tinyc_ide.html.gz, 236 kB, im Browser entpackt), loest die #includes ueber examples/ und examples/common/ auf, uebersetzt und laedt hoch. Warum die Seite vom GERAET kommen muss: eine https-Seite (z. B. die Doku auf github.io) darf einen http-LAN-Server gar nicht erst anfragen — GEMESSEN, der Browser blockt als Mixed Content, bevor irgendein CORS-Header gelesen wird. Vom Geraet aus sind Upload und Start same-origin. Am C3 durchgespielt: Compiler geholt, sml_chart.tc mit vier Includes uebersetzt (18500 Byte, wie lokal), in Slot 1 geladen und gestartet. Kostet 6524 Byte Flash, kein RAM. || VORHER 1.6.53: das Raeumen eines Slots gab den VM-Heap NICHT zurueck. TinyCStopVM() steigt bei einem bereits abgeraeumten Slot sofort wieder aus (`torn_down`), und NICHTS setzt dieses Kennzeichen zurueck, wenn ein Programm geladen, aber nicht gestartet wird — genau das macht jeder Upload. Danach loescht das memset in TinyCUnloadSlot() den einzigen Zeiger auf einen nie freigegebenen Heap. Am C3 GEMESSEN (2026-08-18): Programm mit 9000 Feld-Slots hochladen, TinyCUnload — von 40 kB kommt 1 kB zurueck, der groesste freie Block bleibt wo er war. Pro Upload einmal, bis zum Neustart. Das ist vermutlich ein guter Teil von Hans' „nach laengerer Laufzeit geht derselbe Upload nicht mehr". Jetzt geben Raeumen und Reset Heap, Rahmen und UDP-Globals BEDINGUNGSLOS zurueck und setzen `torn_down` zurueck. || VORHER 1.6.52: ein Upload, dessen Lader am Speicher scheitert, versucht es JETZT SELBST ein zweites Mal — aus der Datei. Hans hat genau das von Hand gemacht (2026-08-18): erster Upload scheitert, zweiter geht durch. Der Grund ist die Reihenfolge, nicht die Menge: der Upload-Puffer (bei ihm ~31 kB) liegt MITTEN in dem Bereich, den das Raeumen des Slots freigegeben hat, und zerteilt den grossen freien Lauf; der Lader will danach 34 kB AM STUECK und findet sie nicht. Also: Programm auf die Platte schreiben, den Puffer zurueckgeben, aus der Datei laden — dann liegt beides frisch nebeneinander. Dazu zwei Debug-Zeilen, die den groessten freien Block nach dem Raeumen und nach der Pufferzuteilung nennen: damit ist beim naechsten Mal SICHTBAR, ob der Puffer den Lauf zerteilt hat, statt es vermuten zu muessen. ⚠️ Was bleibt, ist Fragmentierung — Hans hat belegt, dass derselbe Upload auf einem Geraet mit Laufzeit scheitert und kurz nach dem Neustart durchgeht. Das Raeumen des Ziel-Slots nimmt den haeufigen Fall weg, keine Garantie. || VORHER 1.6.51: die MQTT-Syscalls waren in JEDEM Bau ausgeschnitten. Sie standen hinter `#ifdef USE_MQTT` — einen Schalter, den Tasmota im Januar 2017 (3.1.13) eingefuehrt und wieder entfernt hat, als MQTT zum Kern wurde. Er ist NIRGENDS definiert, `xdrv_02_9_mqtt.ino` kennt ihn nicht, `MqttPublishPayload` wird immer uebersetzt. Das Gate hat also nicht "abgeschaltetes MQTT abgefangen", sondern mqttPublish/mqttSubscribe/mqttUnsubscribe/OnMqttData aus jedem Geraet entfernt: mqttPublish lieferte IMMER -1. Gefunden von Hans (2026-08-18) — meine eigene Probe am C3 hatte dasselbe gezeigt, und ich hatte es fuer "dieser Bau hat kein MQTT" gehalten, statt nachzusehen, ob es den Schalter ueberhaupt gibt. Er hat die stille Variante danach an echter Hardware gegen einen echten Broker belegt: bei Stufe 0 keine MQT-Zeile, Werte kommen weiter alle 5 s an. Dazu zwei Sachen aus demselben Bericht: (1) ein gescheiterter Lader meldete "Stack overflow", wenn in Wahrheit der Speicher nicht reichte — dafuer gibt es jetzt TC_ERR_OUT_OF_MEMORY ("Out of memory"), ans Ende der Liste gehaengt, damit die bestehenden Nummern bleiben. (2) Ein Upload raeumt den Ziel-Slot jetzt SOFORT, statt ihn nur anzuhalten: ein angehaltener Slot haelt sein Programm und den VM-Speicher weiter (bei Hans 92 KB), und der Lader fand danach die 34 KB am Stueck nicht — erst der zweite Versuch ging durch, weil der erste beim Scheitern geraeumt hatte. || VORHER 1.6.50: mqttPublish nimmt jetzt LAUFZEIT-Zeichenketten und eine LOG-STUFE (ABI 24, Syscall 544). Zwei Dinge, die die Konstanten-Form nicht konnte (Hans, 2026-08-18): ein Thema, das erst zur Laufzeit entsteht — seines traegt den Geraetenamen, also ging er ueber den Befehl `Publish`, eine geparste Befehlszeile, um eine Funktion zwei Rahmen tiefer zu treffen — und ein STILLES Publizieren. Ein Regler, der alle 5 s seinen Sollwert schickt, schreibt bei der Vorgabe weblog 2 alle 5 s zwei Konsolenzeilen; wer den Log herunterdreht, verliert alles andere mit. `MqttPublishPayload()` kennt die Stufe LOG_LEVEL_NONE laengst und ueberspringt den Log dann ganz — nur TinyC kam nicht heran, weil der Syscall mit der Vorgabe aufrief. Jetzt: `mqttPublish(thema, wert, 0)` publiziert und sagt nichts. ⚠️ REIN ANHAENGEND: zwei Literale bleiben Syscall 297 und erzeugen BYTE-IDENTISCHES Bytecode (an dyson_tp02 und power_meter geprueft — unveraendert), die neue Form entsteht nur bei einer Laufzeit-Zeichenkette oder einer dritten Zahl. Ein Programm mit der neuen Form traegt abi_rev 24 und wird von aelterer Firmware abgewiesen; uebersetzt man FUER ein aelteres Geraet, bricht der Compiler mit Namen ab. Dazu: WebChart() setzt seinen Zustand bei JEDER Antwort zurueck — bisher nur vor /tc_ui und vor WebPage(), nicht aber fuer einen webOn-Handler, der seine eigene Seite ausliefert: dort bekam die ERSTE Anfrage nach dem Start den Google-Charts-Lader und jede spaetere zeichnete still leere Diagramme, bis zufaellig jemand /tc_ui oeffnete. || VORHER 1.6.49: die IDE uebersetzt jetzt FUER DAS GERAET, an dem sie haengt. Sie kennt dessen ABI laengst — /tc_api?cmd=status liefert sie, und es ist DASSELBE Feld "Device IP", ueber das auch die .tcb hochgeladen wird; das Ziel ist also nicht geraten, sondern konstruktionsbedingt richtig. Bisher diente die Zahl nur einer Warnung. Jetzt richtet sich die Uebersetzung danach, und das nutzt die beiden Arten von ABI-Bedarf verschieden: VERSCHMELZUNGEN sind entbehrlich — die unverschmolzene Form bedeutet dasselbe, also laesst der Compiler sie weg, wenn das Geraet sie nicht kennt (Programm bleibt korrekt, nur langsamer). SYSCALLS sind es nicht — wer bleSppConnect() aufruft, braucht ABI 20, hier gibt es keine aeltere gleichbedeutende Form; also harter Abbruch mit Namen statt einer .tcb, die auf dem Geraet an einem fehlenden Syscall stirbt. Gemessen an einem Skript mit Schleife: Ziel 23 -> abi_rev 23 (98 B), Ziel 22 -> 22 (97 B), Ziel 21 -> 21 (101 B), Ziel 20 -> abi_rev 2 (107 B) und laeuft damit auf beliebig alter Firmware. Kostet unverschmolzen rund 1,8x auf engen Ganzzahlschleifen und ~9 Prozent mehr Bytecode. Ohne erreichbares Geraet bleibt alles wie bisher (volles ABI) — und beides wird im Ausgabefenster GESAGT, damit niemand still langsameres Bytecode bekommt, ohne zu wissen warum. ⚠️ Die Warnung "Geraet aelter als IDE" ist entfallen: sie behauptete, eine .tcb koenne die falsche Firmware-Funktion aufrufen — das verhindert der Lader, und jetzt entsteht so eine .tcb gar nicht erst. Nur die Gegenrichtung (Geraet NEUER als die IDE) bleibt eine echte Warnung. Alle 225 Beispiele uebersetzen byte-identisch, die Erweiterung ist rein additiv. || VORHER 1.6.48: Notfallbehebung fuer die IDE aus 1.6.47 — sie stuerzte beim UEBERSETZEN ab, nicht erst beim Ausfuehren. Der Disassembler bekam in 1.6.47 die neuen Superinstruktionen, und im Zweig fuer LK_OP_ST/LL_OP_ST stand `opcode` statt `op` — eine Variable, die es in vm.js nirgends gibt. ES-Module laufen im strict mode, also ReferenceError: "opcode is not defined". Und da disassemble() nach JEDEM Uebersetzen automatisch die Disassembler-Ansicht fuellt (nicht erst auf Knopfdruck), traf es jedes Skript mit einer Zuweisung der Form x = y OP z oder x = y OP konst auf int-Locals — also praktisch jedes. Gemeldet von mi-hol (Issue #115), Behebung ist ein Wort. ⚠️ Die Lehre steht als Kommentar schon neben der Fundstelle: eine neue Superinstruktion braucht VIER Eintraege (tc_vm_step, tc_vm_run_slice_ex, den Bytecode-Scanner der Firmware, den IDE-Disassembler) PLUS den Simulator — und ein Disassembler-Fall, den niemand ausfuehrt, wird von keinem Test erwischt. An der Firmware und am Bytecode hat sich NICHTS geaendert; ABI bleibt 23. Wer 1.6.47 geflasht hat, braucht nur die neue IDE (TinyCIde aufrufen, Seite hart neu laden). || VORHER 1.6.47: die VM ist ueberall schneller, und ein eigener Schutzmechanismus hat rohe Web-Antworten getoetet. (1) FIRMWARE Webserver: rohe Scripter-Antworten kamen nur an, solange die Tasmota-WebUI im Browser offen war. Das 8-Sekunden-Sendebudget aus dem Wedge-Schutz (WS_SEND_BUDGET_MS, urspruenglich gegen einen an einem langsamen Client festhaengenden loopTask) verankerte seinen Startzeitpunkt NUR in WSContentBegin(). Ein Scripter->on1, das per won(1 "/v1/json") einen eigenen HTTP-Header mit wcs so(4) / wcs / wcf schreibt, laeuft da nie durch -- es mass also gegen den Start der VORHERIGEN Antwort. Lag der ueber 8 s zurueck, wurde die Verbindung geschlossen, BEVOR ein einziges Byte rausging: curl meldete "Empty reply from server". Fingerabdruck: der Endpunkt lebte nur, solange die WebUI offen war (deren ~2 s-Polling hielt den Zeitstempel frisch), und nach jedem beliebigen normalen Request exakt 8 s lang; der Handler lief und baute seinen JSON-String korrekt, nur ausgeliefert wurde nichts (ottelo, EcoTracker- und Shelly-Emulation). Das Budget wird jetzt PRO ANFRAGE verankert -- Ruecksetzung in PollDnsWebserver vor handleClient, Verankerung in WSContentBegin wie bisher UND spaetestens beim ersten Byte in _WSContentSend. Rohe Antworten bekommen dadurch auch den 2s-SO_SNDTIMEO je Schreibvorgang, den sie nie hatten; fuer normale Seiten aendert sich nichts. (2) TEMPO: der ESP32 fuehrt Bytecode jetzt auf der direkt gefaedelten Schleife aus (2,4x bis 3x, 671 -> 276 ns je Opcode), Frame-Locals werden wiederverwendet (ein Funktionsaufruf kostet 2,8 statt 11,8 us), und sechs Superinstruktionen fassen die haeufigsten Muster zusammen: i++ als Anweisung (0xB0), x = y OP z und x = y OP konst (0xB1/0xB2), deren Weitkonstanten-Zwilling (0xB3) und der Schleifenkopf if !(La CMP Lb|k) goto (0xB4/0xB5), der jede Schleife und jedes if trifft. Der Rumpf von bench_int schrumpfte von 33 auf 13 Opcodes. Gemessen auf .39 gegen Berry auf demselben Chip: Ganzzahl 923 -> 499 ms (Berry 401), Fliesskomma 477 -> 389 (212), Felder 802 -> 643 (2072), Aufrufe 968 -> 748 (810), Zeichenketten 179 -> 152 (97), gesamt 3353 -> 2433 ms gegen Berrys 3592 -- TinyC liegt damit 1,48x vorn. (3) WARNUNG ABI 20 -> 23: neu uebersetzte .tcb laufen NICHT auf aelterer Firmware. Seit ABI 21 VERWEIGERT der Lader eine .tcb mit hoeherer abi_rev, statt sie zu laden und dann mitten in der Schleife an einem unbekannten Opcode zu sterben. Also erst Firmware flashen, dann TinyCIde aufrufen und die IDE-Seite hart neu laden, und erst danach Skripte neu uebersetzen. (4) TC_HEAPLOG baut jetzt auch auf ESP32 -- vorher war es auf 8266 gegated und damit blind auf genau der Plattform mit dem ~1 KB-je-Slot-Neustart-Leck -- und setzt Marken im Inneren der VM-Task. Nur mit -DTINYC_HEAP_DEBUG, kostet normale Builds nichts. Damit per Messung ausgeschlossen: Frame-Locals-Cache, FreeRTOS-Tasklebenszyklus (2 Byte je 251 Zyklen), tc_vm_load, Persist-Restore, Programmpuffer. Die Drift von ~1028 B steht schon an der allerersten Marke IM Task. || VORHER 1.6.46: vier Neuerungen und ein Fehler, der jede zweite Seite still halbiert hat. (1) FIRMWARE Web-Callbacks: WebCall/WebPage/JsonCall prueften vm.halted UNGESPERRT und mit NULL Wartezeit und liessen den Slot dann aus. Ein Slot mit TaskLoop + delay(10) ist die halbe Zeit nicht halted -- also fehlte in der Haelfte aller Seitenaufbauten der GANZE Block dieses Skripts: keine Sensorzeile, kein Canvas, keine Fehlermeldung, kein Logeintrag. Von aussen sah das nach Browser oder WLAN aus. Gemessen von Rolf an max30102.tc: WebCall 11/12, WebPage 4/8, waehrend derselbe Slot ueber seinen webOn-Endpunkt 25/25 lieferte -- weil DER wartet. Jetzt wartet der Seitenaufbau auf das naechste nutzbare Fenster und entscheidet das UNTER dem Mutex, gedeckelt auf 400 ms fuer die ganze Seite (TC_WEB_PASS_BUDGET_MS). Nach dem Fix an .39 nachgemessen: 20/20 auf allen drei Endpunkten, auch wenn das delay() eine Funktion tief steckt, bei unveraenderter Latenz. ⚠️ Wer wartet, muss auf das RICHTIGE warten: ein TaskLoop, der eine Funktion tief bei delay() parkt, IST halted (Mutex frei), nur die Rahmentiefe steht auf 2 -- ein Warten allein auf halted meldet sofort 'bereit' und wird danach von der Reentrancy-Sperre abgewiesen. Genau daran scheiterte der erste Anlauf (0/20, inklusive der 1500-ms-Wartestelle von webOn). Es gibt jetzt EIN tc_slot_dispatchable() -- halted, kein Fehler, Rahmentiefe <=1, nicht geliehen --, auf das ALLE Wartestellen warten. Uebriggebliebene Ausfaelle werden gezaehlt: das nackte Konsolenkommando TinyC meldet \"WebSkip\":N je Slot, TinyCInfo zeigt es in den Webzeilen. Steigt die Zahl, ist der eigene TaskLoop zu beschaeftigt -- nicht der Browser. (2) COMPILER #if wertet jetzt den WERT eines Makros aus, nicht nur seine Existenz: '#define SIM 0' gefolgt von '#if SIM' war WAHR, weil nur eine Menge von Namen gefuehrt wurde. Ein Simulationsschalter auf 0 blieb damit an, und das Geraet meldete weiter 'SIMULATION aktiv'. Braucht nur die neue IDE. (3) BLE \"SPP\" -- eine BLEIBENDE GATT-Verbindung (ABI 20, bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump). Der bisherige GATT-Client verbindet, macht EINEN Vorgang und trennt -- richtig fuer eine Waage, falsch fuer einen Strom. UUIDs sind hier Zeichenketten (16 Bit oder volle 128 Bit); die alte int16-Variante erreicht einen proprietaeren Dienst gar nicht. Verifiziert an einem BlueRadios-Modul (EKG-Rekorder, 250 Saetze/s, null Synchronfehler). ⚠️ bleSppWrite zerlegt an der ATT-MTU -- ein 29 Byte langer Befehl passte vorher in keinen einzelnen Schreibvorgang und verliess den ESP nie, waehrend kurze Befehle immer durchgingen. Braucht eine Firmware mit USE_TINYC_BLE. (4) Bluetooth Classic / SPP (ABI 17/18, sppInit..sppScan + sppDeinit) -- serielle Verbindung zu JEDEM Classic-Geraet, das Protokoll lebt im SKRIPT. NUR der klassische ESP32 (BR/EDR) und nur mit USE_TINYC_SPP gegen ein Bluedroid-Framework; S3/C3/C6/P4 sind BLE-only. sppDeinit gibt die rund 85 KB des Stapels zurueck -- ohne das scheitert der naechste Slot-Neustart an der Speicheranforderung und meldet irrefuehrend 'Stack overflow'. (5) lvglChartUpdateMode (ABI 19) legt lv_chart_set_update_mode offen. Die LVGL-Vorgabe SHIFT macht bei jedem Wert die GANZE Diagrammflaeche ungueltig, CIRCULAR nur eine schmale Spalte -- auf einer 760x300-Flaeche Faktor ~250 und der Unterschied, ob eine 250-Hz-Kurve darstellbar ist. Ausserdem: die lwIP-PCB-Warnung zaehlte ihren eigenen Beobachter mit, der JPEG-Display-Spiegel wird jetzt auf einen wirklich vorhandenen Encoder gegatet, und Doku zu WebChart -- Nullpunkt per WebChartJS(\"o.vAxis.viewWindow={min:0}\") bei unbekanntem Maximum, und WebChartSize ist EINE Einstellung je Seitenaufbau, die in Slot-Reihenfolge weiterwandert (ein Skript ohne eigenen Aufruf erbt die Breite des Vorgaengers statt der Vorgabe -- Ursache ungleich breiter Diagramme bei mehreren Skripten). ⚠️ ABI 16 -> 20: ein .tcb, das die neuen Aufrufe nutzt, braucht diese Firmware. Bestehende .tcb laufen unveraendert weiter (reine Anhaenge, kein Formatwechsel). ⚠️ Nach dem Flashen einmal TinyCIde in der Konsole aufrufen und die Browserseite hart neu laden -- die IDE liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht. || VORHER 1.6.45: drei Fehler, die alle STILL waren -- kein Compilerfehler, keine VM-Meldung, nur ausbleibende Wirkung. (1) FIRMWARE tc_stream_ref(): ein String-LITERAL, das durch einen char[]-FUNKTIONSPARAMETER gereicht wird, kommt als Konstanten-Pool-Referenz an, und tc_resolve_ref() gibt dafuer ABSICHTLICH nullptr zurueck -- webSend(css) gab dann GAR NICHTS aus. `void row(char css[]){webSend(css);} row("left:57px;")` blieb wirkungslos, waehrend sprintf("%s",param) durchweg funktionierte; das sah deshalb nach einem CSS-Problem aus statt nach einem verschluckten String. Betrifft webSend/responseAppend/mailBody und die uebrigen Streaming-Syscalls. (2) FIRMWARE tcbtn(): sicherte textContent statt innerHTML und stellte die Textfarbe hart auf '' zurueck -- ein Button mit Markup darin (z.B. <span>-Punkte) war nach dem ERSTEN Klick dauerhaft leer, und eine per Skript gesetzte Inline-Farbe ging verloren. Jetzt werden innerHTML UND die urspruengliche Inline-Farbe gesichert und zurueckgestellt. (3) COMPILER (codegen.js) String-Ternaer als Aufrufargument: `f(c ? "a" : "b")` uebersetzte anstandslos und tat zur Laufzeit NICHTS -- dieselbe Konstanten-Pool-Falle, sie trifft rund 79 Syscalls (responseCmnd, addLog, ...). Behoben durch Aufspalten in ZWEI vollstaendige Aufrufe, je einen pro Zweig, mit gewoehnlichem Literal-Argument; damit sind alle Syscalls auf einen Schlag erledigt, und es wirkt auf BEREITS AUSGELIEFERTER Firmware. ⚠️ (1) und (2) brauchen einen FLASH, (3) braucht nur die neue IDE -- und die liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht: nach dem Update einmal `TinyCIde` in der Konsole aufrufen und die Browserseite hart neu laden. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.44: neuer Syscall fileRename() (522/523) + IDE-Simulator-Fix. fileRename(from,to) -> 0/-1, beide Pfade Literal oder char[]; ein VORHANDENES Ziel wird NIE stillschweigend ueberschrieben (Tippfehler im Zielnamen darf keine Daten vernichten) und Umbenennen ueber Dateisystemgrenzen (/ffs/ <-> /sdfs/) wird abgelehnt statt halb zu scheitern. Motiv: sml_chart speichert Historie UND Nullpunkte jetzt gemeinsam in der .pvs (ottelo9/tasmota-sml-images#50) und braucht dafuer eine "schon uebernommen"-Marke -- die alte .bin wird nach <name>.done UMBENANNT statt geloescht, ihr Vorhandensein ist die Marke. Ausserdem in idesrc/src/vm.js: `Syscall` war in 63 case-Labels benutzt, aber nie importiert -- der Browser-Simulator starb an ReferenceError, sobald ein Syscall keinen frueheren Zahlen-Fall traf (z.B. jedes Programm mit fileWrite). WICHTIG: die IDE liegt als /tinyc_ide.html.gz im GERAETE-Dateisystem und wird von einem Firmware-Flash NICHT mitgetauscht -- nach dem Update einmal `TinyCIde` in der Konsole aufrufen, sonst meldet der Compiler "Undefined function: fileRename" trotz passender Firmware. Weiterhin ABI 16, kein .tcb-Formatwechsel. || VORHER 1.6.43: persist + upload/network roll-up since 1.6.42 (no .tcb-format / syscall-ABI change, still ABI 16). PERSIST OVERHAUL: name-keyed .pvs (PV3, 3763abf02) - adding/reordering/resizing persist vars or recompiling NO LONGER wipes saved state (entries migrate by NAME; PVS2 read-fallback so old .pvs upgrade seamlessly); persist cap 64->128 on ESP32 with a LOUD parse error when a program exceeds the cap (was SILENT truncation - vars past #64 always reloaded as 0); heap-persist ARRAYS (persist float a[N]) now actually restore across reload AND reboot (5a0f1f06f: restore-at-load + idempotent slot-stop - a reload's double TinyCStopVM used to re-save from the freed heap and zero the .pvs) => chart history can live in .pvs (energy_dashboard converted, .bin files dropped). WORKER/FS: spawnTask worker runs on its own dual-context VM aliasing primary globals, DEFAULT-ON ESP32 (3342f4835; fixes callback 'Bounds PC=0' frame corruption under concurrent net I/O; opt out USE_TINYC_NO_WORKER_VM); cross-slot file-handle race fixed (3473e6192: atomic reserve under mutex + owner-keyed close - two tasks could grab the SAME handle -> wrong-file writes/heap panics). UPLOAD/NET: port-83 raw-socket large-upload server off loopTask (fixes big /ufsu truncate+reboot) + post-FIN drain; dl/upload (82/83) + cam-stream servers now start on Ethernet-only devices (HasIP instead of WifiHasIP); /ufsu deletes the partial file on an aborted write and reports distinct error 10 'write failed' (was misreported as 'too large'); UDP-pause-sync during blocking TLS + tcpConnect 2s default timeout. WEB/LVGL: multi-series WebChart defaults to a top legend (series names no longer truncate to '...'); TC_LV_MAX 128->256 + lvglSetText type-guard (dashboard handle-overflow crash). Examples: energy_dashboard solar + battery-SOC charts (persist-backed), sml_ebus energy/temp charts + dual y-axis, moritz_dash alarm siren+email + MAN/AUTO per thermostat, marstek discharge-cap, hyundai_soc manual live-refresh, esf37 history table + TTS toggle + bounded GATT read.** **TinyC 1.6.42: bugfix roll-up since 1.6.41 (no .tcb-format / syscall-ABI change, still ABI 16). HEAP-CORRUPTION FIX: disabled the idle bump-heap shrink (a11c45565) - special_realloc could MOVE the VM heap while the running program's live frame/stack/global/handle references are ABSOLUTE pointers (not offsets), dangling them all -> use-after-free -> tlsf_free/lwIP crashes + ~30s-cadence boot-loops on ESP32. Root cause of Rolf's .200 (Matter+SML+DS2484) and Andreas's C6 crashes; found independently via OTA git-bisect + UBSan. Callback-arg buffer now reserved per-slot + eager-reserved at slot load (fixes 'Event callback heap alloc failed' after hours of uptime). ESP8266 RUNS AGAIN and ships again: output-program HWDT fixed (tc_syscall scratch buffers moved to heap). Web UI: control-panel scripts render their controls INLINE on the main page (raw HTML in WebCall via /cm?cmnd=...), and a bare WebUI() no longer emits the stray generic 'TinyC UI' button - only webPageLabel-registered pages get a /tc_ui button, and /tc_ui no longer 503s when it would land on an empty slot. Example fixes: ecotracker daily-chart off-by-one date, marstek real Venus E control via the UDP JSON-RPC local API, bmx280 BME680/688/690.** **TinyC 1.6.41: device-wedge + web-stability roll-up since 1.6.40. /tc repo index + .tcb downloads moved CLIENT-SIDE (a synchronous repo TLS GET on the loop task wedged the device for minutes); chunked-send loop-block bounded (a permanent web-wedge under slow-client reload becomes a self-recovering ~8s cap, Andreas-verified) + lwip/sockets self-include; deferred commands (tasmDefer/audioPlay/I2STTS/sendmail) now run from EVENT-DRIVEN slots (were gated on slot-0 vm.halted, never true for a callback slot -> silently never fired); Scripter ?sv= crash on TinyC builds fixed + ?sv= bounds-check; TasmotaSerial freeUart C3/C6 hang fixed; WebChart rolls the newest sample to the right edge; LVGL runs on renderer-based displays (RA8876, not just uDisplay); chkpt r handles a custom partition BEFORE spiffs without bricking. No .tcb format / syscall-ABI change vs 1.6.40 (ABI 16).** **TinyC 1.6.40: per-script main-page web cards (webCard 521, ABI 15->16 -- each WebCall slot auto-framed in a <fieldset> so multiple apps on one main page get a frame+gap; webCard(0) opts a slot out) + TLS-before-WiFi boot-crash guard + repo-fetch offline skip/backoff + raw-TLS abort-close & lwIP PCB-pool census + dyson STATE-CHANGE parse + widget writes routed to the rendering slot. ABI 15->16 (webCard pure append; recompile .tc with the v16 IDE). **TinyC 1.6.39: test-release roll-up of a month's work since the 1.6.38 build — main-loop wedge fix (httpGet/Post/sendMail no longer stall the device), share-table heap fix (~120 KB internal DRAM back on S3+PSRAM), dead-IP connect bounding, raw TLS client + rsaEncrypt() + utcSecs() syscalls, audio (full-duplex I2S / WAV player / mic in), on-device LVGL GUI, P4 MIPI camera + BLE GATT, IDE/firmware ABI-mismatch warning; ESP8266 builds + runs basic programs again (custom images). No .tcb format / syscall-ABI change vs 1.6.38. **TinyC 1.6.38: TWO-PHASE autoexec boot. 1.6.37's serial load only serialised slot STARTS — but each slot's main() still raced the PRIOR slots' already-running TaskLoops (Andreas .142 boot-log: slot-0 `TaskLoop enter` at 02.254 while slot-3 still ran main() at 02.580 → slot-3, the last slot, was starved of VM time/heap, never reached addCommand("EM") → durable column never written on the FIRST boot → reheal had nothing to restore = henne/ei). Fix: new per-slot `hold_taskloop` (TcSlot, ESP32) — the autoexec loader sets it before starting each slot, the VM task BLOCKS after main() (before Phase-2/TaskLoop) while it's set, and the loader clears it on ALL slots only after EVERY main() has run (or timed out). So while slot-3's main() runs, slots 0..2 are parked instead of spinning their TaskLoops → each main() reaches addCommand() with no TaskLoop competition → the durable prefix column is written on the first boot every time. Pairs with 1.6.37's durable cache (the belt; two-phase is the suspenders). No ABI/VM/bytecode/IDE change. **TinyC 1.6.37: command prefix is now DURABLE + serial autoexec load. 1.6.36's sticky prefix only re-armed when `cmd_prefix_saved` (RAM/BSS, set only by main()'s addCommand()) survived; a heap-tight REBOOT where main() never reaches addCommand() left it empty after the BSS reset, so the per-second self-heal had no target and `BAT*` stayed Unknown (Andreas .107 = S3+PSRAM, NOT C3). FIX (a) the prefix is mirrored into a DURABLE 3rd column of /tinyc.cfg (slot_config[].cmd_prefix), learned on the first successful addCommand() and used by TinyCPrefixReheal as the heal target even on a boot whose main() never registered — it now re-registers a RUNNING slot from cmd_prefix_saved OR the persisted copy (the `s->running` gate re-arms only an executing VM, never a deliberately-stopped slot); cleared on program-replace/reset (TinyCClearDurablePrefix), NOT on a plain stop or same-file reload. FIX (b) the autoexec boot loader loads slots SERIALLY — it waits for each slot's main() (Phase 1) to finish via the new `slot->main_done` flag (bounded by TC_BOOT_MAIN_WAIT_MS) before starting the next, so concurrent boot load can't starve a tight S3/PSRAM of the heap headroom main() needs to reach addCommand() (Andreas's root-cause request). No ABI/VM/bytecode/IDE change. **TinyC 1.6.36: registered command prefix is now STICKY. A slot's BAT*/command prefix (set by main()'s addCommand()) used to be cleared by every TinyCStopVM teardown and re-set ONLY when main() runs again — so a transient worker stop+resume (SD->Flash sync worker-stop, or the #76 auto-stop) whose main() doesn't re-reach addCommand() under heap pressure, or a heap-tight boot, left the slot Running:1 while EVERY command fell through to {"Command":"Unknown"}; recoverable only by a full slot-restart (a reboot did NOT fix it). New `cmd_prefix_saved` mirror is set alongside cmd_prefix at registration and cleared ONLY on a deliberate stop/reset/program-replace; it's re-applied in TinyCStartVM (before the VM task re-runs main) and by a once-per-second TinyCPrefixReheal() self-heal that re-arms any loaded slot whose live prefix went empty without a main() re-run. Fixes Andreas's .107 'BAT* Unknown after sync / after boot' (Wurzelanalyse 2026-06-04). No ABI/VM/bytecode/IDE change. PREVIOUS 1.6.35: .tcb bytecode format v5->v6 — self-describing header (new header_size B20-21 + total_size B22-25 u32) + a 2-byte syscall-ABI-revision abi_rev (B26-27) + 12 reserved bytes for future fields (no further format bump). The loader now (a) cross-checks total_size vs the on-disk file size — catches a truncated/corrupt upload before it reads OOB; (b) WARNS (still loads) when a slot's abi_rev != firmware TC_SYSCALL_ABI: 'recompile with the current IDE; commands may not register' — fixes the silent 'slot runs but BAT*/commands return Unknown' trap after a firmware update done with a STALE IDE (syscall renumbering); (c) nudges once when loading pre-v6 bytecode. v2..v5 .tcb still load byte-identically; a v6 .tcb is rejected (loud) by pre-v6 firmware. Needs the matching IDE rebundle (codegen emits v6). BUMP TC_SYSCALL_ABI in BOTH opcodes.js (SYSCALL_ABI) and this file whenever syscall NUMBERS are inserted/renumbered.** PREVIOUS 1.6.34: **TinyC 1.6.34: FUNC_COMMAND now answers {"Command":"Busy"} instead of the generic {"Command":"Unknown"} when a registered TinyC command-prefix matches a slot whose VM is busy — the bounded 200 ms try-lock (1.6.23) times out under a slot-0 load burst (BYD reads / colliding 60 s timers on Andreas's .107), or the VM is mid-execution. Polling HTML UIs can now keep the last good value on a transient busy instead of blanking (which looked like data loss). No ABI/VM change.** PREVIOUS 1.6.33: **TinyC 1.6.33: sprintf/addLog no longer corrupt a float (%f) argument whose VARIABLE NAME collides with a built-in #define (the file-mode constants r/w/a, colours, MATTER_*/CLUSTER_*). The compiler's resolveArg now respects local/global shadowing (it previously substituted the define's int literal -> a spurious I2F reinterpreted the float bit-pattern, e.g. 2.0 -> "1073741824"; compileExpr used the real local, so only collided names broke, looking like "the 2nd+ %f"). Codegen-only + IDE rebundled; no VM change. Also: removed the /ufsu big-write heap-trace debug logging (UPL: heap-trace ...); new example sml_custom_line.tc (descriptor name '*' suppresses a meter line -> render a combined V/A/W line + decimal-aligned columns from a script); matter_c BLIB plugin (Fork B) scaffolding + by-pointer crypto seam (off by default).** PREVIOUS 1.6.32: **TinyC fastMux(flag,time,buf,len) — HW-timer GPIO multiplexer ported from Scripter's ESP32_FAST_MUX. An IRAM hardware-timer ISR steps a small scan buffer of pin-encoding bytes (direct GPIO.out_w1ts/out_w1tc set/clear, pins 0..31) for jitter-free LED-matrix/7-segment/charlieplex multiplexing far steadier than the VM loop. flag 0=start(config pins + period in us @1MHz timer), 1=stop, 2=load scan sequence, 3=read scan position. Gated `USE_TINYC_FAST_MUX` + dual-core Xtensa only — classic ESP32 OR ESP32-S3 (off by default; RISC-V C-series excluded; returns -1 if not built); ported to the Arduino-core-3.x timer API (timerBegin(freq)/timerAlarm/timerAttachInterrupt). SYS_FAST_MUX 427; codegen builtin (refArgs:[2]) + IDE rebundled; example fast_mux.tc.** PREVIOUS 1.6.31: **TinyC dynamic-HTML enablers: varIdx(var)->int returns a global's index so a script can hand-build fully custom interactive HTML (e.g. emit raw `<button onclick='tcbtn(this,1,IDX)'>` / `<input ... onchange='seva(value,IDX)'>` in any layout); plus webButtonV(var,labelbuf) and webSliderV(var,min,max,labelbuf) — runtime-(char[])-label twins of webButton/webSlider (the built-ins only accept compile-time string-literal labels). Closes the two gaps hit building matter_bridge_ui's table: dynamic widget labels + custom raw-HTML controls. SYS_VAR_IDX 424 / SYS_WEB_BUTTON_V 425 / SYS_WEB_SLIDER_V 426; codegen builtins + IDE rebundled.** PREVIOUS 1.6.30: **TinyC generic JSON parsing: new jsonNum(buf,"a#b#c")->float and jsonStr(buf,"a#b#c",dst)->len syscalls (SYS_JSON_NUM 422 / SYS_JSON_STR 423) parse ANY char[] the script holds (e.g. an httpGet response from a remote device) via Tasmota's JsonParser with a '#'-separated path — like sensorGet but on a provided buffer, not just this device's own sensors. Lets matter_bridge_ui read a remote's DeviceName robustly (the hand-rolled string slicing tripped over TinyC quote/char-literal quirks). Codegen builtins + IDE rebundled.** PREVIOUS 1.6.29: **TinyC httpGet (SYS_HTTP_GET) body read rewritten + retried. ROOT CAUSE (proven on .143 C3 via per-call code/size/len logging): on a busy C3 (matter_c + WiFi) the framework http.getString() intermittently returns an EMPTY body on a valid HTTP 200 — ALWAYS for a slow ESP8266 peer (chunked reply split across many small TCP segments) and occasionally for an ESP32 peer; it also saw transient -1 connect drops. FIX: read the body ourselves — drain the raw stream patiently (wait for available() with a 1.5 s per-idle wall-clock bound, continue past FIN while bytes remain buffered) and de-chunk Transfer-Encoding: chunked on the fly; retry the whole GET up to 3x (120 ms apart) on a -1 transport error or an empty read. GET only (idempotent); POST is NOT retried. Fixes the matter_bridge_ui / remote-bridge poller never reading a sleepy ESP8266 RGB lamp (.38) and occasional empty reads from ESP32 peers (.51).** PREVIOUS 1.6.28: **TinyC IDE self-update from the console (Hans's request): new `TinyCIde [url]` command + a /tc "Update IDE" button fetch tinyc_ide.html.gz from the repo and atomically replace the device's served IDE — stream to a .tmp, validate the gzip magic + size, then rename over the live file; the ~190 KB LittleFS write quiesces the VM tasks (TinyCFsWritePause) + holds the loop-WDT, mirroring the /ufsu big-write path. Updates the browser IDE without the Tasmota file manager. Verified live on .143: 186422->187286 B, gunzip OK, no .tmp residue, Matter preserved.** PREVIOUS 1.6.27: **matter_c: Alexa support — UpdateFabricLabel (0x3E/0x09) commission-abort fix; mandatory Groups (0x0004) + ColorControl + Level attrs on light/plug device types (Alexa GS014 conformance); per-fabric Bridged-Node 0x0013 suppression for Alexa/Amazon vendors (NON_BRIDGE_VENDOR, Berry parity). Alexa now commissions + controls matter_c lights/plugs as DIRECT (non-bridged) nodes. LIMITATION: Alexa rejects a single node that mixes actuators + sensors — split into a lights node + a separate sensor-bridge node; the full mixed matter_home_bridge.tc still works on Apple/Google (Apple regression-tested OK).** PREVIOUS 1.6.26: **matter_c: handle IM TimedRequest (op 0x0A) — fix Google Nest "Gerät kann nicht hinzugefügt werden"**. Hans's C3 log (matter_powermeter.tc) showed commissioning fully succeed (PASE→attest→CSR→AddNOC fabric idx=5→CASE operational sid=13653) and post-CASE Descriptor reads, then Google Nest sent an IM TimedRequest (proto=0x0001 op=0x0A exch=0x2613); matter_c had no handler so it sent only an MRP StandaloneAck and no IM StatusResponse → Nest's timed interaction stalled, retried the TimedRequest ~10s later (0x2614), then gave up. Per Core Spec §8.7 a TimedRequest{0:timeoutMs} must be answered with StatusResponse(SUCCESS); the follow-up timed Invoke/Write then arrives on the same exchange and is handled normally. Added the handler in the secured-rx IM dispatch (emits the 8-byte StatusResponse `15 24 00 00 24 FF 0C 18`); follow-up accepted unconditionally (no command on this device needs strict timed gating). Apple Home doesn't use a timed interaction at that step, which is why it already paired. PREVIOUS 1.6.25: **matter_c: add `SAT=4000` to operational mDNS TXT (fix Google Nest "kann nicht verbinden" post-CASE)** — Hans reported Google Nest fails commissioning right after our log shows CASE Sigma3 verified + OPERATIONAL SESSION sid=61744 (1 active). Our operational mDNS TXT records were `SII=5000 SAI=300 T=0` — missing `SAT` (Session Active Threshold, ms) which Matter Core Spec §4.3.1.6 marks MANDATORY since v1.3. Apple Home tolerates SAT missing; Google Nest rejects. Added `SAT=4000` (spec default). Also added an opt-in diagnostic build flag `-DMTRC_DIAG_HANS` that logs every decrypted secured-channel rx with proto/op/exch/payload hex prefix — useful for diagnosing post-CASE failures where the controller stops talking. PREVIOUS 1.6.24: **matter_c: drop per-packet AddLog from AsyncUDP onPacket lambda (fix .122 hourly reboot)** — Captured live on .122 (ESP32-C6 matter_home_bridge with 32 endpoints, Apple Home subscription pressure) via USB-CDC serial 2026-05-27 15:34:50: Guru Meditation `Instruction access fault` with MEPC=RA=MTVAL=0x6f48222c after ~1h uptime (BootCount 290). 0x6f48222c decoded as LE ASCII bytes = `,"Ho` — start of `,"Hostname":"ESP32-C6"` JSON fragment from Tasmota's STATE/SENSOR teleperiod. Stack at crash also held `stname":"ESP`/`rx 42 B`/`from`/`:00:`. Root cause: `AddLog("MTR: udp rx %u B from %s:%u …", …, mtrc_peer_ip.toString().c_str(), …)` inside the AsyncUDP onPacket lambda — `IPAddress::toString()` of an IPv6 link-local plus Tasmota's LOGSZ stack buffer for vsnprintf overflowed the AsyncTCP task's ~4 KB stack and corrupted the saved RA with adjacent format-string bytes. `matter_udp_rx()` itself ran fine on that stack (no crashes in crypto/IM dispatch); the overflow was specifically in the log path. Fix: remove the per-packet AddLog from the lambda; bump two volatile uint32_t counters (pkts/bytes) instead; FUNC_LOOP logs aggregates every 5 s on the main task where 8 KB+ of stack is safe. A wider previous attempt (deferred matter_udp_rx itself to main loop) starved WiFi/HTTP for the ~7-second 682-chunk Subscribe response burst and was reverted (5199ae4fb) before any release upload. PREVIOUS 1.6.23: **Bounded try-lock on share-table readers + FUNC_COMMAND vm_mutex** — Andreas reported a deterministic ~2:30 min HTTP-server outage on .104 (ESP32-C3 single-core + TinyC ebusD-Reader) when slot-0 emits 60 shareSetFloat/s and the HTTP task tries /cm?cmnd=WP+B (or /ufsu). Two unbounded `portMAX_DELAY` locks in the same path: `shareGet*`/`shareHas` on `tc_share_mutex`, and `FUNC_COMMAND` on the slot's `vm_mutex`; either could pile up enough scheduler pressure to wedge AsyncTCP, recovering only at the 60 s UDP-multicast socket-reset boundary. Readers now use a 50 ms `tc_share_try_lock_ms()` (drop the read with default value on timeout — same as missing-key behaviour); `FUNC_COMMAND` uses a 200 ms `xSemaphoreTake` deadline (returns "Command unknown" instead of blocking the web task). Writers (`shareSet*`) keep `portMAX_DELAY` since they MUST persist. With this in place a 60-shares/s pattern is again the supported case (the 3-categories polling workaround stays a useful tidiness pattern but is no longer required for stability). PREVIOUS 1.6.22: **WebChart now respects Tasmota's per-language `D_DECIMAL_SEPARATOR`** — tooltips and any formatted axis labels on `WebChart()` charts show `1,5` on a `de_DE` build (or whatever the language header defines) instead of `1.5`. Implemented by injecting a `google.visualization.NumberFormat({decimalSymbol: …})` after the data table is built (before the `WebChartJS` hook, so user-supplied JS sees the formatter already applied). JS literals in chart data stay '.' (correct). Same mechanism Tasmota itself uses for its sensor body (`WSContentSend_PD`). Script-side `webSend(...)` already runs through `WSContentSend_PD` so it was already localized. **Companion: sml_chart_editor is now locale-aware** — display via `Intl.NumberFormat` (browser locale, so a DE user sees `,` even on an en_GB-built firmware), parser accepts both `.` and `,` so paste-from-anywhere works; CSV export keeps `.` to match `fileWriteArray` on the device. PREVIOUS 1.6.21: `/cedit` route — host the sml_chart binary editor on the device. A tiny new webserver route reads `/sml_chart_editor.html(.gz)` from the filesystem and serves it inline as `text/html`, so the standalone editor (`tasmota/tinyc/utils/sml_chart_editor.html`) can be opened at `http://<device>/cedit` and its Load / Save buttons hit `/ufsd?download=`, `/ufsu` and `/cm` same-origin to read `/sml_chart.bin` in place, write it back, and run `Backlog TinyCStop 0; TinyCRun /sml_chart.tcb` so the script reloads — no manual download/upload cycle. The route is needed because Tasmota's generic `/ufsd?download=` always sends `Content-Disposition: attachment` and would just download the HTML instead of rendering it. Editor README at `tasmota/tinyc/utils/sml_chart_editor.md`. Requested by mi-hol (discussion #83). PREVIOUS 1.6.20: PWL_DIRECT_GLOBALS: the polling spawnTask worker no longer silently exits at its first delay (the "no values fetched" symptom). The worker BORROWS the one shared VM; during its delay() windows it releases the mutex while still looking halted=true, so the high-rate UDP-global RX path (tc_udp_on_receive) injected globals into the borrowed VM and disturbed the worker's loop state, making the worker loop exit cleanly (no error). Fix: a `vm->worker_borrowed` flag set for the WHOLE borrow incl. its delay windows; tc_udp_on_receive now skips injection when a worker is borrowing the VM (on top of the 1.6.19 drop-on-busy try-lock). Verified live on a devkit-S3: the globals-ON worker survives its 15 s startup delay and runs its request cycle. PREVIOUS 1.6.19: PWL_DIRECT_GLOBALS / UDP-global RX no longer crashes a node that also runs a spawnTask TLS worker. `tc_udp_on_receive()` took the per-slot `vm_mutex` with `portMAX_DELAY`, so while a spawnTask worker held the VM for a multi-second BearSSL request (the powerwall worker), loopTask blocked in the UDP-global-receive path for the WHOLE TLS — freezing the web server + LwIP servicing and corrupting the TLSF heap. It surfaced as Exception 29 (StoreProhibited) in LwIP `tcp_alloc` on the worker's NEXT TLS socket (wild free-list pointer), and the reboot wiped the web log ring so it looked like the worker had silently stopped. Fix: the UDP-global injection is now NON-BLOCKING — `xSemaphoreTake(vm_mutex, 0)` and drop-on-busy (multicast globals are best-effort, so dropping one while the VM is busy is harmless; same drop-on-busy pattern as matter_udp_rx). Live-verified on a devkit-S3 (.39): `powerwall.tc` with `-DPWL_DIRECT_GLOBALS` ran 11 request cycles / ~5 min with ZERO crashes and a clean heap throughout (it crashed deterministically within 9-60s before). Root-caused via UDP-syslog capture + `heap_caps_check_integrity_all` probing (heap was clean through 15s of UDP RX on the borrowed VM and right up to the TLS — only the lock-stall during TLS corrupted it). PREVIOUS 1.6.18: fileWriteArray()/fileReadArray() now store FLOAT values (was integer): they write/read human-readable TAB-separated float text, one array per line — a plain editable `.csv`/`.tab` — restoring parity with Scripter's `fwa()`/`fra()` (which are float). New signature `fileWriteArray(arr, handle, count [, append [, decimals]])` / `fileReadArray(arr, handle [, count])`: `count` is now explicit (like fileWriteBin/fileReadBin) because TinyC global arrays don't carry their declared size — without it small global arrays over-wrote the whole global pool. `decimals` (default 2, trailing zeros stripped via Scripter's `%*_f`) caps decimal places so the file stays compact — without it small/fractional values could blow up to long strings (e.g. 0.0001234567) and bloat big arrays. The integer variant is dropped (no example used it; use fileWriteBin/fileReadBin for compact binary). Read is now streamed value-by-value, so arrays of ANY size work (the old 512-byte line / 256-element cap is gone) — e.g. a 1441-slot SML chart buffer can be saved as readable CSV and restored. Motivated by users wanting to read/edit/restore the sml_chart_* data as text instead of opaque binary. PREVIOUS 1.6.17: **Flash-FS file-manager upload no longer hard-hangs a running node: a large internal-flash (LittleFS) write — e.g. uploading the ~183 KB IDE via /ufsu — repeatedly disables the SPI flash cache, and on a dual-core node running a TinyC VM task this deadlocked the device with NO watchdog recovery (needed a power-cycle). Reproduced + serial-traced on an S3 Matter-bridge (TaskLoop); SD-card uploads were unaffected (external SPI never disables the internal cache). The old tc_global_pause only suppressed main-loop callbacks — tc_vm_task kept stepping; and merely pausing/vTaskSuspend()ing it was NOT enough (the task still wedged the write — verified). Fix: for /ufsu uploads >= TC_FS_BIG_WRITE (16 KB; small files never deadlock so they skip it) the writer STOPS each running VM task for the duration of the write (TinyCFsWritePause→TinyCStopVM, fully off the scheduler — the only thing that lets the write through, ~3 s vs a hard hang) and RESTARTS them after (TinyCFsWriteResume→TinyCStartVM, re-runs main(); for the bridge that re-runs matterReset()+rebuild, identical to a normal boot — Matter fabric persists on UFS, no commissioning lost). Wired into xdrv_50 UfsUploadFileOpen/Close with HandleUploadUFSDone as a resume safety-net. Small .tcb /tc_upload writes are left untouched (tc_deploy manages its own slot). PREVIOUS 1.6.16: **Matter commissioning fix (CRITICAL on newlib-nano builds): the operational DNS-SD instance name `<CompressedFabricID>-<NodeID>` formatted the 64-bit node id with `%016llX`, but ESP-IDF newlib-nano printf (default on several Tasmota envs, e.g. tinyc32s3/c3) ignores the `ll` length modifier and emits garbage ("…lX") — so a controller (Apple Home) could never resolve the node for the CASE handshake and commissioning ended at "connecting → no response". Fixed by formatting all 64-bit ids byte-by-byte with `%02X` (fabric_op_instance in matter_c + the commissionable instance in xdrv). Also: matterSet/matterSetFloat now bump the subscription generation ONLY on a real value change — re-publishing identical sensor values no longer triggers a ReportData burst, which had flooded the subscriber (a script writing N attrs/second = N reports/second) and starved the CASE handshake / overwhelmed single-core nodes during commissioning. Together these make a multi-endpoint Matter bridge commission + run on a dual-core S3 (verified: 14 endpoints, 3 controller sessions). PREVIOUS 1.6.15: **Matter per-endpoint naming: new builtin `matterName(ep, "label")` (SYS_MTR_NAME=408). Apple Home (and other controllers) can only show a manufacturer-supplied name per endpoint when the node is a Matter *bridge*, so matterName turns the node into one: the first call lazily creates an Aggregator (0x000E) endpoint, the named endpoint becomes a Bridged Node (its Descriptor DeviceTypeList gains 0x0013) and gets a Bridged Device Basic Information cluster (0x0039) whose NodeLabel carries the label — exactly the pattern Berry Matter uses. Before this, a multi-endpoint node (e.g. a HomeKit-scripter port with N temp/humidity sensors) showed up as "Temperatursensor 1..N" with no way to name them. matterName(ep, name) is opt-in per endpoint; unnamed endpoints stay plain (no bridge forced). Call AFTER matterAdd for that endpoint; idempotent (re-call to rename); matterReset() drops all labels + the aggregator. Malloc-free (parallel 33-entry label table in the heap-allocated matter ctx). Adding a bridge changes the node identity, so an already-commissioned node must be removed + re-added in the controller to pick up the names. PREVIOUS 1.6.14: **DMX moved to RMT (no UART consumed). `dmxInit` is now `dmxInit(gpio)` (1 arg) — the DMX512 frame (BREAK+MAB+start+slots, 4us/bit, byte = start-low+8 data LSB+2 stop-high) is built as rmt_symbol_word_t[] and pushed via rmt_new_tx_channel + copy encoder at 1 MHz (exact, hardware-clocked — no CPU busy-wait BREAK). IDF5 RMT API = native to pinned arduino-esp32 3.3.7; UARTs stay free for SML/Modbus/tc_serial (the whole motivation). Re-sent ~20 Hz from FUNC_EVERY_50_MSECOND, 30 s watchdog -> all-zero. Compile-time auto-init via #define TC_DMX_GPIO. Replaces the 1.6.12/1.6.13 UART backend (dmxInit(uart,rx,tx) signature gone — nothing depended on it yet). PREVIOUS 1.6.13: **DMX runtime config: new builtin `dmxInit(uart, rx, tx)` (SYS_DMX_INIT=397) -> 1=ok/0=fail. Pick the hardware UART (0..2) + rx/tx GPIOs at runtime from the .tc script — no recompile/`#define` per board. Call once before `dmxWrite`; `dmxInit` reconfigures cleanly if called again (end()+delete+re-begin). Compile-time `TC_DMX_TX_PIN`/`TC_DMX_RX_PIN`/`TC_DMX_UART_NUM` still work as an auto-init fallback when `dmxWrite` is used without `dmxInit`. Frame BREAK now uses the runtime-selected UART for uart_set_line_inverse. PREVIOUS 1.6.12: **New builtin `dmxWrite(channel, value)` (SYS_DMX_WRITE=396): TX-only DMX512 on a dedicated ESP32 hardware UART (default UART2) for solar-surplus heater dimmers and similar. No library/HAL patch — per-frame BREAK via uart_set_line_inverse (inverse-line method), 250000 8N2, start code + TC_DMX_SLOTS (16) data slots, auto-refreshed from FUNC_EVERY_50_MSECOND (~20 Hz, runs even while the VM is paused so the dimmer never loses its frame), 30 s watchdog → all-zero (heater safe-off). Lazy UART init on first dmxWrite; pins via user_config_override.h (#define TC_DMX_TX_PIN <gpio>, optional TC_DMX_DE_PIN for RS485 DE, TC_DMX_UART_NUM, TC_DMX_SLOTS). Linearisation LUT + surplus logic stay in the .tc script. ESP8266: no-op. PREVIOUS 1.6.11: **Boot-loop false-positive fix (Andreas/Bat3). A commanded `Restart`/OTA was mistaken for a crash-loop and disabled autoexec — esp. right after an OTA flash (Tasmota also reports "settings reset") + 1-2 manual `Restart 1`. tc_bootloop_detected() is pure-OR with early return, so the filesystem marker ALONE trips it. Fix A: clear the boot-loop marker in FUNC_SAVE_BEFORE_RESTART (Tasmota calls that ONLY on graceful restart/OTA, never on crash/WDT/panic) — folded into the existing case, before CleanUp/persist-save. Fix B (belt+suspenders): tc_bootloop_detected() short-circuits on esp_reset_reason()==ESP_RST_SW (clean software reset) and proactively deletes the stale marker; crash resets (PANIC/WDT/BROWNOUT) and power-on (QPC counter) still detected. PREVIOUS 1.6.10: **Two production-UX fixes (Andreas/Bat3). (1) WebOn/WebUI page-switch no longer flashes a "TinyC not ready" 503 white page: `HandleTinyCWebOn` (was hardcoded immediate-503 on slot 0) and `HandleTinyCUI` now split *fatal* (no slot/not loaded/vm.error) from *transient* and wait up to `TC_WEBON_HALTED_WAIT_MS` (default 1500, `#ifndef`-guarded) for `vm.halted` before 503 — a slot running a TaskLoop (Modbus/BYD polls) is only sub-ms non-halted so the page now loads first try. Multi-slot-aware WebOn (`handler_slot[]` like `page_slot[]`) tracked for 1.7.x. (2) Persist `.pvs` layout-hash / legacy mismatch no longer **deletes** the file → `tc_persist_demote()` renames it to `<name>.pvs.bak` (one generation) so a schema-change flash is *recoverable* instead of total data-loss (Bat3: 27 cfg + tariff/SOC tables wiped by a single new `persist` var, twice in 2 days). Falls back to remove only if rename fails. Full name-keyed migration (PVS3 — `index` is compiler-assigned and shifts on add/remove, so raw-index migration is unsafe; needs .tcb-format names) tracked for 1.7.x. PREVIOUS 1.6.9: **`responseCmnd(buf)` no longer silently truncates.** The char-array form copied through a hardcoded 255-byte stack buffer; longer JSON was cut mid-object → Tasmota rendered an empty `{}` with no diagnostic (Andreas lost non-trivial time on a ~280-char BATrt response on .107). Buffer is now `TC_RESPONSE_MAX` (ESP32 512 / ESP8266 256), `#ifndef`-guarded so user_config_override.h can raise it; a truncation emits `TCC: responseCmnd output truncated at N chars (raise TC_RESPONSE_MAX...)` — same silent-drop anti-pattern eliminated for shareSet* in 1.6.6. String-literal `responseCmnd("…")` was never affected (no 256-cap). Plus doc fixes: CLAUDE.md persist note now states a layout change resets ALL persist values to defaults (not just changed vars); TinyC_Reference.md documents the responseCmnd cap. PREVIOUS 1.6.8: **WebUI sv= write now targets the page-owning slot, not hardcoded slot 0.** `TinyC_WebSetVar` was hardcoded to `slots[0]`: any script running in a non-zero slot rendered its widgets correctly (the `/tc_ui` render path resolves the page-owning slot from `page_slot[]`) but every checkbox/button/slider write landed in slot 0's globals, which that script never reads → "WebUI renders but does nothing". Surfaced with marstek_emu running in slot 1 on .39 (slot 0 in use by test deploys). Fix: `TinyC_WebSetVar(uint8_t slot_idx)` — `/tc_ui` passes the page-owning slot index (`si`), the main-page WebPage path keeps 0 (separate pre-existing multi-slot assumption). Takes an index not a `TcSlot*` because a pointer param breaks Arduino's auto-generated forward prototype in the concatenated tasmota.ino (TcSlot declared after the generated decl). Device-verified on .39 (marstek slot 1): sv=21_1 / 3_1 now stick, toggle both directions. PREVIOUS 1.6.7: **WebUI button rework: `webButton` is now a momentary action button (no `: ON/OFF` suffix; optional `"Idle|Active"` confirm text shown ~2.5 s on click, generic ✓ otherwise) and a new `webToggle(var,"On|Off")` syscall (394) provides a latching on/off button — green when var!=0, grey when 0, with optional per-state text/emoji. Device-verified on tasmota32s3-devkit (.39): grey↔green latch + per-state text swap + emoji render confirmed via /tc_ui. IDE bundle (opcodes/codegen/vm sim) regenerated so `webToggle` compiles in-browser and via tc_deploy.mjs.** PREVIOUS 1.6.6: **`udp(10, mcast_ip)` correctness fix + share-table PSRAM-BSS + share-Set diagnostic hardening.** Three independent items shipped in one drop. (1) `udp(10)` rewritten — the 1.6.1-shipped path called raw LwIP `igmp_leavegroup()` and returned ERR_OK, but Andreas's 14./15.05. nightly A/B test on .107 (Bat3 / SMA Tripower SE) showed `spw_pkts/h` stayed constant at ~18 000/h in Phase A and Phase B (no measurable drop in multicast reception despite syntactic-OK leave). Root cause: Arduino-ESP32 `NetworkUDP::beginMulticast()` joins via SOCKET-layer `setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)` which writes BOTH the netif IGMP table AND a per-socket membership list in `lwip_sockets`. Our `igmp_leavegroup()` only cleared the netif table; the socket-internal membership remained active, so the UDP demux continued to deliver matching packets to the PCB. Fix: case 10 now calls `Tinyc->udp_port.stop()` (which internally does `setsockopt(IPPROTO_IP, IP_DROP_MEMBERSHIP, ...)` on the underlying fd, atomically clearing both layers) followed by `Tinyc->udp_port.begin(saved_port)` to reopen as a plain unicast listener on the same port (preserves Andreas's "drop without losing port" requirement at the user-visible level — unicast UDP on the port keeps working). API arg `mcast_ip` kept for compatibility + sanity-checked against the bound group (mismatch logged but drop still proceeds). The previous 1.6.5 ESP8266 path-fork (`#ifdef ESP32 ... #endif` wrapping the raw IGMP call) is gone — the socket-layer path works on both ESP32 and ESP8266 with identical code. `<lwip/igmp.h>` include removed (no longer needed). The 13.05. smoke-test on .39 that "verified" the original implementation only checked rc=0 and the watchdog-rejoin gate; it never measured packet flow stop. New case-10 emits explicit success/failure logs per call so users can confirm at runtime. Workaround for users on 1.6.5 in the meantime: substitute `udp(0, <port>)` for `udp(10, ...)` — same socket-layer API path, same effect at the user level. (2) `EXT_RAM_BSS_ATTR` on `tc_share_table[TC_SHARE_MAX]` — Andreas's Bat3 override `TC_SHARE_STR_LEN=2560` + `TC_SHARE_MAX=32` yields a ~83 KB static table that was eating internal DRAM unconditionally on PSRAM-equipped boards. With the attribute, the BSS section is placed in external RAM when `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` is set in sdkconfig (true for Tasmota's tasmota32s3-* envs); on non-PSRAM boards EXT_RAM_BSS_ATTR resolves to empty → byte-identical placement to 1.6.5. Initializer `= { }` dropped (BSS is zero-init by definition; explicit init would force a data-section copy, defeating the attribute). (3) AddLog hardening on `SYS_SHARE_SET_INT/FLT/STR` — the 1.5.0..1.6.5 implementations silently `break`'d on three failure modes: null key (const-pool index invalid — bytecode corruption), `find_or_alloc` returning -1 (table at `TC_SHARE_MAX` capacity, no free slot), and (STR-only) source-buffer truncation past `TC_SHARE_STR_LEN`. All three now emit a specific INFO-level log including key name, attempted value (truncated to 32 chars for STR), and a "raise TC_SHARE_MAX/TC_SHARE_STR_LEN in user_config_override.h" hint. Motivating case: Andreas debugged a silent-drop scenario on 1.6.3 where SHARE_SET_STR was overflowing the then-default `TC_SHARE_MAX=24` with no diagnostic — the eventual bump to 32 was guessed-at, not data-driven. New `tc_share_count_used()` helper (mutex-held, linear scan) supplies the "%d/%d" capacity hint in the log. Caveat: a script polling shareSet in EveryLoop with a typo'd or always-failing key will flood the log; no per-key rate-limit (kept simple — script authors are expected to fix the call site once the log surfaces). All three items are independent — the udp(10) fix doesn't affect share-table behaviour and vice versa; both compile on ESP32 + ESP8266. IDE patch not needed (no API surface changes — `udp` is already variadic, share-set syscalls unchanged at the bytecode level). Andreas pending live cross-check on .107 with both `udp(10, "239.12.255.254")` and `udp(0, 9522)` paths — expectation is Phase-B `spw_pkts/h` falls to ~0 (vs the 18 000/h baseline that defeated the 1.6.1-1.6.5 path). Previous: "1.6.5" — ESP8266 build fix for udp(10, mcast_ip) — Ottelo's `tasmota4m_ottelo_tc` ESP8266 build failed with `'igmp_leavegroup' was not declared in this scope` at link time. The 1.6.1 changelog claim "ESP32 + ESP8266 LwIP both export the raw IGMP API → no platform gates needed" was wrong: ESP8266 LwIP keeps `igmp_leavegroup()` internal — the function exists but the public `<lwip/igmp.h>` header doesn't expose it the way the ESP32 IDF's LwIP does. Fix: wrap the `#include <lwip/igmp.h>` and the `case 10:` body of SYS_UDP_FUNC in `#ifdef ESP32 ... #endif`. On ESP8266, the case still pops its argument (stack-balance discipline) and pushes 0 (= not supported); scripts that detect the 0 return can fall back to `udp(0, port)` for a port-close. ESP32 path byte-identical to 1.6.4. Ottelo verified the fix builds clean on his side. **1.6.5 is now obsolete** — 1.6.6's socket-layer replacement makes the ESP32/ESP8266 split unnecessary and addresses the underlying correctness issue 1.6.5 was never going to detect. Previous: "1.6.4" — **Phase-1 vm_mutex fix from 1.6.3 ROLLED BACK** — commit `5f647b704` introduced an `xSemaphoreTake/Give(vm_mutex, portMAX_DELAY)` cycle around each 256-instruction batch in Phase 1 of `tc_vm_task` (mirroring Phase 2's TaskLoop pattern). Intent: close a Frame-locals-NULL race Andreas (.107 / Bat3) was hitting at ~30 % Slot-0-restart frequency. The fix was structurally correct (post-fix 4 reload cycles all clean, vs ~1-2 fail rate pre-fix) BUT triggered a much worse production regression: WR-Modbus-TCP-disconnect-storm at ~200/h vs ~7-8/h baseline. Andreas's user-side App-Layer-Watchdog forced TCP-disconnect + immediate reconnect every ~15 s after 3 consecutive Modbus-read fails — the Sunny-Tripower WR at 192.168.56.91:502 was being hammered with reconnects in the minute-takt, unzumutbar for production use. Andreas pulled .107 from the network at 21:15 today to protect the inverter. Mechanism (Andreas's hypothesis 1, most likely): Phase-1 holding vm_mutex for 256-instr batches (~5-10 ms each) serialised against Phase-2 TaskLoop's own mutex-cycle and against callback mutex-takes. When main() did substantial work (Andreas's `slot-0_bat_ctrl.tcb` is 27 KB of bytecode = several hundred ms init), the new contention pushed Modbus response-read latency past the worker's 200 ms threshold, the 3-fail watchdog tripped, TCP cycled, repeat. Also: the fix was incomplete — Andreas still hit 1× err=12 crash POST-1.6.3 with same fingerprint (PC=7273 ctx=main fp=0 fc=0 instr=375), so there's at least one other race-class the mutex doesn't catch. ROLLBACK is the correct trade-off: err=12 is a 30 % Restart-Roulette (recoverable, scripts re-launch), WR-Modbus-storm is a continuous Hardware-Hammer (potential damage). shareDump (1.6.2) and udp(10, mcast_ip) (1.6.1) remain intact — they're in the prior commit `ebb277e64`, unaffected. **A proper Phase-1 race fix needs a different mechanism** — candidate: clearing `vm->halted = false` AFTER `tc_vm_load` returns rather than before, so callbacks can't slip past the `!halted` gate during the load window. Will revisit when time + bench-rig allows. IDE H1 label bumped 1.6.2 → 1.6.4 (skipping 1.6.3, matching TC_RELEASE). Previous (rolled back): "1.6.3" — Phase-1 vm_mutex fix. Previous: "1.6.2" — `shareDump()` — new diagnostic syscall (SYS_SHARE_DUMP = 352, picked from the 352..359 gap between TCP tuning and crypto since the natural 348 slot was already taken by SYS_TCP_KEEPALIVE in v1.5.1) that walks the entire `tc_share_table[]` and emits one `TCC: share[N] key="K" type=T value=V` log line per live entry, plus a summary `shareDump: N/32 live entries`. Returns the number of live entries to TinyC. Pure diagnostic — non-allocating, mutex-protected, ESP32 + ESP8266 compatible. Andreas (.107 / Bat3) hit a reproduction of the cross-VM share-anomaly where Slot 2's `shareSetFloat` writes are correctly logged on the writer side but Slot 0's `shareGetFloat` reads return 0.0 for all keys Slot 2 owns (price, pv_tod, pv_tom). All four diagnostic theories from my 09:15 letter (init-race, float/int mismatch, slot-self-read, identifier-collision) were ruled out by his testing — the remaining hypotheses (allocator bug, type-tag mismatch in slot, mutex-failure under heap pressure) all benefit from being able to inspect the table contents directly. `shareDump()` lets a script log the inventory and answer: did the write actually land? at what index? with what type and value? — without resorting to firmware patches with strategically-placed debug logs. Plus IDE `<h1>` header bumped 1.6.0 → 1.6.2 (was a missed step in the 1.6.1 bump — Andreas spotted it at 12:45). IDE patch `patch_share_dump.mjs` adds the `shareDump` builtin to the BUILTINS table (zero-arg, returns int) and updates the visible release label. Previous: "1.6.1" — `udp(10, mcast_ip)` — netif-level IGMP-Leave syscall for clean multicast-off A/B testing. Calls LwIP's `igmp_leavegroup(IP_ADDR_ANY, &group)` directly so the host stops accepting packets to the group at the netif level, independent of which WiFiUDP/AsyncUDP socket originally joined it. Required because `WiFiUDP::stop()` only releases the underlying PCB — if multiple sockets share a port (as happens when `Tinyc->udp` globalvars-multicast and `Tinyc->udp_port` user-multicast coexist on port 9522), stopping one socket leaves the IGMP group membership pinned by the other, and packets keep arriving at the surviving bind. Andreas (.107 / Bat3 / Sunny Tripower diagnostics) discovered this when his A/B test loop did `udp(0, SPW_PORT)` to "turn off" multicast for Phase B and observed spw_pkts/h growing *higher* in Phase B than Phase A — the LwIP IGMP filter was still leaking 18 000 frames/h to whatever socket happened to be bound. Implementation in SYS_UDP_FUNC mode 10: parse the IP from a TinyC char[], call `igmp_leavegroup` with `ifaddr=0` (= any netif), log the lwIP err_t, and clear `Tinyc->udp_port_mcast` if it matched (so case-1's inactivity watchdog won't try to rejoin the just-left group). Returns 1 on ERR_OK, 0 on bad IP or LwIP failure. Pulled `<lwip/igmp.h>` into the file's includes block — small header, no transitive cost. Pairs with `udp(9, mcast_ip, port)` (join) and `udp(0, port)` (plain-unicast bind): the Phase-B sequence is now `udp(10, "239.12.255.254")` to leave, then re-join with `udp(9, "239.12.255.254", 9522)` at Phase-A return. No IDE patch needed — `udp` is a variadic builtin already, the new mode just adds a runtime case. ESP32-only path; ESP8266 has igmp_leavegroup too (LwIP raw API is identical) so the code compiles on both. Previous: "1.6.0" — `tcpTransact(req, req_len, resp, resp_max, timeout_ms)` — atomic write-and-await-reply for request/response TCP protocols (Modbus-TCP being the headliner). Folds the canonical `tcpWriteArray + delay/poll-tcpAvailable + tcpReadArray` pattern into a single syscall (SYS_TCP_TRANSACT = 351), eliminating the explicit busy-loop every script ships by hand. Returns: bytes received on success (the moment any data arrives, all immediately-available bytes up to resp_max are read); -1 timeout (no response within the window); -2 not connected, OR peer dropped mid-wait (tcpDisconnectReason() set to PEER_CLOSED in that case); -3 bad arguments. Wait granularity is 1 FreeRTOS tick (≈1 ms) — `vTaskDelay(1)` between availability checks lets other FreeRTOS tasks run freely during the gaps. Holds the calling slot's vm_mutex throughout — intended use is from a spawnTask worker handling one TCP session, where blocking that slot's other callbacks for ≤200 ms is fine. Suitable for protocols where the response fits in a single TCP segment (Modbus-TCP, ≤256 B); for protocols where data dribbles in chunks, the lower-level tcpWriteArray + tcpAvailable + tcpReadArray remain available unchanged. Updates examples/modbus_lib.tc to use tcpTransact internally — mbFC03/04/06/16 helpers drop the per-FC `mb_wait_for` poll-loop and become single-syscall transactions, also tightening the timeout-correctness story (the old loop slept up to 2 ms past the deadline; tcpTransact ends within ~1 ms of millis() ≥ deadline). IDE BUILTINS + simulator stub in lock-step (tinyc_ide.html.gz) so the compiler accepts `tcpTransact` and standalone-IDE runs report a "no net" stub return. Pairs with the v1.5.1 TCP tuning syscalls — typical SMA Tripower flow becomes: tcpSelect(0); tcpConnect(...); tcpKeepalive(30,10,3); /* loop */ int n = tcpTransact(req, 12, resp, 260, 200); if (n < 0) { reason = tcpDisconnectReason(); ... }. Andreas's BYD HVS + SMA Tripower polling worker shrinks from ~25 lines per FC to ~5 with this in place. Previous: "1.5.2" — `#include "file.tc"` directive (IDE-side only — pure preprocessor; firmware unchanged from 1.5.1). The IDE compiler now recognizes `#include "file.tc"` lines and inlines the content from the device filesystem (fetched via existing `/tc_api?cmd=readfile`) before compile. Recursive (included files can themselves #include); first-include-only deduplication acts as an automatic header-guard so simple libraries don't need #ifndef/#define wrappers; cycle detection (max depth 16) catches accidental infinite recursion. Fall-through: source with no #include directives is unchanged, no network call. New convention: shared libraries live as `.tc` files in the device's UFS (e.g. `/modbus_lib.tc`), main script does `#include "modbus_lib.tc"` and gets all the library's functions/globals as if typed inline. Motivating example: `examples/modbus_lib.tc` ships `mbFC03/FC04/FC06/FC16` helpers for Modbus TCP — Andreas's BYD HVS + SMA Tripower + HM2.0 stack now reads as e.g. `int n = mbFC03(0, 1, 0x0010, 4, regs, 200);` instead of hand-assembling 12-byte request frames in every script. Pairs with the v1.5.1 TCP tuning syscalls (tcpKeepalive/tcpDisconnectReason). Implementation: ~80 lines of new IDE JS (parseDirective gets a `'include'` case, preprocess() rejects unresolved #include with a clear error, new async `tcResolveIncludes()` wraps the recursive fetch+inline pass). `compileCode/runCode/saveTcb/uploadWiFi/runOnDevice` are now async to await the include resolver. Firmware is byte-identical to 1.5.1 (the inlined source becomes one big `.tc` text before the bytecode compiler runs — VM has no concept of separate compilation units). Previous: "1.5.1" — TCP-client tuning + critical regression fixes (May 7). Three new per-slot syscalls (348/349/350) for outgoing TCP connections: `tcpKeepalive(idle_sec, intvl_sec, count)` sets SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT on the selected slot via direct setsockopt on the LwIP fd — solves the SMA Tripower / Solar Edge "idle-disconnect after 60 s" pattern that's been forcing scripts to do periodic dummy reads; `tcpNoDelay(on)` toggles Nagle's algorithm (off by default after every connect, so this is mainly for re-enabling it intentionally); `tcpDisconnectReason()` returns 0..5 (NEVER, CONNECTED, PEER_CLOSED, TIMEOUT, NETWORK, USER_CLOSED) so a watchdog can react intelligently to RST/FIN vs network errors instead of blind reconnects. State is tracked per-slot in a new `tcp_cli_reason[TC_TCP_CLI_SLOTS]` field on the Tinyc struct; updated automatically by SYS_TCP_CONNECT/DISCONNECT/CONNECTED/DISCONNECT_REASON. Also bumped `TC_TCP_CLI_SLOTS` 4 → 8 (one Modbus-TCP user with BYD HVS + SMA Tripower SE + HM2.0 + Wallbox + future modules ran out at 4); each slot ~80 B in the Tinyc struct so 8 is fine even on ESP8266. Override via `-DTC_TCP_CLI_SLOTS=N`. IDE BUILTINS table + simulator stubs in lock-step (tinyc_ide.html.gz). Two critical regression fixes also rolled in: (a) AES/HMAC/SHA/HEX2BIN syscall stack-buffer overflow — 1.3.20 introduced `stackbuf[4096]` + `kbuf[1024]+dbuf[4096]` + `dbuf[4096]` + `src[1024]` as fixed-size locals inside `tc_vm_step`'s switch handlers; GCC at -Os reserves the largest unified switch-case frame at function entry regardless of which case runs, so every TinyC callback dispatch inflated tc_vm_step by ~5 KB. Loop task (8 KB) and web-server task (~4-8 KB) callbacks overflowed into adjacent heap → StoreProhibited in WiFi RX (esf_buf_alloc / wDev_IndicateFrame / ppTask). Fixed by heap-allocating all four buffers via special_malloc (PSRAM-preferring on equipped devices). (b) Multi-slot deadlock from `drop racy halted pre-check` (Apr 30) — that change removed the `s->vm.halted && s->vm.error == TC_OK` pre-check before tc_slot_callback in TinyCShow's JsonCall+WebCall fan-out, intending to fix a cosmetic spawnTask UI-disappear case. But without the pre-check every fan-out unconditionally takes each slot's mutex with portMAX_DELAY, deadlocking when a slot is mid-callback (delay) or mid-syscall in a spawnTask worker. Multi-slot configs hung permanently on slot startup or first nav-button click. Bisect against the C3 baseline (commit 63a7e6535, Apr 20) which ran the same pattern stably for weeks — pre-check restored. The spawnTask UI-disappear case will need a different cleaner fix (xSemaphoreTake with timeout instead of portMAX_DELAY) — open as a v1.6 follow-up. Previous: "1.5.0" — String operations (Option B from the strings evaluation): 7 new built-ins that operate in-place on existing char[] buffers — no new VM type, no GC, no heap pressure. New syscalls 302-308: SYS_STR_REPLACE_CONST (in-place find-and-replace-all of a literal old/new pair, returns count, handles both grow and shrink with full buffer-overflow guard), SYS_STR_STARTS_CONST (literal prefix check, 1/0), SYS_STR_ENDS_CONST (literal suffix check, 1/0), SYS_STR_CONTAINS_CONST (literal substring search, 1/0), SYS_STR_TO_UPPER (in-place ASCII A-Z conversion, UTF-8 multi-byte chars passed through), SYS_STR_TO_LOWER (in-place a-z), SYS_STR_TRIM (in-place strip leading + trailing ' '/'\\t'/'\\n'/'\\r', returns new length, shifts buffer down). Wired in the IDE BUILTINS table as strReplace / strStartsWith / strEndsWith / strContains / strToUpper / strToLower / strTrim. Each takes a `char[]` arg and a string-literal arg (compiled to const-pool index); runtime-needle variants intentionally not added in v1 — the literal-needle case is overwhelmingly common in IoT scripts (config-file parsing, prefix-based command dispatch, file-extension checks). Validated on .39 (tasmota32s3-devkit) via examples/test_strings_v15.tc — 9 test cases all green: multi-replace with UTF-8 expansion (unit=C → unit=°C ×2), replace grow (b → BB), replace shrink (hello → hi ×2), startsWith with edge cases (empty needle, longer-than-buffer), endsWith, contains, in-place case conversion, trim with all four whitespace cases (none, leading+trailing spaces, mixed \\t\\n\\r, all-whitespace). Closes ~80% of the "TinyC string handling is painful" gap from the strings evaluation; the runtime-needle variants and structural ops (split, join) are deferred — sprintf + the existing strToken cover those niches. Compile cycle unchanged (~10ms), bytecode adds ~20 bytes per call site (LOAD_CONST + LOAD_CONST + SYSCALL2). Previous: "1.4.3" — `void swap(int& a, int& b)` declares scalar pass-by-reference parameters; the callee reads/writes through the ref, mutations are visible to the caller. Also: `void parse_pair(int input, int& low, int& high)` for multi-out, `void inc_by(int& n, int amount) { n += amount; }` for in-place compound assignment, globals as ref args. **Zero new VM opcodes** — the implementation reuses the existing reference machinery (ADDR_LOCAL 0x78, ADDR_GLOBAL 0x79, LOAD_REF_ARR 0xA3, STORE_REF_ARR 0xA4 — already shipped for `int arr[]` array-by-reference params). A scalar ref is literally "an array ref always accessed at index 0": caller emits ADDR_LOCAL/ADDR_GLOBAL with the variable's slot/gindex; callee stores the encoded ref in a 1-slot local with `isScalarRef=true`; reads emit `PUSH_I8 0; LOAD_REF_ARR <slot>`; writes emit `PUSH_I8 0; <value>; STORE_REF_ARR <slot>`. Compound assignment (`n += 5`) handled with the standard DUP-and-recompute-offset pattern. Implementation: 5 idempotent patches in patch_refparams_v1.mjs (parser AMPERSAND-after-type acceptance, function-entry param registration, call-site ref encoding, identifier read, assignment write). v1 scope: int& only (float& and char& work too with same code path — declared types pass through, but coercions on float assignment route through I2F/F2I correctly); arg must be a plain Identifier of a local or global int variable; passing array elements (arr[i]), struct fields (obj.f), or heap-array variables yields a clear compile error. Validated on .39 via examples/test_refparams_v1.tc — all 4 patterns: swap (x=7, y=5 from 5,7), multi-out (lo=0xcd, hi=0xab from 0xABCD), compound `n += 5` (counter=25 from 10), globals as ref args (g_count=3, g_total=600 from 0,0). Out of v1: ref to array element (`func(arr[i])`), ref to struct field (`func(obj.f)`), heap-array vars as ref args, signature checking on the caller side (today silent). Float& and char& work but untested in v1. Previous: "1.4.2" — completes the dispatch-table pattern: `struct CmdEntry { char name[12]; cmd_handler handler; }` declares a struct with a typedef'd fn-ptr field; `cmds[i].handler = do_on;` assigns; `cmds[i].handler(args);` calls indirectly through the struct field. Three idempotent patches in patch_fnptrs_v2.mjs: (1) parser postfix accepts `(args)` after MemberAccess/MemberArrayAccess and produces a CallExpr with `callee` set to the access node (no name); (2) compileCallExpr detects callee-on-member-access, looks up the fn-ptr signature via the field's resolved type, pushes args, compiles the member access (emits LOAD_X to get the address from the struct slot), emits OP_CALL_INDIRECT; (3) exprLeavesValue extended to read the field signature for void-call detection. VM unchanged — uses the OP_CALL_INDIRECT shipped in v1.4.1. Validated on .39 via examples/test_fnptrs_v2.tc: 3-entry CmdEntry table populated with `cmds[i].handler = do_X`, looped-dispatched via `cmds[i].handler(arg)`, all three handlers (DO_ON, DO_OFF, DO_SET args=[42]) invoked correctly with the char[] arg propagated. Out of scope: function-pointer fields with array suffix `cmds[0].handlers[i](args)`, fn-ptr ARRAY fields. Previous: "1.4.1" — typedef-based fn-ptr types let scripts hold and call function references at runtime, enabling clean dispatch tables and callback-style APIs. New syntax: `typedef int (*cmp_fn)(int, int);` declares a fn-ptr type; `cmp_fn fn;` declares a variable; `fn = my_function;` assigns a named function's address; `fn(a, b)` calls indirectly. Works for locals, globals, and function parameters (e.g. `int run_op(cmp_fn f, int a, int b) { return f(a, b); }`). One new VM opcode `OP_CALL_INDIRECT 0x56`: pops u16 target from data stack instead of reading next 2 bytecode bytes, otherwise identical frame setup to OP_CALL. Bare function-name expression (no parens) emits PUSH_I32 with the function's bytecode address — uses big-endian 4-byte encoding to match existing PUSH_I32 / tc_read_i32 semantics; high two bytes always 0 since bytecode addresses fit in 16 bits. Forward references (calling a function defined later in the source) handled by a new `fnAddrPatches` queue that resolves after the function-compile pass alongside the existing forward-CALL patches. Implementation in patch_fnptrs_v1.mjs (11 idempotent patches against the IDE) + 1 new opcode handler in firmware. Validated end-to-end on .39 (tasmota32s3-devkit) via examples/test_fnptrs_v1.tc — all 4 patterns: local fn-ptr with two reassignments (7, 12), dispatch-by-id (9, 20), global fn-ptr with reassignment (Hello world! / Hi Tasmota.), fn-ptr as function parameter (30, 200). Two notable bugs found and fixed during validation: (1) initial PUSH_I32 byte order was little-endian, but firmware reads big-endian → indirect calls jumped to truncated addresses ending up at offset 0 and re-entering main() in an infinite loop; (2) compileExprStmt's exprLeavesValue() didn't know fn-ptr calls, defaulting to true → emitted POP for void fn-ptr calls → stack underflow on the 2nd void indirect call. Out of v1: function-pointer struct fields (interaction with Phase E pending), inline fn-ptr type syntax `void (*p)(int)` without typedef, comparison operators (==, !=) on fn-ptrs, returning fn-ptrs from functions, anonymous function literals. Previous: "1.4.0" — `struct Tag { int x; float y; char name[16]; }` defines a record type. Local + global + persist'd struct vars, positional initializer (`Point p = {1, 2}`), array of struct (`WriteLog wlog[16]`), char-array fields with `strcpy/sprintf %s`, nested structs (`Rect{Point tl; Point br}`), whole-struct assignment (`b = a` between matching tags) including array<->var both directions, struct as function parameter (by value), struct as return value, `sizeof(StructTag)` returns slot count at compile time. Implementation in `patch_structs_v1.mjs` (18 idempotent patches against the IDE). VM unchanged — uses existing 1D-array opcodes (LOAD/STORE_LOCAL/GLOBAL/HEAP_ARR) with compile-time field offsets and per-slot copy unrolling. Struct values follow TinyC's int32 slot model: each `int`/`char`/`float` field is 1 slot, char-array fields take their full slot count, nested structs flatten into the containing struct's layout. Heap-promotion follows existing rules: structs of ≤16 slots stack, larger ones (or array-of-struct totaling >16) auto-promote to heap. Return-by-value uses the existing `Op.RET` (which preserves data stack across frame teardown) — callee pushes N field values, caller pops them into the receiving local using a per-function temp slot for the offset/value swap. Validated end-to-end on .39 via `examples/test_structs_v1.tc` (11 test cases): basic field access (10/20/30), positional init, global+char-field, array indexed read/write, char-array field with strcpy+sprintf %s, nested struct (Rect.tl/br with 4-slot Point inner = 4 total slots, off-by-N bug fixed), whole-struct copy (var→var, arr[i]→var, var→arr[i]), function param (got 99,11), function return (z=42,84), sizeof (Point=2 WriteLog=4 Sample=18 Rect=4). Known v1 limitations: persist hash includes struct slotCount but NOT field-name list — silently reordering fields within a struct decl after persist data exists won't invalidate the .pvs file (workaround: delete .pvs manually, or add/remove a field which DOES invalidate). Also out of v1: self-referential structs (`struct Node { Node next; }` — needs pointers), 2D-array fields, struct equality `a==b`, designated initializers, function-pointer fields. Previous: "1.3.38" — `char/int/float buf[N][M]`. Full element read/write `buf[i][j] = …`, row passing `func(buf[i])` to char[]/int[]/float[] params, sprintf("%s", buf[i]) recognizer for char 2D, `strcpy/strcat/strcmp` on rows. Compiles to existing 1D heap-array opcodes via `i*M + j` flattening + `ADDR_HEAP_OFF` for row refs — VM unchanged. Row references require heap storage (auto-promoted at >16 elements; hard error otherwise with a clear message). Validated with `examples/test_2d.tc` (char) and `examples/test_2d_phase2.tc` (int + float + sprintf %s) on .39: int 2D writes/reads (ltab[r][c] = r*10+c → ltab[2][3]=23 ✓), float 2D (coef[1][1]=0.500 ✓), sprintf("%s", msgs[i]) in for-loop ✓. Patch script `patch_2d_arrays.mjs` is idempotent: applies cleanly to a fresh tinyc_ide.html.gz on each release rebuild. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)`. Element access `buf[i][j]` compiles to flat index `i*M + j` against the existing 1D heap-array opcodes. Single-index access `buf[i]` produces a row reference (via `ADDR_HEAP_OFF`, an existing opcode) when the result is used in a `char[]` parameter context — so `processChannel(buf[i], len)` and `strcpy(buf[i], "x")` work cleanly. Limited to `char` 2D for now; row-reference semantics requires heap storage (auto-promoted at >16 elements, so any practical 2D dimension qualifies). VM unchanged — pure compiler/IDE work. Validated end-to-end via `examples/test_2d.tc` on .39 with element access, constant + variable index row passing, strcpy/strcat/strcmp on rows, and a UDF accepting char[]. Phase 2 (deferred) covers `int/float buf[R][C]` and `sprintf("%s", buf[i])` recognizer. Previous: "1.3.37"    // Binary array file I/O — `fileReadBin(handle, arr, count)` and `fileWriteBin(handle, arr, count)` move count int32 elements between file and memory as 4-byte little-endian. Same syscall serves int[] and float[] alike (both are int32 in memory; the on-disk bit pattern is identical). Motivating use case: chart history files that survive `persist` layout-hash invalidation. The existing `persist` mechanism is right for layout-coupled scalars (where reading wrong-named data is dangerous), but hostile for time-series chart arrays — every persist-var add/remove blows away hours of accumulated history. Scripts can now keep charts in regular globals and save/load to a dedicated named file via these syscalls, independent of persist. New IDs 286/287; documented in TinyC_Reference.md. Pattern is reusable for any binary blob (calibration tables, lookup tables, etc.). Previous: "1.3.36"    // Autoexec spawn — additionally gated on `TasmotaGlobal.uptime >= TC_AUTOEXEC_MIN_UPTIME` (default 3 s). 1.3.35 deferred the spawn from FUNC_INIT to first FUNC_LOOP, which on this hardware is uptime ~134 ms. Empirically that's still inside the Wi-Fi/RF coex bring-up window: `serialBegin` from main() claims the UART but receives ZERO bytes. (Verified on 2026.05.03 ttgo47 build with heatpump_map.tcb — Tasmota's own download server doesn't come up until uptime ~2.4 s, indicating WifiHasIP went true around then; before that the UART subsystem isn't stable.) Adding the uptime gate makes the autoexec spawn wait until the Wi-Fi/RF coex is past its bring-up phase. main() then runs in a fully quiet environment and serialBegin works without any script-side delay or BootInit hook. Override via `-DTC_AUTOEXEC_MIN_UPTIME=N` for slow networks. Manual TinyCRun mid-life is unaffected. Previous: "1.3.35" — Autoexec spawn deferred from FUNC_INIT to first FUNC_LOOP. Root cause analysis: TinyC's main() runs in its own FreeRTOS task (`tc_vm_task`) spawned during xdrv_124's FUNC_INIT. The task gets scheduled when loopTask yields — which it does while other drivers' FUNC_INITs are still running and Wi-Fi/RF coex is initializing. main() ends up calling `serialBegin` (or any peripheral begin) concurrently with this platform init, the UART claim returns OK but the GPIO matrix routing gets clobbered, and zero bytes ever arrive on RX. In-tree Tasmota drivers don't see this race because they all run synchronously on loopTask in FUNC_INIT, single-threaded. The historical workaround was `delay(15000)` at the top of main() — the 15 seconds let Wi-Fi/RF coex + every late driver fully settle before serialBegin ran. Fix: split TinyCLoadSettings into two phases. FUNC_INIT only loads `/tinyc.cfg` and populates `Tinyc->slot_config[]`; the actual TinyCStartVM() loop moves to a new `TinyCStartAutoexec()` called once on the first non-paused FUNC_LOOP. By that point every other driver's FUNC_INIT has run — main() spawns into a quiet environment and user `serialBegin`/`i2cBegin`/`spiBegin` in main() works without any delay or BootInit hook. The BootInit callback added in 1.3.31 is kept (still useful for users who want to keep main() lean and put hardware init in a separately-named function), but it's now an opt-in convenience instead of a workaround for a timing bug. `TC_BOOT_INIT_MIN_UPTIME` define from 1.3.34 removed (no longer relevant). Manual TinyCRun mid-life is unaffected — that path didn't have the race in the first place since Tasmota was already past FUNC_INIT. Validated against `examples/heatpump_map.tc` with bookkeeping-only main() + serialBegin in BootInit + 15-second delay removed. Previous: "1.3.34" — BootInit cold-boot uptime gate (`TC_BOOT_INIT_MIN_UPTIME = 3 s`). 1.3.33 fired BootInit on the first FUNC_LOOP after main() returned, but on a script with bookkeeping-only main, that fires within ~600 ms of cold boot — much too early for serialBegin: the UART claim succeeds (handle returned) but NO bytes ever arrive. Empirically this is the same race that motivated the historical 15-second `delay()` workaround in main(): Tasmota's late-init phase (WiFi-up RF coex, SerialBridge, console/OTA listeners) needs several seconds to settle before peripheral hardware is stable. New gate: only dispatch BootInit at FUNC_LOOP when `TasmotaGlobal.uptime >= TC_BOOT_INIT_MIN_UPTIME`. 3 s is the minimum that lets WiFi come up cleanly on a typical network. Mid-life TinyCRun reloads are unaffected — uptime is already large so the gate is moot, BootInit fires immediately after main returns. Override via `-DTC_BOOT_INIT_MIN_UPTIME=N` if 3 s is too short for a particular board (the user's empirical 15 s window suggests some hardware needs more — observe at `addLog` "BootInit fired at uptime N s" and bump if your script still misses bytes). Previous: "1.3.33" — BootInit gate fix — use `s->vm.halted` (with mutex) instead of `!s->task_running`. The 1.3.32 implementation gated dispatch on `!s->task_running` which is wrong for any script with a `TaskLoop` callback: TaskLoop keeps the slot's FreeRTOS task alive forever after main() returns, so `task_running` stays true and BootInit never fires. (heatpump_map.tc has TaskLoop for the email watchdog — that's how this surfaced. 0 frames after reload because serialBegin in BootInit never ran.) Correct gate: hold the slot's vm_mutex, check `s->vm.halted && error == TC_OK`, fire `tc_vm_call_callback_id`, clear `boot_init_pending` — all atomic against concurrent TaskLoop callbacks (which momentarily set halted=false during their own invocations). Also early-clear the pending flag when the script doesn't define BootInit at all (cb_index < 0) to avoid scanning the same slot every FUNC_LOOP forever. Previous: "1.3.32" — BootInit dispatch — per-slot, fires once per VM run instead of once per device boot. The 1.3.31 implementation gated dispatch on a static-global one-shot (`tc_boot_init_fired`) which only fired on the very first non-paused FUNC_LOOP at cold boot — meaning any TinyCStop+TinyCRun reload silently SKIPPED BootInit, breaking the dev workflow (every script reload would lose hardware init). New gate: per-slot `s->boot_init_pending` (in TcSlot) — set to `true` in `TinyCStartVM` right after tc_vm_load, cleared after dispatch. FUNC_LOOP scans all slots; for each loaded slot with `boot_init_pending && !task_running` (i.e. main() has returned), dispatch BootInit and clear the flag. Net semantics: BootInit fires exactly once per VM run, after main() exits, on the first FUNC_LOOP that follows. Cold-boot autoexec works (~50 ms after FUNC_INIT chain settles); manual TinyCRun reload works (immediately after main returns); post-upload restart works (via the existing TinyCStartVM call). Validated against `examples/heatpump_map.tc` migrated to use BootInit() for `serialBegin` (removed the historical 15-second `delay()` workaround at the top of `main()`). Previous: "1.3.31" — New `BootInit` callback — fires once on the first FUNC_LOOP, after every other Tasmota driver's FUNC_INIT has run and all template-defined GPIOs are configured. Equivalent of Scripter's `>BS` section. Solves a long-standing pain point where `serialBegin()` (and other peripheral inits) called from `main()` race Tasmota's own driver init and crash or silently fail to bind a pin — users had to insert a multi-second `delay()` at the top of main to work around it. New idiom: keep `main()` for VM-side bookkeeping (allocations, persist load, addCommand, etc.) and put hardware init (`serialBegin`, `i2cBegin`, `spiBegin`, peripheral config writes) in `void BootInit() { ... }`. By the time BootInit fires, Tasmota's GPIO+peripheral setup has fully completed; WiFi may or may not be up yet (use `OnWifiConnect`/`OnInit` for that). Wired analogously to `tc_init_done` (FUNC_NETWORK_UP one-shot for OnInit) — new static `tc_boot_init_fired` gates a single dispatch on first FUNC_LOOP. cb_index slot inserted in the middle of TcCallbackId enum (between EVERY_SECOND and ON_INIT) so all subsequent IDs renumber by +1; safe because nothing serializes these IDs across firmware versions and any in-flight `vm->cb_index[]` is always re-resolved at `tc_vm_load`. IDE CALLBACK_NAMES in lock-step (tinyc_ide.html.gz) so the compiler keeps `BootInit` in the function table instead of dead-code-eliminating it. CLAUDE.md callback section updated. Previous: "1.3.30" — pwlRequest — fully drop the handshake timeout caps that 1.3.24..1.3.29 were trying. Decisive new evidence: the unmodified Scripter Powerwall.h runs for months on the SAME firmware where our TinyC pwlRequest sticks within ~30 connect cycles. Same library, same Powerwall, same chip — only difference left was that we set tc_basic_client.setTimeout(10) + tc_ssl_client.setHandshakeTimeout(10) before connect; Scripter sets neither. Hypothesis: occasional ECDSA handshakes exceed the cap, aborted mid-handshake, leaves BearSSL state half-initialized, cumulative corruption. Reverting to exact Scripter pattern (only setTimeout(3000) + 2-arg connect). Worst-case stuck window goes back up to ~30 s but the script-side pwl-stale watchdog (5 min) catches the rare actual-stuck case via Restart 1. Previous: "1.3.29" — pwlRequest 10-second handshake timeout cap (sweet spot between aborting ECDSA and unbounded lwIP hangs). 1.3.28 removed all caps to fix ECDSA handshake aborting at 3 s — but then a stuck BearSSL session caused 120-s lwIP TCP-connect hangs (the ESP-IDF lwIP default), holding the VM mutex for 2 minutes per failed call. 10 s is well above ECDSA's ~5 s cost and 12× shorter than lwIP default. Pairs with examples/powerwall.tc lower reboot threshold (PWL_REBOOT_THRESHOLD 6 → 3) so when @R doesn't unstick BearSSL (observed: it usually doesn't) we fall back to chip reboot in ~30 s instead of after multiple 5-min backoff cycles. Previous: "1.3.28" — pwlRequest connect-timeout caps removed (1.3.24/25/26 reverted). Tesla rolled the Powerwall local-API cert from RSA to ECDSA; ECDSA handshakes on ESP32 BearSSL take 4-5 s (EC point math), which our wobbler-protection caps (setHandshakeTimeout(3), 3-arg connect with 3000ms, tc_basic_client.setTimeout(3)) were aborting before completion. Symptom: every pwlRequest returned -1 in 6228 ms (= 2 retries × 3 s) regardless of actual Powerwall reachability — the Scripter's same-library `Powerwall` class kept working because it never had these caps. Reverted to the Scripter pattern: only `setTimeout(3000)` (which BSSL_TCP_Client interprets as 3000 SECONDS — effectively no timeout) and 2-arg `connect()`. Wobbler recovery now relies entirely on the script-side circuit breaker (cookie wipe → @R → reboot escalation in examples/powerwall.tc), which still works because individual operations either succeed in normal time or block on the BSSL default ~30 s and then fail. Worst-case stuck window is back up to ~30 s per failed call but normal operation works again. Previous: "1.3.27" — pwlRequest("@R") — SSL reset without device reboot. Adds a new `@R` command to tc_call2pwl that tears down the BSSL_TCP_Client session AND the underlying WiFiClient socket, briefly pauses for lwIP to release, then re-binds and re-inits ssl config + buffer sizes + insecure mode, and clears the auth cookie. Lets the powerwall.tc script recover from a stuck BearSSL state (the recurring failure mode where every pwlRequest times out at 6 s regardless of Powerwall reachability) without escalating to `tasmCmd("Restart 1")`. The script's circuit breaker now does @R at PWL_RESET_THRESHOLD (3 consecutive FAST fails) and only escalates to chip reboot at PWL_REBOOT_THRESHOLD (6 fails) if @R didn't help. Existing `@D` (config), `@C` (cts serials), `@N` (clear cookie) commands unchanged. Previous: "1.3.26" — pwlRequest connect() with explicit timeout. 1.3.24+25 set tc_basic_client.setTimeout(3) AND tc_ssl_client.setHandshakeTimeout(3) — but neither reliably caps the BSSL_TCP_Client `connect(host, port)` call on Arduino-ESP32 core 3.x. Observed 37-second hangs on a single failed call despite both timeouts. Switched to the explicit 3-arg `connect(host, port, timeout_ms)` overload (BSSL_TCP_Client.h line 130) which bounds the whole connect+handshake phase. Worst-case stuck window per failed call now ~3 s × TC_PWL_RETRIES = 6 s instead of 37 s. The setTimeout/setHandshakeTimeout calls stay (they bound read/write phases) but the connect cap is now what it always should have been. Combined with the script-side circuit breaker (cookie wipe + 4× backoff + skip-remaining), Powerwall wobblers now cause one ~3 s mutex hold instead of cascading multi-call freezes — device stays HTTP-responsive throughout. Previous: "1.3.25" — pwlRequest SSL-handshake timeout cap. 1.3.24 capped TCP connect (`tc_basic_client.setTimeout(3)`) which dropped the worst-case stuck window from ~60 s to ~36 s — but the SSL handshake itself has its own ~30 s default in BSSL_TCP_Client and was now the dominant cost (observed 36.6 s timeout per failed call). Now also calls `tc_ssl_client.setHandshakeTimeout(3)` (BSSL_TCP_Client API, seconds) to bound the handshake phase. Combined: TCP connect 3 s + SSL handshake 3 s + read/write 3-5 s; with TC_PWL_RETRIES=2 on connect, worst case ~6 s per failed pwlRequest call instead of 36+ s. Pairs with the script-side circuit breaker in examples/powerwall.tc — single failed call now causes ~6 s mutex hold (HTTP server recovers between calls), cookie wipe + 4× backoff prevents repeated hits, device stays usable through Powerwall wobblers. Previous: "1.3.24" — pwlRequest TCP connect-timeout cap. tc_pwl_get_cookie / tc_pwl_get_request both call `tc_ssl_client.connect()` which on Arduino-ESP32 inherits a ~30-s default TCP-connect timeout — the `setTimeout(3000)` set on the SSL client right above only bounds read/write. Combined with TC_PWL_RETRIES=2 + delay(100), worst case = ~60 s of held VM mutex when the Powerwall is unresponsive. During that hold the device looks completely "stuck" from the LAN side: HTTP server can't respond, multiple cadences pile up in TaskLoop, cascade of 3× 60-s timeouts froze a test device for ~3 minutes. Now also calls `tc_basic_client.setTimeout(3)` (Arduino WiFiClient API, seconds) which DOES bound the connect phase. Worst case drops to ~6 s (2 retries × 3 s). Pairs well with the script-side circuit breaker in examples/powerwall.tc which now backs off + clears the auth cookie on consecutive failures. Previous: "1.3.23" — pwlRequest now accepts a runtime char[] buffer (was: string-literal only). The SYS_PWL_REQUEST handler used to call `tc_get_const_str(vm, ci)` which only reads from the bytecode constant pool — meaning the whole credential string ("@Dip,email,password") had to be hardcoded in the .tc source. That forced either committing credentials or sprinkling `<POWERWALL_IP>` placeholders that broke the build for everyone else. Now uses the same dual-source `tc_ref_to_cstr` pattern that SPRINTF_STR was fixed to use a few releases back: copies up to 160 chars (fits @D ip,email,password) into a stack buffer regardless of whether the ref is a const-pool string literal or a heap/local char[]. IDE BUILTIN tinyc_ide.html.gz updated in lock-step (pwlRequest's `constArgs: [0]` → `strArgs: [0]`) so the compiler stops rejecting non-literal first arguments. Net effect: scripts can now do `char cmd[160]; sprintf(cmd, "@D%s,%s,%s", ip, email, pw); pwlRequest(cmd);` with credentials read at runtime from /powerwall.cfg — no more TESLA_EMAIL/PASSWORD/IP defines needed in user_config_override.h, no more credentials in the firmware binary, no more credentials in the .tc source. Pattern is identical to /pool_pump.cfg loading in examples/pool_pump.tc — see examples/powerwall.tc's load_pwl_config() for the canonical implementation. String-literal callsites (the existing `pwlRequest("/api/meters/aggregates")` etc) keep working unchanged because tc_ref_to_cstr handles const-pool refs transparently. Previous: "1.3.22" — sprintf %%-escape fix in `tc_sprintf_float`. The custom Arduino-safe float formatter (which bypasses libc snprintf because Arduino strips %f support) hand-walks the format string and copies prefix/suffix bytes verbatim around the float-spec replacement. The hunt loop correctly *skips* `%%` while searching for the active spec, but the prefix/suffix copy loops were emitting `%%` literally — producing e.g. "85 %% (12.98 kWh)" instead of "85 % (12.98 kWh)" on `sprintf(buf,"%d %% (%.2f kWh)",pct,kwh)`. Visible in any TinyC sprintf with `%%` adjacent to a float spec; the int path uses real snprintf and was already correct. Fixed both the prefix and suffix byte-walk loops to detect `%%` pairs and emit a single `%` (one extra `c++` per pair). No format-string semantic change for existing call sites that didn't use `%%`. Previous: "1.3.21" — UDP `global` send-side self-heal: when WiFi degrades, Arduino UDP can wedge multicast `endPacket()` while the upper-layer `udp_connected` flag stays true — silencing all `global` broadcasts from a slot until that slot is restarted. Symptom seen on a heat-pump device .31 whose `hp_in/hp_out/hp_at/hp_run` UDP globals stopped reaching subscriber slots even though the VM kept executing and `store_reg()` kept assigning. Receive side already auto-recovered via inactivity watchdog (`tc_udp_poll`); send side now mirrors that — `tc_udp_send/_array/_str` check `endPacket()`'s return value and on failure call `tc_udp_send_fail_recover()` which throttle-rebinds the multicast socket (`tc_udp_init()`). Throttle is `TC_UDP_REINIT_THROTTLE_MS = 5000` so a genuinely-down network can't cause continuous re-bind churn (every assignment to a UDP global would otherwise trigger). Logs at INFO when a re-init fires. Same logic transparently helps any future scripted-UDP/`udpSend` path that goes through these helpers. Previous: "1.3.20" — Symmetric crypto syscalls (360–365): aesEcb / aesCbc (AES-128, in-place on TinyC char[] buffers), hmacSha256, sha256, plus hex2bin / bin2hex byte-twiddling helpers. ESP32-only via mbedtls (already linked for HTTPS/MQTT-TLS); ESP8266 path stubs return 0/no-op. Motivating use case: TinyC scripts speaking the Tuya local protocol (v3.3 = AES-128-ECB) so users can drive Smart-Life-controlled devices (pool heat pumps, plugs, switches, dehumidifiers) directly from Tasmota without a cloud round-trip or a separate bridge. Also enables custom signed REST APIs (HMAC-SHA256), encrypted SML decoders not covered by AmsLib, and per-device MQTT-TLS fingerprinting. Buffers follow TinyC convention (one byte per int32 slot, low 8 bits used); lengths are in bytes and must fit the ref's allocated capacity. AES-CBC stack-allocates up to 4 KB per call, falls back to malloc above; HMAC/SHA bounded at 1024 B key / 4 KB data — bigger payloads should be hashed in chunks via repeated SHA-256 of a hash-state buffer (future enhancement). Tuya v3.4 (ECDH+AES-GCM) not exposed yet — most Smart-Life devices are still v3.3. IDE BUILTINS + symbol-table entries for the 6 functions are wired (refArgs[] / strArgs[] / intArgs[] in tinyc_ide.html.gz) — first user is examples/pool_pump.tc, validated end-to-end on ESP32-S3. Previous: "1.3.19" — Cross-VM share table + PSRAM-backed bytecode + IDE strcmp/sprintf fixes. (1) New 8-syscall `share*` API (340–347) lets two TinyC slots exchange named scalars/strings via a driver-global 32-entry table (~2.6 KB DRAM, mutex-protected on ESP32). Use this when one program outgrows a single slot and is split across two — e.g. Andreas's BYD/Speedwire/EEBus stack. Missing-key reads return 0/0.0/"" without error; `shareHas`/`shareDelete` complete the model. (2) `TC_MAX_PROGRAM` 65536 → 131072 with PSRAM fallback: `s->program` and `vm->const_data` allocate from internal DRAM first, only spill to `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` on OOM (ESP32 only). Small/normal programs stay in fast static RAM; only edge-case 100+ KB scripts (or scripts on devices with fragmented heap) reach PSRAM. AddLog INFO line emitted when PSRAM path is taken. (3) IDE: 4-site emitByte-truncation bug fixed — `emit(Op.SYSCALL); emitByte(Syscall.X)` truncated ids ≥256 to `id & 0xFF`, silently rerouting STRCMP_CONST=275 to SYS_MATH_POW=19 (so `strcmp(arr,"literal")` returned NaN bits 0x7FC00000 = 2143289344, breaking every `if (strcmp(...) == 0)` branch). Same bug hit FILE_WRITE_STR=276, LOG_LEVEL=269, LOG_LEVEL_STR=270. All four sites now use the existing `emitSyscall(id)` helper which auto-picks SYSCALL2 (u16) for ids ≥256. (4) IDE: `inferType(CallExpr)` had a hardcoded float-builtin list (sqrt/sin/cos/.../atof) and ignored the symbol-table `returnFloat: true` flag, so `sprintf(buf,"%.2f",shareGetFloat(...))` saw valType='int' and emitted I2F → reinterpreted bits → printed 1056964608.00 (= 0.5f bit-pattern). Now also returns 'float' when `BUILTINS[name].returnFloat === true`; future float-returning builtins work automatically.   Previous: "1.3.18" — Constant pool cap raised 512→1024 on ESP32 (Andreas BYD/Speedwire/EEBus scripts hit 440/512). "1.3.17" — TC_ERR_BOUNDS rich log + RET-time SP-balance check + compiler float→int narrowing warning.
+#define TC_RELEASE         "1.6.63"     // **TinyC 1.6.63: webText() FINALLY WRITES BACK. Found while converting lcd_i2c.tc to byte[] -- the question was whether packing survives the web round trip, and the answer was that nothing survived it. A char[]/byte[] over HEAP_THRESHOLD (16 elements) is HEAP-allocated, but the ?sv= write-back stored the typed text one character per int32 GLOBAL slot at `gref & 0x0FFF` -- which for a heap array is the HANDLE, not an index. Handle 0 meant globals[0]. Every webText on a buffer larger than 16 threw the entry away and overwrote the first scalars of the running script instead: `char devname[32]` in webui_demo, webcall_demo and multipage_demo, both custom lines in lcd_i2c. Only matter_bridge_ui's ip_in[16], exactly on the threshold and therefore inline, ever worked. ⚠️ Invisible because ONLY the write-back was wrong -- rendering goes through tc_ref_to_cstr(), which resolves heap refs correctly, so the field always showed the right text and merely refused to keep a new one. ⭐ The fix hands the JavaScript the whole REF (siva(value,id,ref) -> sv=id_S_ref_text) and writes through tc_cstr_to_ref(), the VM's own writer, which knows heap from global AND knows the element packing -- so the byte[] question that started the search is answered on the way past. The ref arrives from a URL and is bounded like the index was: tag 2 (global) or tag 3 without the const-pool bit (heap), nothing else, then tc_ref_maxlen() caps the length. The old s_ form stays for a page still open in a browser. Also: a string LITERAL may now be passed to a byte[] PARAMETER (it was restricted to char[], which made the packing warning's own advice -- move the parameter too -- impossible to follow wherever literals were passed); examples/lcd_i2c.tc converted to byte[] as the proof, 1884 -> 984 B of RAM for 216 B more bytecode; and both syntax highlighters caught up with the language -- do/struct/enum/typedef/const/static/persist/watch/global were drawn as plain identifiers, and byte, int16, short, uint16 and ushort had no colour at all.**
 #define TC_FILE_NAME       "/autoexec.tcb"
 #ifdef ESP8266
 #define TC_MAX_PERSIST     64          // ESP8266: keep the table small (simple programs, tight RAM)
@@ -501,6 +500,23 @@ enum TcOp {
   // Runtime array ref (ref params): resolve packed ref stored in local slot
   OP_LOAD_REF_ARR   = 0xA3,  // u8 local_idx; pop idx -> push *(resolveRef(local[local_idx])+idx)
   OP_STORE_REF_ARR  = 0xA4,  // u8 local_idx; pop val, pop idx -> *(resolveRef(local[local_idx])+idx)=val
+  // ── Packed byte arrays (`byte[]`, one byte per element) ──────────────────
+  // Every other array element in TinyC is an int32 — `char[]` included. A 1 KB
+  // buffer therefore costs 4 KB, and as a LOCAL it would want 1024 of the 256
+  // slots a frame has. `byte[]` lives PACKED in the same storage: n bytes take
+  // (n+3)/4 slots, element i is byte i of the region. The compiler knows the
+  // type at the access site and emits these opcodes directly, so a byte index
+  // costs the same as an int32 index with no branch in the hot path.
+  // See tinyc/docs/BYTE_ARRAYS.md.
+  OP_LOAD_LOCAL_BYTE  = 0xA8,  // u8 base_idx; pop idx -> push ((uint8_t*)&locals[base])[idx]
+  OP_STORE_LOCAL_BYTE = 0xA9,  // u8 base_idx; pop val, pop idx -> store byte
+  OP_LOAD_GLOBAL_BYTE = 0xAA,  // u16 base_idx; pop idx -> push byte
+  OP_STORE_GLOBAL_BYTE= 0xAB,  // u16 base_idx; pop val, pop idx -> store byte
+  OP_LOAD_HEAP_BYTE   = 0xAC,  // u8 handle; pop idx -> push byte
+  OP_STORE_HEAP_BYTE  = 0xAD,  // u8 handle; pop val, pop idx -> store byte
+  OP_LOAD_REF_BYTE    = 0xAE,  // u8 local_idx; pop idx -> push byte via resolved ref
+  OP_STORE_REF_BYTE   = 0xAF,  // u8 local_idx; pop val, pop idx -> store byte via ref
+
   // Watch variables (change tracking)
   OP_STORE_WATCH    = 0xA5,  // u16 varIdx, u16 shadowIdx, u16 writtenIdx — store with shadow update
   // Heap ref with slot offset — for strcpy(arr[i].field, ...)
@@ -544,6 +560,34 @@ enum TcOp {
                              // i.e. `i++` USED AS A STATEMENT: six opcodes, of which
                              // the DUP and the POP exist only to produce a value that
                              // is then thrown away.
+  // ── Packed 16-bit arrays (`int16` / `uint16`) ────────────────────────────
+  // Same idea as the byte block at 0xA8, one step coarser: an element is two
+  // bytes of the region, so `n` elements take (n+1)/2 int32 slots and element
+  // `i` sits at ((int16_t*)basis)[i]. Half the RAM of an int[] at the FULL
+  // resolution of a sensor reading — where byte[] needs WebChartQ's scale and
+  // offset to squeeze a temperature into eight bits, an int16 holds it in
+  // hundredths of a kelvin outright. See tinyc/docs/INT16_ARRAYS.md.
+  //
+  // Signedness is a property of the LOAD, not of the storage: the stores mask
+  // to 16 bits and are shared, while the compiler picks the sign- or
+  // zero-extending load from the declared type at the access site. That is why
+  // `uint16` costs four opcodes here instead of eight, and why the element-kind
+  // field in a ref needs no third value for it.
+  OP_LOAD_LOCAL_I16   = 0xB6,  // u8 base_idx; pop idx -> push (int16_t)((int16_t*)&locals[base])[idx]
+  OP_STORE_LOCAL_I16  = 0xB7,  // u8 base_idx; pop val, pop idx -> store 16 bits
+  OP_LOAD_GLOBAL_I16  = 0xB8,  // u16 base_idx; pop idx -> push sign-extended
+  OP_STORE_GLOBAL_I16 = 0xB9,  // u16 base_idx; pop val, pop idx -> store 16 bits
+  OP_LOAD_HEAP_I16    = 0xBA,  // u8 handle; pop idx -> push sign-extended
+  OP_STORE_HEAP_I16   = 0xBB,  // u8 handle; pop val, pop idx -> store 16 bits
+  OP_LOAD_REF_I16     = 0xBC,  // u8 local_idx; pop idx -> push sign-extended via resolved ref
+  OP_STORE_REF_I16    = 0xBD,  // u8 local_idx; pop val, pop idx -> store 16 bits via ref
+  // Zero-extending twins — `uint16` (Modbus holding registers, raw ADC words).
+  // No stores: a store writes the same sixteen bits either way.
+  OP_LOAD_LOCAL_U16   = 0xBE,  // u8 base_idx; pop idx -> push 0..65535
+  OP_LOAD_GLOBAL_U16  = 0xBF,  // u16 base_idx
+  OP_LOAD_HEAP_U16    = 0xC0,  // u8 handle
+  OP_LOAD_REF_U16     = 0xC1,  // u8 local_idx
+
   // Constants
   OP_LOAD_CONST   = 0x90,
 };
@@ -1319,6 +1363,7 @@ enum TcSyscall {
   SYS_WEB_CHART_SIZE  = 233, // (width, height) -> void — set chart div size in pixels (0=default)
   SYS_WEB_CHART_TBASE = 261, // (minutes) -> void — set time base offset from "now" for chart x-axis
   SYS_WEB_CHART_JS    = 354, // (js_str) -> void — attach script JS to the last WebChart (runs in draw scope with dt,o,el; set o.done to take over the draw)
+  SYS_WEB_CHART_Q     = 545, // (scale, offset) -> void — affine decode for the NEXT WebChart: value = raw * scale + offset. ONE-SHOT (cleared by the WebChart that uses it). Turns a packed byte[] into a physical quantity.
   SYS_WEB_REPO_PULLDOWN = 280, // (gref, label_c, json_url_c, index_key_c, dest_path_c) -> void — Scripter smlpd()-style remote JSON directory picker
   SYS_SML_APPLY_PINS    = 281, // (path_c, rx, tx, smlf) -> int — idempotent SML descriptor pin substitution (%0?rxpin%/%0?txpin%/%0?smlf%, leading 0 optional). Inserts "; <template>" comment line above each active line on first call; rebuilds active line from template on subsequent calls. Values are substituted verbatim (e.g. tx=-1 becomes the literal "-1" which SML accepts as "no tx pin"); the original placeholder text is preserved only in the template comment. Returns # subs done, 0 = no change, -1 = err.
   SYS_SML_SCRIPTER_LOAD = 282, // (path_c) -> int — extract >F/>S sections from descriptor, compile to bytecode, run on EverySecond/Every100ms ticks. Subset: lnv0..lnv9, +=/-=/*=//=/=, +-*/% < <= > >= == !=, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX"). Returns # sections compiled (0..2), -1 = err.
@@ -1376,12 +1421,12 @@ enum {
   TC_ERR_BAD_BINARY,     TC_ERR_INSTRUCTION_LIMIT,
   TC_ERR_BOUNDS,         TC_ERR_PAUSED,
   TC_ERR_FORBIDDEN_PIN,  TC_ERR_FRAME_INVALID,
-  // Speicher aus: bisher meldete jede fehlgeschlagene Anforderung beim Laden
-  // "Stack overflow" -- ein falscher Wegweiser, der die Suche in den VM-Stapel
-  // schickt, während in Wahrheit der Heap nicht reichte (Hans, 2026-08-18:
-  // "heap alloc failed (8835 slots, 34 KB)" und darunter "Load error: Stack
-  // overflow"). ANS ENDE gehängt, damit die Nummern der bestehenden Codes
-  // bleiben -- sie stehen so im Status-JSON und in der IDE.
+  // Out of memory: until now every failed allocation at load time reported
+  // "Stack overflow" -- a wrong signpost that sends the search into the VM
+  // stack while in truth the heap was short (Hans, 2026-08-18: "heap alloc
+  // failed (8835 slots, 34 KB)" with "Load error: Stack overflow" below it).
+  // Appended AT THE END so the numbers of the existing codes stay put -- they
+  // appear that way in the status JSON and in the IDE.
   TC_ERR_OUT_OF_MEMORY,
 };
 
@@ -2023,6 +2068,15 @@ static TcSlot *tc_sensor_get_slot = nullptr; // re-entry guard: skip this slot's
 static uint16_t tc_chart_width = 0;     // chart div width in px (0 = 100%)
 static uint16_t tc_chart_height = 0;    // chart div height in px (0 = 300px)
 static int32_t  tc_chart_time_base = 0; // time base offset in minutes from "now" (0=now)
+// WebChartQ(scale, offset): affine decode of the NEXT WebChart's samples,
+// value = raw * scale + offset. Identity by default, so an unset pair costs
+// nothing and changes nothing. Deliberately ONE-SHOT -- it is cleared again by
+// the WebChart that consumes it, unlike WebChartSize, whose stickiness across
+// slots is the standing complaint about chart layout. One WebChart call is one
+// series, so a per-series quantisation is exactly the right granularity: two
+// byte[] series in one chart routinely need different scales.
+static float    tc_chart_q_scale  = 1.0f;
+static float    tc_chart_q_offset = 0.0f;
 
 // Every HTTP response starts with a clean chart state. The Google Charts
 // loader is emitted once per PAGE, guarded by tc_chart_lib_sent -- so if the
@@ -2037,6 +2091,8 @@ static inline void tc_chart_response_reset(void) {
   tc_chart_width     = 0;
   tc_chart_height    = 0;
   tc_chart_time_base = 0;
+  tc_chart_q_scale   = 1.0f;
+  tc_chart_q_offset  = 0.0f;
 }
 #define TC_MAX_SERIAL_PORTS 3
 static TasmotaSerial *tc_serial_ports[TC_MAX_SERIAL_PORTS] = {}; // TinyC serial ports (up to 3, one per handle)
@@ -2189,7 +2245,126 @@ static inline bool tc_is_const_ref(int32_t ref) {
 }
 
 // Resolve a packed array ref to a pointer into VM memory, returns NULL on error
+// ── Element-kind field in a ref ─────────────────────────────────────────────
+// The ref encoding is fully used in all three forms, but a pair of bits is
+// free in each (see docs/BYTE_ARRAYS.md, docs/INT16_ARRAYS.md): heap bits 8-9,
+// global 16-17, local 24-25. That mapping lives ONLY here so it does not
+// reappear at 156 call sites.
+//
+//   00 = int32 (the default, and what every ref meant before byte[])
+//   01 = packed byte[]      -- UNCHANGED from the single-bit scheme
+//   10 = packed int16[]     (signed)
+//   11 = packed uint16[]    (unsigned)
+//
+// Signedness is normally a property of the LOAD opcode, not of the storage --
+// but a ref outlives the access site: a syscall that reads the array (WebChart)
+// has only the ref to go on, and would draw a uint16 sample of 60000 as -5536.
+// So the two 16-bit widths get their own code rather than sharing one.
+//
+// ⚠️ The `01` encoding is deliberately the old byte flag, bit-for-bit. Every
+// .tcb already in the field keeps meaning exactly what it meant, so widening
+// this from a flag to a field is not an ABI break by itself — only the new
+// OPCODES are (see TC_SYSCALL_ABI).
+#define TC_REF_BYTES_HEAP   0x00000100u
+#define TC_REF_BYTES_GLOBAL 0x00010000u
+#define TC_REF_BYTES_LOCAL  0x01000000u
+#define TC_REF_I16_HEAP     0x00000200u
+#define TC_REF_I16_GLOBAL   0x00020000u
+#define TC_REF_I16_LOCAL    0x02000000u
+
+// Element kinds, as stored in the two-bit field above.
+#define TC_ELEM_I32   0
+#define TC_ELEM_BYTE  1
+#define TC_ELEM_I16   2
+#define TC_ELEM_U16   3
+
+static inline uint32_t tc_ref_bytes_bit(int32_t ref) {
+  uint32_t uref = (uint32_t)ref;
+  switch (uref >> 30) {
+    case 3: return TC_REF_BYTES_HEAP;      // heap (const refs carry bit 15)
+    case 2: return TC_REF_BYTES_GLOBAL;
+    default: return TC_REF_BYTES_LOCAL;    // tag 0/1 = local
+  }
+}
+
+// Bit 1 of the field. Set alone it means int16; together with the byte bit
+// (i.e. `11`) it means uint16.
+static inline uint32_t tc_ref_i16_bit(int32_t ref) {
+  uint32_t uref = (uint32_t)ref;
+  switch (uref >> 30) {
+    case 3: return TC_REF_I16_HEAP;
+    case 2: return TC_REF_I16_GLOBAL;
+    default: return TC_REF_I16_LOCAL;
+  }
+}
+
+// Both bits of the field, for stripping.
+static inline uint32_t tc_ref_kind_mask(int32_t ref) {
+  return tc_ref_bytes_bit(ref) | tc_ref_i16_bit(ref);
+}
+
+// Which element kind does this ref carry? Const-pool refs (tag 3 with bit 15)
+// are string literals: they are char data, never a packed numeric array.
+static inline int tc_ref_elem_kind(int32_t ref) {
+  uint32_t uref = (uint32_t)ref;
+  if ((uref >> 30) == 3 && (uref & 0x8000u)) return TC_ELEM_I32;   // Konstante
+  int kind = 0;
+  if (uref & tc_ref_bytes_bit(ref)) kind |= 1;
+  if (uref & tc_ref_i16_bit(ref))   kind |= 2;
+  return kind;
+}
+
+// Bytes per element: 4, 1 or 2.
+static inline int tc_ref_elem_size(int32_t ref) {
+  switch (tc_ref_elem_kind(ref)) {
+    case TC_ELEM_BYTE: return 1;
+    case TC_ELEM_I16:
+    case TC_ELEM_U16:  return 2;
+    default:           return 4;
+  }
+}
+
+// Does this ref point at a packed byte[]? Kept as its own predicate because 64
+// syscall bodies ask exactly this question and nothing more.
+static inline bool tc_ref_is_bytes(int32_t ref) {
+  return tc_ref_elem_kind(ref) == TC_ELEM_BYTE;
+}
+
+// Packed 16-bit, either signedness.
+static inline bool tc_ref_is_i16(int32_t ref) {
+  const int k = tc_ref_elem_kind(ref);
+  return k == TC_ELEM_I16 || k == TC_ELEM_U16;
+}
+
+// ...and whether that 16-bit array is the signed one.
+static inline bool tc_ref_i16_signed(int32_t ref) {
+  return tc_ref_elem_kind(ref) == TC_ELEM_I16;
+}
+
+// Mark a ref — the compiler does this when it builds one, the firmware when it
+// passes one along.
+static inline int32_t tc_ref_mark_bytes(int32_t ref) {
+  return (int32_t)(((uint32_t)ref & ~tc_ref_kind_mask(ref)) | tc_ref_bytes_bit(ref));
+}
+
+static inline int32_t tc_ref_mark_i16(int32_t ref) {
+  return (int32_t)(((uint32_t)ref & ~tc_ref_kind_mask(ref)) | tc_ref_i16_bit(ref));
+}
+
+static inline int32_t tc_ref_mark_u16(int32_t ref) {
+  return (int32_t)(((uint32_t)ref & ~tc_ref_kind_mask(ref))
+                   | tc_ref_i16_bit(ref) | tc_ref_bytes_bit(ref));
+}
+
+// Strip the field again so the existing resolution arithmetic is untouched.
+static inline int32_t tc_ref_strip_kind(int32_t ref) {
+  return (int32_t)((uint32_t)ref & ~tc_ref_kind_mask(ref));
+}
+
 static int32_t* tc_resolve_ref(TcVM *vm, int32_t ref) {
+  // A byte[] flag would break the slot arithmetic; callers that want the int32
+  // pointer get it to the START of the region (the byte view sits on top).
+  ref = tc_ref_strip_kind(ref);
   uint32_t uref = (uint32_t)ref;
   uint8_t tag = uref >> 30;
   if (tag == 3) {
@@ -2244,9 +2419,29 @@ static int32_t* tc_resolve_ref(TcVM *vm, int32_t ref) {
 }
 
 // How many int32 slots remain from the ref's base index to the end of the array?
+static int32_t tc_ref_maxlen_slots(TcVM *vm, int32_t ref);   // fwd, defined below
+
 static int32_t tc_ref_maxlen(TcVM *vm, int32_t ref) {
+  // For a packed byte[] the capacity is asked in BYTES, not slots — four bytes
+  // per slot. The kind field has to come off first or the slot arithmetic below
+  // is wrong.
+  //
+  // ⚠️ int16[] is deliberately NOT handled here, and that is not an oversight.
+  // 121 call sites read this function under one contract — "byte[] gives bytes,
+  // anything else gives slots" — and most of them go on to write `cap` int32
+  // slots. Teaching it a THIRD unit would have made every one of those write
+  // twice past the end of an int16 array: precisely the class of bug that ABI 26
+  // exists to have fixed, multiplied by 121. So the contract stays, an int16 ref
+  // reads as its slot count here (always an UNDER-estimate, therefore safe), and
+  // the two places that genuinely want elements ask tc_ref_elem_count() instead.
+  const bool ist_bytes = tc_ref_is_bytes(ref);
+  ref = tc_ref_strip_kind(ref);
   uint32_t uref = (uint32_t)ref;
   uint8_t tag = uref >> 30;
+  if (ist_bytes) {
+    const int32_t slots = tc_ref_maxlen_slots(vm, ref);
+    return slots > 0 ? slots * 4 : 0;
+  }
   if (tag == 3) {
     // const-pool ref (string literal passed as char[]): length is the
     // C-string length of the const entry, +1 for the null terminator.
@@ -2277,6 +2472,91 @@ static int32_t tc_ref_maxlen(TcVM *vm, int32_t ref) {
     uint8_t base = uref & 0xFF;
     return (base < TC_MAX_LOCALS) ? TC_MAX_LOCALS - base : 0;
   }
+}
+
+// Capacity in SLOTS — the arithmetic tc_ref_maxlen does for int32 arrays. Split
+// out so the byte view can use it without recursing into itself.
+static int32_t tc_ref_maxlen_slots(TcVM *vm, int32_t ref) {
+  uint32_t uref = (uint32_t)tc_ref_strip_kind(ref);
+  uint8_t tag = uref >> 30;
+  if (tag == 3) {
+    if (tc_is_const_ref(ref)) return 0;
+    uint8_t handle = (uint8_t)(uref & 0xFF);
+    uint16_t offset = (uint16_t)((uref >> 16) & 0x3FFF);
+    if (handle < TC_MAX_HEAP_HANDLES && vm->heap_handles && vm->heap_handles[handle].alive) {
+      uint16_t sz = vm->heap_handles[handle].size;
+      return (offset < sz) ? (int32_t)(sz - offset) : 0;
+    }
+    return 0;
+  }
+  if (tag == 2) {
+    uint16_t base = uref & 0xFFFF;
+    return (base < vm->globals_size) ? vm->globals_size - base : 0;
+  }
+  uint8_t base = uref & 0xFF;
+  return (base < TC_MAX_LOCALS) ? TC_MAX_LOCALS - base : 0;
+}
+
+// Capacity in ELEMENTS, whatever the element width — the unit a syscall wants
+// when it walks an array as the script declared it. Separate from
+// tc_ref_maxlen() on purpose: see the warning there. Only WebChart and
+// sortArray need this; everything byte- or text-facing keeps the old contract.
+static int32_t tc_ref_elem_count(TcVM *vm, int32_t ref) {
+  if (tc_ref_is_i16(ref)) {
+    const int32_t slots = tc_ref_maxlen_slots(vm, ref);
+    return slots > 0 ? slots * 2 : 0;
+  }
+  return tc_ref_maxlen(vm, ref);   // byte[] already answers in elements
+}
+
+// ── Byte view of an array, whichever kind it is ─────────────────────────────
+// The byte-facing syscalls (file I/O, TCP/UDP, crypto, hex2bin, serial) convert
+// element by element today:
+//     for (int i = 0; i < n; i++) tmp[i] = (char)(arr[i] & 0xFF);
+// With a packed byte[] that is pointless — the bytes already sit that way in
+// memory. This helper serves both behind one signature:
+//   byte[]      -> pointer DIRECTLY into the region (no copy)
+//   int32 array -> `tmp` filled as before (low byte of each element)
+// `want` is the requested length, clamped to the capacity. Returns NULL when
+// the ref does not resolve.
+static uint8_t *tc_ref_bytes(TcVM *vm, int32_t ref, int32_t want,
+                             uint8_t *tmp, int32_t tmpcap, int32_t *out_len) {
+  const bool ist_bytes = tc_ref_is_bytes(ref);
+  int32_t cap = tc_ref_maxlen(vm, ref);          // byte[] -> bytes, else slots
+  if (want < 0 || want > cap) want = cap;
+  int32_t *basis = tc_resolve_ref(vm, ref);
+  if (!basis) { if (out_len) *out_len = 0; return nullptr; }
+  if (ist_bytes) {
+    if (out_len) *out_len = want;
+    return (uint8_t *)basis;                     // already packed
+  }
+  if (!tmp || tmpcap <= 0) { if (out_len) *out_len = 0; return nullptr; }
+  if (want > tmpcap) want = tmpcap;
+  for (int32_t i = 0; i < want; i++) tmp[i] = (uint8_t)(basis[i] & 0xFF);
+  if (out_len) *out_len = want;
+  return tmp;
+}
+
+// The write-back companion to tc_ref_bytes(): put `n` bytes from `src` INTO the
+// array `ref`, whichever kind it is. This is the direction a byte-facing syscall
+// takes for its RESULT (a digest, decrypted plaintext, bytes read off a socket).
+//   byte[]      -> memcpy straight into the packed region (one byte per byte)
+//   int32 array -> one byte per slot, as the syscalls wrote back by hand before
+// `n` is clamped to the capacity. Returns the number of bytes written.
+static int32_t tc_ref_put_bytes(TcVM *vm, int32_t ref, const uint8_t *src, int32_t n) {
+  if (!src || n <= 0) return 0;
+  int32_t cap = tc_ref_maxlen(vm, ref);          // byte[] -> bytes, else slots
+  if (n > cap) n = cap;
+  int32_t *basis = tc_resolve_ref(vm, ref);
+  if (!basis) return 0;
+  if (tc_ref_is_bytes(ref)) {
+    // memmove, not memcpy: for an in-place op on a byte[] the result already
+    // lives in the region (src points into it), so this call is a safe no-op.
+    memmove((uint8_t *)basis, src, n);
+  } else {
+    for (int32_t i = 0; i < n; i++) basis[i] = (int32_t)src[i];
+  }
+  return n;
 }
 
 // Normalize file mode: accept both char ('r','w','a') and int (0,1,2)
@@ -2310,11 +2590,20 @@ static int tc_ref_to_cstr(TcVM *vm, int32_t ref, char *out, int maxOut) {
   }
   int32_t *buf = tc_resolve_ref(vm, ref);
   if (!buf) { out[0] = '\0'; return 0; }
-  int32_t maxLen = tc_ref_maxlen(vm, ref);
+  int32_t maxLen = tc_ref_maxlen(vm, ref);   // byte[] -> bytes, else slots
   int i;
-  for (i = 0; i < maxLen && i < maxOut - 1; i++) {
-    if (buf[i] == 0) break;
-    out[i] = (char)(buf[i] & 0xFF);
+  if (tc_ref_is_bytes(ref)) {
+    // A byte[] holding text reads one byte per char, straight from the region.
+    const uint8_t *bp = (const uint8_t *)buf;
+    for (i = 0; i < maxLen && i < maxOut - 1; i++) {
+      if (bp[i] == 0) break;
+      out[i] = (char)bp[i];
+    }
+  } else {
+    for (i = 0; i < maxLen && i < maxOut - 1; i++) {
+      if (buf[i] == 0) break;
+      out[i] = (char)(buf[i] & 0xFF);
+    }
   }
   out[i] = '\0';
   return i;
@@ -2325,12 +2614,16 @@ static int tc_ref_to_cstr(TcVM *vm, int32_t ref, char *out, int maxOut) {
 static int tc_cstr_to_ref(TcVM *vm, int32_t ref, const char *src) {
   int32_t *buf = tc_resolve_ref(vm, ref);
   if (!buf || !src) return 0;
-  int32_t maxLen = tc_ref_maxlen(vm, ref) - 1;
+  int32_t maxLen = tc_ref_maxlen(vm, ref) - 1;   // byte[] -> bytes, else slots
   int i;
-  for (i = 0; i < maxLen && src[i]; i++) {
-    buf[i] = (int32_t)(uint8_t)src[i];
+  if (tc_ref_is_bytes(ref)) {
+    uint8_t *bp = (uint8_t *)buf;
+    for (i = 0; i < maxLen && src[i]; i++) bp[i] = (uint8_t)src[i];
+    bp[i] = 0;
+  } else {
+    for (i = 0; i < maxLen && src[i]; i++) buf[i] = (int32_t)(uint8_t)src[i];
+    buf[i] = 0;
   }
-  buf[i] = 0;
   return i;
 }
 
@@ -2360,12 +2653,15 @@ static void tc_stream_ref(TcVM *vm, int32_t ref, tc_send_fn sendFn) {
   }
   int32_t *buf = tc_resolve_ref(vm, ref);
   if (!buf) return;
-  int32_t maxLen = tc_ref_maxlen(vm, ref);
+  int32_t maxLen = tc_ref_maxlen(vm, ref);   // byte[] -> bytes, else slots
+  const bool is_bytes = tc_ref_is_bytes(ref);
+  const uint8_t *bp = (const uint8_t *)buf;
   char chunk[TC_STREAM_CHUNK];
   int ci = 0;
   for (int i = 0; i < maxLen; i++) {
-    if (buf[i] == 0) break;
-    chunk[ci++] = (char)(buf[i] & 0xFF);
+    uint8_t c = is_bytes ? bp[i] : (uint8_t)(buf[i] & 0xFF);
+    if (c == 0) break;
+    chunk[ci++] = (char)c;
     if (ci >= TC_STREAM_CHUNK - 1) {
       chunk[ci] = '\0';
       sendFn(chunk, ci);
@@ -3910,27 +4206,27 @@ static void tc_free_all_frames(TcVM *vm) {
 // keeps its address; compaction is a separate, bigger question.
 static void tc_heap_coalesce(TcVM *vm) {
   if (!vm->heap_handles) return;
-  bool wieder = true;
-  while (wieder) {
-    wieder = false;
+  bool again = true;
+  while (again) {
+    again = false;
     for (int i = 0; i < vm->heap_handle_count; i++) {
       if (vm->heap_handles[i].alive || vm->heap_handles[i].size == 0) continue;
-      uint16_t ende = vm->heap_handles[i].offset + vm->heap_handles[i].size;
+      uint16_t end = vm->heap_handles[i].offset + vm->heap_handles[i].size;
       for (int j = 0; j < vm->heap_handle_count; j++) {
         if (j == i || vm->heap_handles[j].alive || vm->heap_handles[j].size == 0) continue;
-        if (vm->heap_handles[j].offset == ende) {          // j schließt direkt an i an
+        if (vm->heap_handles[j].offset == end) {           // j sits right after i
           vm->heap_handles[i].size += vm->heap_handles[j].size;
-          vm->heap_handles[j].size = 0;                    // Beschreibung aufgeben
-          ende = vm->heap_handles[i].offset + vm->heap_handles[i].size;
-          wieder = true;
+          vm->heap_handles[j].size = 0;                    // give up the descriptor
+          end = vm->heap_handles[i].offset + vm->heap_handles[i].size;
+          again = true;
         }
       }
-      // Liegt der freie Block ganz oben, wandert die Bumpmarke zurück --
-      // dann kann die nächste Anforderung beliebig groß sein.
+      // If the free block is at the very top, the bump pointer walks back --
+      // then the next allocation can be of any size.
       if (vm->heap_handles[i].offset + vm->heap_handles[i].size == vm->heap_used) {
         vm->heap_used = vm->heap_handles[i].offset;
         vm->heap_handles[i].size = 0;
-        wieder = true;
+        again = true;
       }
     }
   }
@@ -3952,61 +4248,60 @@ static int tc_heap_alloc(TcVM *vm, uint16_t size) {
     if (!vm->heap_handles) return -1;
     vm->heap_handle_count = 0;
   }
-  // Eine UNBENUTZTE Beschreibung suchen. ⚠️ `!alive` allein reicht seit der
-  // Wiederverwendung nicht mehr: eine tote Beschreibung mit size > 0 ist ein
-  // FREIER BLOCK und darf nicht als leerer Eintrag überschrieben werden --
-  // sonst wäre sein Platz für immer verloren. Findet sich keiner, werden erst
-  // die freien Blöcke verschmolzen (das gibt Einträge zurück).
+  // Look for an UNUSED descriptor. ⚠️ `!alive` alone is no longer enough since
+  // blocks are reused: a dead descriptor with size > 0 IS A FREE BLOCK and must
+  // not be overwritten as if it were an empty entry -- its space would be lost
+  // forever. If none is found, the free blocks are merged first (that returns
+  // entries).
   int handle = -1;
-  for (int runde = 0; runde < 2 && handle < 0; runde++) {
+  for (int round = 0; round < 2 && handle < 0; round++) {
     for (int i = 0; i < TC_MAX_HEAP_HANDLES; i++) {
       if (!vm->heap_handles[i].alive && vm->heap_handles[i].size == 0) { handle = i; break; }
     }
-    if (handle < 0 && runde == 0) tc_heap_coalesce(vm);
+    if (handle < 0 && round == 0) tc_heap_coalesce(vm);
   }
   if (handle < 0) return -1;
 
-  // ── Erst aus dem Bestand bedienen ────────────────────────────────────────
-  // Bisher wuchs der Haufen bei JEDER Anforderung, auch wenn direkt daneben
-  // ein gleich großer, freigegebener Block lag: ein Skript, das Arrays anlegt
-  // und wieder freigibt (Diagramme!), trieb den Verbrauch monoton hoch, bis
-  // TC_MAX_HEAP erreicht war oder die Vergrößerung am zerstückelten
-  // System-Heap scheiterte. Jetzt wird der am besten passende freie Block
-  // genommen -- „am besten passend", damit ein großer Block nicht von einer
-  // kleinen Anforderung zerlegt wird.
+  // ── Serve from what we already have first ────────────────────────────────
+  // The heap used to grow on EVERY allocation, even with an equally large freed
+  // block right next to it: a script that creates and releases arrays (charts!)
+  // drove consumption monotonically up until TC_MAX_HEAP was reached or the
+  // growth failed on a fragmented system heap. Now the best-fitting free block
+  // is taken -- "best fitting" so a small request does not carve up a large
+  // block.
   {
-    int besser = -1;
-    uint16_t beste = 0;
+    int best = -1;
+    uint16_t best_size = 0;
     for (int i = 0; i < vm->heap_handle_count; i++) {
       if (vm->heap_handles[i].alive || vm->heap_handles[i].size < size) continue;
-      if (besser < 0 || vm->heap_handles[i].size < beste) {
-        besser = i; beste = vm->heap_handles[i].size;
+      if (best < 0 || vm->heap_handles[i].size < best_size) {
+        best = i; best_size = vm->heap_handles[i].size;
       }
     }
-    if (besser >= 0) {
-      // Rest abtrennen, wenn er sich lohnt UND eine Beschreibung frei ist;
-      // sonst bekommt die Anforderung den ganzen Block (die paar Slots mehr
-      // sind unsere, und beim Freigeben kommen sie vollständig zurück).
-      uint16_t rest = beste - size;
+    if (best >= 0) {
+      // Split off the remainder when it is worth it AND a descriptor is free;
+      // otherwise the request gets the whole block (the few extra slots are
+      // ours, and on free they all come back).
+      uint16_t rest = best_size - size;
       if (rest >= 16) {
-        int frei = -1;
+        int spare = -1;
         for (int i = 0; i < TC_MAX_HEAP_HANDLES; i++) {
-          if (i != besser && !vm->heap_handles[i].alive && vm->heap_handles[i].size == 0) {
-            frei = i; break;
+          if (i != best && !vm->heap_handles[i].alive && vm->heap_handles[i].size == 0) {
+            spare = i; break;
           }
         }
-        if (frei >= 0) {
-          vm->heap_handles[frei].offset = vm->heap_handles[besser].offset + size;
-          vm->heap_handles[frei].size   = rest;
-          vm->heap_handles[frei].alive  = false;
-          if ((uint8_t)(frei + 1) > vm->heap_handle_count) vm->heap_handle_count = frei + 1;
-          vm->heap_handles[besser].size = size;
+        if (spare >= 0) {
+          vm->heap_handles[spare].offset = vm->heap_handles[best].offset + size;
+          vm->heap_handles[spare].size   = rest;
+          vm->heap_handles[spare].alive  = false;
+          if ((uint8_t)(spare + 1) > vm->heap_handle_count) vm->heap_handle_count = spare + 1;
+          vm->heap_handles[best].size = size;
         }
       }
-      vm->heap_handles[besser].alive = true;
-      memset(&vm->heap_data[vm->heap_handles[besser].offset], 0,
-             vm->heap_handles[besser].size * sizeof(int32_t));
-      return besser;
+      vm->heap_handles[best].alive = true;
+      memset(&vm->heap_data[vm->heap_handles[best].offset], 0,
+             vm->heap_handles[best].size * sizeof(int32_t));
+      return best;
     }
   }
   // Grow heap if needed (up to TC_MAX_HEAP)
@@ -4497,6 +4792,41 @@ static int32_t tc_sprintf_to_ref(int32_t *dst, int32_t maxSlots, const char *tmp
     dst[i] = (int32_t)(uint8_t)tmpbuf[i];
   }
   dst[len] = 0;
+  return len;
+}
+
+// ── Byte-aware char access for the string-write syscalls ─────────────────────
+// A string element is normally one int32 slot; in a packed byte[] it is one
+// byte. `ib` (= tc_ref_is_bytes(ref), computed once per buffer by the caller)
+// selects which. The index is a CHARACTER position in both cases — the helper
+// hides the packing, so a syscall's own loops/shifts stay index-based and work
+// on either kind. char[] behaviour is byte-identical (ib=false path).
+static inline int32_t tc_chr_get(const int32_t *base, bool ib, int32_t i) {
+  return ib ? (int32_t)((const uint8_t *)base)[i] : base[i];
+}
+static inline void tc_chr_put(int32_t *base, bool ib, int32_t i, int32_t ch) {
+  if (ib) ((uint8_t *)base)[i] = (uint8_t)ch;
+  else    base[i] = ch;
+}
+// strlen over a resolved buffer, byte-aware. `cap` is the char capacity
+// (= tc_ref_maxlen: bytes for byte[], slots for int32 — both are char counts).
+static inline int32_t tc_str_len_b(const int32_t *base, bool ib, int32_t cap) {
+  int32_t i = 0;
+  while (i < cap && tc_chr_get(base, ib, i) != 0) i++;
+  return i;
+}
+// Copy C-string `s` into `base` at char offset `ofs`, NUL-terminated, bounded
+// by `cap` chars. Returns chars written (excluding NUL). Byte-aware. This is
+// tc_sprintf_to_ref generalised to a byte[]-or-int32 target with an offset, so
+// the sprintf _CAT variants no longer need int32 `dst + ofs` pointer maths.
+static inline int32_t tc_str_write_b(int32_t *base, bool ib, int32_t cap,
+                                     int32_t ofs, const char *s) {
+  int32_t len = (int32_t)strlen(s);
+  int32_t room = cap - 1 - ofs;
+  if (room < 0) room = 0;
+  if (len > room) len = room;
+  for (int32_t i = 0; i < len; i++) tc_chr_put(base, ib, ofs + i, (int32_t)(uint8_t)s[i]);
+  tc_chr_put(base, ib, ofs + len, 0);
   return len;
 }
 
@@ -6190,6 +6520,13 @@ static int32_t tc_fast_mux(uint32_t flag, uint32_t time, int32_t *buf, uint32_t 
 // hardcoded slot 0. Low 12 bits = global index (TC_MAX_GLOBALS=512, fits 0x0FFF),
 // bits 12-14 = slot index (TC_MAX_VMS=6). An id with no high bits decodes to
 // slot 0 -> backward compatible with the old single-slot behaviour.
+//
+// ⚠️ This id identifies a SCALAR global and nothing else. It cannot address an
+// ARRAY: bits 16-17 (the element kind) and the heap tag are both masked off by
+// the 0x0FFF, so a heap-allocated array arrives here as its bare handle and is
+// indistinguishable from global index 0. webText is the only widget that writes
+// an array, and it therefore does NOT round-trip through this id -- it sends the
+// whole ref instead (see SYS_WEB_TEXT and the "S_" branch of TinyC_WebSetVar).
 static inline uint16_t tc_widget_id(int32_t gref) {
   uint16_t gidx = (uint16_t)(((uint32_t)gref) & 0x0FFF);
   if (Tinyc && tc_current_slot) {
@@ -6696,14 +7033,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int hh = TC_POP(vm);  // handle
       TasmotaSerial *p = tc_serial_get(hh);
       if (p && b > 0 && b <= 256) {
-        int32_t *buf = tc_resolve_ref(vm, a);
-        if (buf) {
-          int32_t maxLen = tc_ref_maxlen(vm, a);
-          if (b > maxLen) b = maxLen;
-          TC_UBUF(tbuf, 256);
-          for (int i = 0; i < b; i++) tbuf[i] = (uint8_t)(buf[i] & 0xFF);
-          p->write(tbuf, b);
-        }
+        // accepts char[] OR byte[]: tc_ref_bytes points into a byte[] region
+        // directly and gathers the low bytes of an int32 array into tbuf.
+        TC_UBUF(tbuf, 256);
+        int32_t n = 0;
+        uint8_t *bp = tc_ref_bytes(vm, a, b, tbuf, sizeof(tbuf), &n);
+        if (bp && n > 0) p->write(bp, n);
       }
       break;
     }
@@ -6784,11 +7119,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Capture response immediately before it's overwritten
       const char *resp = ResponseData();
       int32_t rlen = strlen(resp);
+      // Byte-aware, same reason as httpGet/smlGetStr: maxLen is a BYTE count
+      // for a packed byte[] while a bare buf[i] writes int32 slots.
+      const bool ist_bytes = tc_ref_is_bytes(buf_ref);
       if (rlen > maxLen) rlen = maxLen;
       for (int32_t i = 0; i < rlen; i++) {
-        buf[i] = (int32_t)(uint8_t)resp[i];
+        tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)resp[i]);
       }
-      buf[rlen] = 0;  // null-terminate
+      tc_chr_put(buf, ist_bytes, rlen, 0);  // null-terminate
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: tasmCmd -> %d bytes"), rlen);
       TC_PUSH(vm, rlen);
       break;
@@ -6863,7 +7201,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         len = (int32_t)strlen(cs);
       } else {
         int32_t *p = tc_resolve_ref(vm, a);
-        if (p) { int32_t max = tc_ref_maxlen(vm, a); while (p[len] != 0 && len < max) len++; }
+        if (p) { len = tc_str_len_b(p, tc_ref_is_bytes(a), tc_ref_maxlen(vm, a)); }
       }
       TC_PUSH(vm, len);
       break;
@@ -6873,26 +7211,22 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t dst_ref = TC_POP(vm);
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       if (!dst) break;
+      const bool dib = tc_ref_is_bytes(dst_ref);   // dst may be a packed byte[]
       int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
       // Source may be a const-pool string ref (e.g. string literal passed
-      // through a function param). Detect and use char* path; otherwise
-      // treat as an int32 VM array.
+      // through a function param), a char[] or a byte[]; all read byte-aware.
       if (tc_is_const_ref(src_ref)) {
-        uint16_t ci = (uint16_t)(((uint32_t)src_ref) & 0x7FFF);
-        if (ci < vm->const_count && vm->constants[ci].type == 1) {
-          const char *s = vm->constants[ci].str.ptr;
-          int32_t i = 0;
-          while (s && s[i] != 0 && i < max) { dst[i] = (int32_t)(uint8_t)s[i]; i++; }
-          dst[i] = 0;
-        } else {
-          dst[0] = 0;
-        }
+        const char *s = tc_const_ref_str(vm, src_ref);
+        int32_t i = 0;
+        while (s && s[i] != 0 && i < max) { tc_chr_put(dst, dib, i, (int32_t)(uint8_t)s[i]); i++; }
+        tc_chr_put(dst, dib, i, 0);
       } else {
         int32_t *src = tc_resolve_ref(vm, src_ref);
         if (src) {
+          const bool sib = tc_ref_is_bytes(src_ref);
           int32_t i = 0;
-          while (src[i] != 0 && i < max) { dst[i] = src[i]; i++; }
-          dst[i] = 0;
+          while (i < max) { int32_t c = tc_chr_get(src, sib, i); if (c == 0) break; tc_chr_put(dst, dib, i, c); i++; }
+          tc_chr_put(dst, dib, i, 0);
         }
       }
       break;
@@ -6902,20 +7236,22 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t dst_ref = TC_POP(vm);
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       if (!dst) break;
+      const bool dib = tc_ref_is_bytes(dst_ref);
       int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
-      int32_t di = 0;
-      while (dst[di] != 0 && di < max) di++;
+      int32_t di = tc_str_len_b(dst, dib, max + 1);
+      if (di > max) di = max;
       const char *cs = tc_const_ref_str(vm, src_ref);   // literal passed via char[] param
       if (cs) {
         int32_t si = 0;
-        while (cs[si] != 0 && di < max) { dst[di++] = (int32_t)(uint8_t)cs[si++]; }
-        dst[di] = 0;
+        while (cs[si] != 0 && di < max) { tc_chr_put(dst, dib, di++, (int32_t)(uint8_t)cs[si++]); }
+        tc_chr_put(dst, dib, di, 0);
       } else {
         int32_t *src = tc_resolve_ref(vm, src_ref);
         if (src) {
+          const bool sib = tc_ref_is_bytes(src_ref);
           int32_t si = 0;
-          while (src[si] != 0 && di < max) { dst[di++] = src[si++]; }
-          dst[di] = 0;
+          while (di < max) { int32_t c = tc_chr_get(src, sib, si); if (c == 0) break; tc_chr_put(dst, dib, di++, c); si++; }
+          tc_chr_put(dst, dib, di, 0);
         }
       }
       break;
@@ -6929,14 +7265,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *cb = tc_const_ref_str(vm, b_ref);
       int32_t *pa = ca ? nullptr : tc_resolve_ref(vm, a_ref);
       int32_t *pb = cb ? nullptr : tc_resolve_ref(vm, b_ref);
+      const bool aib = (!ca) && tc_ref_is_bytes(a_ref);
+      const bool bib = (!cb) && tc_ref_is_bytes(b_ref);
       int32_t result = 0;
       if ((ca || pa) && (cb || pb)) {
         int32_t max_a = ca ? 0 : tc_ref_maxlen(vm, a_ref);
         int32_t max_b = cb ? 0 : tc_ref_maxlen(vm, b_ref);
         int32_t i = 0;
         while (1) {
-          int32_t va = ca ? (int32_t)(uint8_t)ca[i] : (i < max_a ? (pa[i] & 0xFF) : 0);
-          int32_t vb = cb ? (int32_t)(uint8_t)cb[i] : (i < max_b ? (pb[i] & 0xFF) : 0);
+          int32_t va = ca ? (int32_t)(uint8_t)ca[i] : (i < max_a ? (tc_chr_get(pa, aib, i) & 0xFF) : 0);
+          int32_t vb = cb ? (int32_t)(uint8_t)cb[i] : (i < max_b ? (tc_chr_get(pb, bib, i) & 0xFF) : 0);
           if (va != vb) { result = va - vb; break; }
           if (va == 0)  { result = 0;       break; }
           i++;
@@ -6953,11 +7291,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = 0;
       if (pa && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *pb = vm->constants[ci].str.ptr;
+        const bool aib = tc_ref_is_bytes(a_ref);
         int32_t max_a = tc_ref_maxlen(vm, a_ref);
         int32_t i = 0;
-        while (pa[i] != 0 && pb[i] != 0 && pa[i] == (int32_t)(uint8_t)pb[i] && i < max_a) i++;
-        int32_t bv = (i < max_a) ? (int32_t)(uint8_t)pb[i] : 0;
-        result = pa[i] - bv;
+        while (i < max_a && tc_chr_get(pa, aib, i) != 0 && pb[i] != 0
+               && tc_chr_get(pa, aib, i) == (int32_t)(uint8_t)pb[i]) i++;
+        int32_t av = (i < max_a) ? tc_chr_get(pa, aib, i) : 0;
+        int32_t bv = (int32_t)(uint8_t)pb[i];
+        result = av - bv;
       }
       TC_PUSH(vm, result);
       break;
@@ -6970,10 +7311,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       } else {
         int32_t *p = tc_resolve_ref(vm, a);
         if (p) {
+          const bool ib = tc_ref_is_bytes(a);
           int32_t max = tc_ref_maxlen(vm, a);
           int32_t i = 0;
-          while (p[i] != 0 && i < max) {
-            tc_output_char((char)(p[i] & 0xFF));
+          while (i < max) {
+            int32_t c = tc_chr_get(p, ib, i);
+            if (c == 0) break;
+            tc_output_char((char)(c & 0xFF));
             i++;
           }
         }
@@ -6986,10 +7330,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       if (dst && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *s = vm->constants[ci].str.ptr;
+        const bool dib = tc_ref_is_bytes(dst_ref);
         int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
         int32_t i = 0;
-        while (s[i] != 0 && i < max) { dst[i] = (int32_t)(uint8_t)s[i]; i++; }
-        dst[i] = 0;
+        while (s[i] != 0 && i < max) { tc_chr_put(dst, dib, i, (int32_t)(uint8_t)s[i]); i++; }
+        tc_chr_put(dst, dib, i, 0);
       }
       break;
     }
@@ -6999,12 +7344,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       if (dst && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *s = vm->constants[ci].str.ptr;
+        const bool dib = tc_ref_is_bytes(dst_ref);
         int32_t max = tc_ref_maxlen(vm, dst_ref) - 1;
-        int32_t di = 0;
-        while (dst[di] != 0 && di < max) di++;
+        int32_t di = tc_str_len_b(dst, dib, max + 1);
+        if (di > max) di = max;
         int32_t si = 0;
-        while (s[si] != 0 && di < max) { dst[di++] = (int32_t)(uint8_t)s[si++]; }
-        dst[di] = 0;
+        while (s[si] != 0 && di < max) { tc_chr_put(dst, dib, di++, (int32_t)(uint8_t)s[si++]); }
+        tc_chr_put(dst, dib, di, 0);
       }
       break;
     }
@@ -7031,7 +7377,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, val);
-      TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
+      TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
     case SYS_SPRINTF_FLT: {
@@ -7044,7 +7390,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       TC_BUF(tmp, 256);
       tc_sprintf_float(tmp, sizeof(tmp), fmt, fval);
-      TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
+      TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
     case SYS_SPRINTF_STR: {
@@ -7065,7 +7411,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, srcbuf);
-      TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
+      TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
 
@@ -7078,11 +7424,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *fmt = tc_get_const_str(vm, ci);
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      int32_t ofs = tc_strlen_ref(dst, maxSlots);
+      const bool _dib = tc_ref_is_bytes(dst_ref);
+      int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, val);
-      tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
-      TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
+      int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
+      TC_PUSH(vm, ofs + _w);
       break;
     }
     case SYS_SPRINTF_FLT_CAT: {
@@ -7093,11 +7440,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *fmt = tc_get_const_str(vm, ci);
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      int32_t ofs = tc_strlen_ref(dst, maxSlots);
+      const bool _dib = tc_ref_is_bytes(dst_ref);
+      int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       TC_BUF(tmp, 256);
       tc_sprintf_float(tmp, sizeof(tmp), fmt, fval);
-      tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
-      TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
+      int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
+      TC_PUSH(vm, ofs + _w);
       break;
     }
     case SYS_SPRINTF_STR_CAT: {
@@ -7108,14 +7456,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *fmt = tc_get_const_str(vm, ci);
       if (!dst || !fmt) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      int32_t ofs = tc_strlen_ref(dst, maxSlots);
+      const bool _dib = tc_ref_is_bytes(dst_ref);
+      int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       // Const-ref-aware source extraction (same fix as SPRINTF_STR).
       TC_BUF(srcbuf, 256);
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, srcbuf);
-      tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
-      TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
+      int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
+      TC_PUSH(vm, ofs + _w);
       break;
     }
 
@@ -7131,7 +7480,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, srcStr);
-      TC_PUSH(vm, tc_sprintf_to_ref(dst, maxSlots, tmp));
+      TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
     case SYS_SPRINTF_STR_CAT_CONST: {
@@ -7143,11 +7492,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *srcStr = tc_get_const_str(vm, src_ci);
       if (!dst || !fmt || !srcStr) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
-      int32_t ofs = tc_strlen_ref(dst, maxSlots);
+      const bool _dib = tc_ref_is_bytes(dst_ref);
+      int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       TC_BUF(tmp, 256);
       snprintf(tmp, sizeof(tmp), fmt, srcStr);
-      tc_sprintf_to_ref(dst + ofs, maxSlots - ofs, tmp);
-      TC_PUSH(vm, ofs + (int32_t)strlen(tmp));
+      int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
+      TC_PUSH(vm, ofs + _w);
       break;
     }
 
@@ -7223,7 +7573,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         int n = tc_file_handles[h].read(tmp, chunk);
         if (n <= 0) break;
         for (int i = 0; i < n; i++) {
-          buf[total + i] = (int32_t)tmp[i];
+          // Byte-aware, the read counterpart of SYS_FILE_WRITE above.
+          tc_chr_put(buf, tc_ref_is_bytes(buf_ref), total + i, (int32_t)tmp[i]);
         }
         total += n;
       }
@@ -7240,16 +7591,20 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         TC_PUSH(vm, -1);
         break;
       }
+      // Byte-aware read side: tc_ref_maxlen() gives the element count either
+      // way, but a packed byte[] holds four elements per slot — reading it as
+      // int32 slots walked off the end and wrote garbage into the file.
+      const bool ist_bytes = tc_ref_is_bytes(buf_ref);
       int32_t maxSlots = tc_ref_maxlen(vm, buf_ref);
       if (len > maxSlots) len = maxSlots;
-      // Convert int32 array elements to bytes and write
+      // Convert array elements to bytes and write
       TC_UBUF(tmp, 256);
       int32_t total = 0;
       while (total < len) {
         int32_t chunk = len - total;
         if (chunk > (int32_t)sizeof(tmp)) chunk = sizeof(tmp);
         for (int32_t i = 0; i < chunk; i++) {
-          tmp[i] = (uint8_t)(buf[total + i] & 0xFF);
+          tmp[i] = (uint8_t)(tc_chr_get(buf, ist_bytes, total + i) & 0xFF);
         }
         int n = tc_file_handles[h].write(tmp, chunk);
         if (n <= 0) break;
@@ -7296,12 +7651,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       break;
     }
 
-    // fileRename(from, to) — Datei umbenennen/verschieben. Gab es bisher nicht;
-    // ohne sie musste man "einmal erledigt"-Zustaende ueber zusaetzliche
-    // Markierungsdateien nachbilden oder das Original loeschen (gemu 2026-07-25,
-    // beim Umstellen der sml_chart-Speicherung). LittleFS/FFat koennen es nativ.
-    // Ziel wird NICHT stillschweigend ueberschrieben: existiert es schon, gibt
-    // es -1 -- sonst koennte ein Tippfehler im Zielnamen Daten vernichten.
+    // fileRename(from, to) — rename/move a file. Did not exist before; without
+    // it, "done once" states had to be modelled with extra marker files or by
+    // deleting the original (gemu 2026-07-25, while reworking the sml_chart
+    // storage). LittleFS/FFat do it natively. The target is NOT overwritten
+    // silently: if it exists the call returns -1 -- otherwise a typo in the
+    // target name could destroy data.
     case SYS_SPP_INIT:
     case SYS_SPP_STATE:
     case SYS_SPP_AVAILABLE:
@@ -7425,15 +7780,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!pfrom[0] || !pto[0]) { TC_PUSH(vm, -1); break; }
       FS *fsf = tc_file_path(pfrom);
       FS *fst = tc_file_path(pto);
-      // Quelle und Ziel muessen auf demselben Dateisystem liegen -- rename()
-      // kann nicht ueber Dateisystemgrenzen (Flash <-> SD) kopieren.
+      // Source and target have to live on the same filesystem -- rename()
+      // cannot copy across a filesystem boundary (flash <-> SD).
       if (!fsf || !fst || fsf != fst) {
-        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileRename(\"%s\",\"%s\") -> -1 (anderes Dateisystem)"), pfrom, pto);
+        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileRename(\"%s\",\"%s\") -> -1 (different filesystem)"), pfrom, pto);
         TC_PUSH(vm, -1);
         break;
       }
       if (!fsf->exists(pfrom)) { TC_PUSH(vm, -1); break; }
-      if (fsf->exists(pto))    { TC_PUSH(vm, -1); break; }   // nie stumm ueberschreiben
+      if (fsf->exists(pto))    { TC_PUSH(vm, -1); break; }   // never overwrite silently
       bool ok = fsf->rename(pfrom, pto);
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileRename(\"%s\",\"%s\") -> %d"), pfrom, pto, ok ? 0 : -1);
       TC_PUSH(vm, ok ? 0 : -1);
@@ -8285,7 +8640,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (handle >= 0 && handle < TC_MAX_FILE_HANDLES && Tinyc->file_used[handle]) {
         File &f = tc_file_handles[handle];
         int32_t *base = tc_resolve_ref(vm, ref);
-        int32_t cap   = tc_ref_maxlen(vm, ref);
+        // A packed array holds INTEGERS, not float bit patterns, and holds more
+        // of them than it has slots -- so both the count and the decoding come
+        // off the element kind. Without this an int16[] chart ring exported as
+        // bit-cast floats: garbage values, and only half the samples.
+        const int wa_kind = tc_ref_elem_kind(ref);
+        int32_t cap   = tc_ref_elem_count(vm, ref);
         int32_t n = count;
         if (n > cap) n = cap;          // never read past the array's storage
         if (n < 0) n = 0;
@@ -8293,7 +8653,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           char tmp[32];
           for (int32_t i = 0; i < n; i++) {
             if (i > 0) f.write((uint8_t)'\t');
-            float fv; memcpy(&fv, &base[i], sizeof(float));
+            float fv;
+            switch (wa_kind) {
+              case TC_ELEM_BYTE: fv = (float)((const uint8_t  *)base)[i]; break;
+              case TC_ELEM_I16:  fv = (float)((const int16_t  *)base)[i]; break;
+              case TC_ELEM_U16:  fv = (float)((const uint16_t *)base)[i]; break;
+              default: memcpy(&fv, &base[i], sizeof(float)); break;
+            }
             // negative precision = up to `decimals` places, trailing zeros stripped
             ext_snprintf_P(tmp, sizeof(tmp), PSTR("%*_f"), -decimals, &fv);
             f.write((const uint8_t*)tmp, strlen(tmp));
@@ -8323,10 +8689,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       int32_t *base = tc_resolve_ref(vm, buf_ref);
       if (!base) { TC_PUSH(vm, -1); break; }
-      int32_t maxSlots = tc_ref_maxlen(vm, buf_ref);
+      int32_t maxSlots = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
       if (count < 0) count = 0;
       if (count > maxSlots) count = maxSlots;
       File &f = tc_file_handles[handle];
+      // A byte[] target reads RAW bytes (one file byte per element), not the
+      // 4-byte-LE int32 elements below — `count` is a byte count here.
+      if (tc_ref_is_bytes(buf_ref)) {
+        int n = (count > 0) ? f.read((uint8_t*)base, count) : 0;
+        if (n < 0) n = 0;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileReadBin(%d, %d) -> %d bytes"), handle, count, n);
+        TC_PUSH(vm, n);
+        break;
+      }
       uint8_t tmp[256];           // 64 int32 elements per chunk
       int32_t total_elems = 0;
       int32_t bytes_remaining = count * 4;
@@ -8371,10 +8746,20 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       int32_t *base = tc_resolve_ref(vm, buf_ref);
       if (!base) { TC_PUSH(vm, -1); break; }
-      int32_t maxSlots = tc_ref_maxlen(vm, buf_ref);
+      int32_t maxSlots = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
       if (count < 0) count = 0;
       if (count > maxSlots) count = maxSlots;
       File &f = tc_file_handles[handle];
+      // A byte[] source writes RAW bytes (one per element), not 4-byte-LE
+      // int32 elements — `count` is a byte count here.
+      if (tc_ref_is_bytes(buf_ref)) {
+        int n = (count > 0) ? f.write((uint8_t*)base, count) : 0;
+        f.flush();
+        if (n < 0) n = 0;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: fileWriteBin(%d, %d) -> %d bytes"), handle, count, n);
+        TC_PUSH(vm, n);
+        break;
+      }
       uint8_t tmp[256];           // 64 elements per chunk
       int32_t total_elems = 0;
       int32_t remaining = count;
@@ -8954,11 +9339,17 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
               if (len > 0) {
                 packet[len] = 0;
                 int32_t *buf = tc_resolve_ref(vm, buf_ref);
-                int32_t maxLen = tc_ref_maxlen(vm, buf_ref);
+                int32_t maxLen = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
                 if (buf) {
+                  const bool is_bytes = tc_ref_is_bytes(buf_ref);
                   int n = (len < maxLen - 1) ? len : maxLen - 1;
-                  for (int i = 0; i < n; i++) buf[i] = (int32_t)(uint8_t)packet[i];
-                  buf[n] = 0;
+                  if (is_bytes) {
+                    for (int i = 0; i < n; i++) ((uint8_t*)buf)[i] = (uint8_t)packet[i];
+                    ((uint8_t*)buf)[n] = 0;
+                  } else {
+                    for (int i = 0; i < n; i++) buf[i] = (int32_t)(uint8_t)packet[i];
+                    buf[n] = 0;
+                  }
                   result = n;
                 }
               }
@@ -9054,24 +9445,25 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           if (TasmotaGlobal.global_state.network_down) { TC_PUSH(vm, 0); break; }
           char url[64];
           tc_ref_to_cstr(vm, url_ref, url, sizeof(url));
-          int32_t *arr = tc_resolve_ref(vm, arr_ref);
-          int32_t maxLen = tc_ref_maxlen(vm, arr_ref);
-          if (arr && count > 0) {
+          int32_t maxLen = tc_ref_maxlen(vm, arr_ref);   // byte[] -> bytes, else slots
+          if (count > 0 && maxLen > 0) {
             if (count > maxLen) count = maxLen;
             if (count > 512) count = 512;
             uint8_t *payload = (uint8_t*)malloc(count);
             if (payload) {
-              for (int32_t i = 0; i < count; i++) {
-                payload[i] = (uint8_t)(arr[i] & 0xFF);
+              // accepts char[] OR byte[] via tc_ref_bytes.
+              int32_t n = 0;
+              uint8_t *bp = tc_ref_bytes(vm, arr_ref, count, payload, count, &n);
+              if (bp && n > 0) {
+                IPAddress adr;
+                adr.fromString(url);
+                WiFiUDP tmpUdp;
+                tmpUdp.begin(port);
+                tmpUdp.beginPacket(adr, port);
+                tmpUdp.write(bp, n);
+                tmpUdp.endPacket();
+                tmpUdp.stop();
               }
-              IPAddress adr;
-              adr.fromString(url);
-              WiFiUDP tmpUdp;
-              tmpUdp.begin(port);
-              tmpUdp.beginPacket(adr, port);
-              tmpUdp.write(payload, count);
-              tmpUdp.endPacket();
-              tmpUdp.stop();
               free(payload);
             }
           }
@@ -9251,14 +9643,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       a = TC_POP(vm);  // addr
 #ifdef USE_I2C
       int32_t *arr = tc_resolve_ref(vm, buf_ref);
-      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);
+      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
       if (arr && len > 0) {
         if (len > maxLen) len = maxLen;
         if (len > 255) len = 255;  // I2C practical limit
         TC_UBUF(tmpbuf, 256);
         bool err = I2cReadBuffer((uint8_t)a, (int)b, tmpbuf, (uint16_t)len, (uint8_t)bus);
         if (!err) {  // I2cReadBuffer returns 0=OK, 1=Error
-          for (int32_t i = 0; i < len; i++) { arr[i] = (int32_t)tmpbuf[i]; }
+          tc_ref_put_bytes(vm, buf_ref, tmpbuf, len);   // byte[] packs, int32 expands
           TC_PUSH(vm, 1);
         } else {
           TC_PUSH(vm, 0);
@@ -9281,7 +9673,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       a = TC_POP(vm);  // addr
 #ifdef USE_I2C
       int32_t *arr = tc_resolve_ref(vm, buf_ref);
-      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);
+      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
+      const bool rs_is_bytes = tc_ref_is_bytes(buf_ref);
       if (arr && len > 0) {
         if (len > maxLen) len = maxLen;
         if (len > 255) len = 255;
@@ -9290,7 +9683,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         myWire.write((uint8_t)b);
         if (myWire.endTransmission(false) == 0) {  // repeated START
           if ((uint8_t)len == myWire.requestFrom((uint8_t)a, (uint8_t)len)) {
-            for (int32_t i = 0; i < len; i++) { arr[i] = (int32_t)myWire.read(); }
+            for (int32_t i = 0; i < len; i++) {
+              int v = myWire.read();
+              if (rs_is_bytes) ((uint8_t*)arr)[i] = (uint8_t)v;
+              else             arr[i] = (int32_t)v;
+            }
             TC_PUSH(vm, 1);
           } else {
             TC_PUSH(vm, 0);
@@ -9314,14 +9711,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       b = TC_POP(vm);  // reg
       a = TC_POP(vm);  // addr
 #ifdef USE_I2C
-      int32_t *arr = tc_resolve_ref(vm, buf_ref);
-      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);
-      if (arr && len > 0) {
+      int32_t maxLen = tc_ref_maxlen(vm, buf_ref);   // byte[] -> bytes, else slots
+      if (len > 0 && maxLen > 0) {
         if (len > maxLen) len = maxLen;
         if (len > 255) len = 255;
         TC_UBUF(tmpbuf, 256);
-        for (int32_t i = 0; i < len; i++) { tmpbuf[i] = (uint8_t)(arr[i] & 0xFF); }
-        TC_PUSH(vm, I2cWriteBuffer((uint8_t)a, (uint8_t)b, tmpbuf, (uint16_t)len, (uint8_t)bus) ? 0 : 1);  // returns 0=OK,1=Err
+        // accepts char[] OR byte[] via tc_ref_bytes.
+        int32_t n = 0;
+        uint8_t *bp = tc_ref_bytes(vm, buf_ref, len, tmpbuf, sizeof(tmpbuf), &n);
+        if (bp && n > 0) {
+          TC_PUSH(vm, I2cWriteBuffer((uint8_t)a, (uint8_t)b, bp, (uint16_t)n, (uint8_t)bus) ? 0 : 1);  // 0=OK,1=Err
+        } else {
+          TC_PUSH(vm, 0);
+        }
       } else {
         TC_PUSH(vm, 0);
       }
@@ -9512,10 +9914,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         int32_t *buf = tc_resolve_ref(vm, ref);
         int32_t maxLen = tc_ref_maxlen(vm, ref);
         if (buf && maxLen > 0) {
+          // Byte-aware: tc_ref_maxlen() answers in BYTES for a packed byte[],
+          // so a bare buf[i] would write four times the array's size.
+          const bool ist_bytes = tc_ref_is_bytes(ref);
           int slen = strlen(sval);
           if (slen >= maxLen) slen = maxLen - 1;
-          for (int i = 0; i < slen; i++) buf[i] = (int32_t)(uint8_t)sval[i];
-          buf[slen] = 0;
+          for (int i = 0; i < slen; i++) tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)sval[i]);
+          tc_chr_put(buf, ist_bytes, slen, 0);
           TC_PUSH(vm, slen);
         } else {
           TC_PUSH(vm, 0);
@@ -10141,23 +10546,25 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       int32_t result = 0;
       if (src && dst && n >= 1) {
+        const bool sib = tc_ref_is_bytes(src_ref);
+        const bool dib = tc_ref_is_bytes(dst_ref);
         int32_t src_max = tc_ref_maxlen(vm, src_ref);
         int32_t dst_max = tc_ref_maxlen(vm, dst_ref) - 1;
         // find start of nth token
         int32_t si = 0, idx = 1;
-        while (idx < n && si < src_max && src[si] != 0) {
-          if (src[si] == delim) idx++;
+        while (idx < n && si < src_max && tc_chr_get(src, sib, si) != 0) {
+          if (tc_chr_get(src, sib, si) == delim) idx++;
           si++;
         }
-        if (idx == n && si < src_max && src[si] != 0) {
-          int32_t di = 0;
-          while (si < src_max && src[si] != 0 && src[si] != delim && di < dst_max) {
-            dst[di++] = src[si++];
+        if (idx == n && si < src_max && tc_chr_get(src, sib, si) != 0) {
+          int32_t di = 0, c;
+          while (si < src_max && (c = tc_chr_get(src, sib, si)) != 0 && c != delim && di < dst_max) {
+            tc_chr_put(dst, dib, di++, c); si++;
           }
-          dst[di] = 0;
+          tc_chr_put(dst, dib, di, 0);
           result = di;
         } else {
-          dst[0] = 0;
+          tc_chr_put(dst, dib, 0, 0);
         }
       }
       TC_PUSH(vm, result);
@@ -10176,9 +10583,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *dst = tc_resolve_ref(vm, dst_ref);
       int32_t result = 0;
       if ((sc || src) && dst) {
+        const bool sib = (!sc) && tc_ref_is_bytes(src_ref);
+        const bool dib = tc_ref_is_bytes(dst_ref);
         int32_t src_max = sc ? 0x7FFFFFFF : tc_ref_maxlen(vm, src_ref);
         int32_t dst_max = tc_ref_maxlen(vm, dst_ref) - 1;
-        #define TC_SC(i) (sc ? (int32_t)(uint8_t)sc[i] : ((i) < src_max ? (src[i] & 0xFF) : 0))
+        #define TC_SC(i) (sc ? (int32_t)(uint8_t)sc[i] : ((i) < src_max ? (tc_chr_get(src, sib, i) & 0xFF) : 0))
         // compute source string length
         int32_t srclen = 0;
         while (TC_SC(srclen) != 0) srclen++;
@@ -10188,9 +10597,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         if (slen <= 0 || pos + slen > srclen) slen = srclen - pos;
         if (slen > dst_max) slen = dst_max;
         for (int32_t i = 0; i < slen; i++) {
-          dst[i] = TC_SC(pos + i);
+          tc_chr_put(dst, dib, i, TC_SC(pos + i));
         }
-        dst[slen] = 0;
+        tc_chr_put(dst, dib, slen, 0);
         result = slen;
         #undef TC_SC
       }
@@ -10210,10 +10619,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *needle   = nc ? nullptr : tc_resolve_ref(vm, needle_ref);
       int32_t result = -1;
       if ((hc || haystack) && (nc || needle)) {
+        const bool hib = (!hc) && tc_ref_is_bytes(haystack_ref);
+        const bool nib = (!nc) && tc_ref_is_bytes(needle_ref);
         int32_t hmax = hc ? 0x7FFFFFFF : tc_ref_maxlen(vm, haystack_ref);
         int32_t nmax = nc ? 0x7FFFFFFF : tc_ref_maxlen(vm, needle_ref);
-        #define TC_HC(i) (hc ? (int32_t)(uint8_t)hc[i] : ((i) < hmax ? (haystack[i] & 0xFF) : 0))
-        #define TC_NC(i) (nc ? (int32_t)(uint8_t)nc[i] : ((i) < nmax ? (needle[i]   & 0xFF) : 0))
+        #define TC_HC(i) (hc ? (int32_t)(uint8_t)hc[i] : ((i) < hmax ? (tc_chr_get(haystack, hib, i) & 0xFF) : 0))
+        #define TC_NC(i) (nc ? (int32_t)(uint8_t)nc[i] : ((i) < nmax ? (tc_chr_get(needle, nib, i)   & 0xFF) : 0))
         int32_t hlen = 0; while (TC_HC(hlen) != 0) hlen++;
         int32_t nlen = 0; while (TC_NC(nlen) != 0) nlen++;
         if (nlen > 0 && nlen <= hlen) {
@@ -10239,15 +10650,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = -1;
       if (haystack && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *needle = vm->constants[ci].str.ptr;
+        const bool hib = tc_ref_is_bytes(haystack_ref);
         int32_t hmax = tc_ref_maxlen(vm, haystack_ref);
-        int32_t hlen = 0;
-        while (hlen < hmax && haystack[hlen] != 0) hlen++;
+        int32_t hlen = tc_str_len_b(haystack, hib, hmax);
         int32_t nlen = strlen(needle);
         if (nlen > 0 && nlen <= hlen) {
           for (int32_t i = 0; i <= hlen - nlen; i++) {
             bool match = true;
             for (int32_t j = 0; j < nlen; j++) {
-              if (haystack[i + j] != (int32_t)(uint8_t)needle[j]) { match = false; break; }
+              if (tc_chr_get(haystack, hib, i + j) != (int32_t)(uint8_t)needle[j]) { match = false; break; }
             }
             if (match) { result = i; break; }
           }
@@ -10279,20 +10690,20 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
               && new_ci >= 0 && new_ci < vm->const_count && vm->constants[new_ci].type == 1) {
         const char *oldstr = vm->constants[old_ci].str.ptr;
         const char *newstr = vm->constants[new_ci].str.ptr;
+        const bool ib = tc_ref_is_bytes(arr_ref);      // packed byte[] or int32
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
         int32_t oldlen = strlen(oldstr);
         int32_t newlen = strlen(newstr);
         if (oldlen > 0) {
           // Compute current length
-          int32_t curlen = 0;
-          while (curlen < maxlen && arr[curlen] != 0) curlen++;
+          int32_t curlen = tc_str_len_b(arr, ib, maxlen);
           // Walk and replace. After each replacement, shift tail.
           int32_t i = 0;
           while (i + oldlen <= curlen) {
             // Match?
             bool match = true;
             for (int32_t j = 0; j < oldlen; j++) {
-              if (arr[i + j] != (int32_t)(uint8_t)oldstr[j]) { match = false; break; }
+              if (tc_chr_get(arr, ib, i + j) != (int32_t)(uint8_t)oldstr[j]) { match = false; break; }
             }
             if (!match) { i++; continue; }
             // Compute new total length after this single replacement
@@ -10304,18 +10715,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             }
             // Shift tail (arr[i+oldlen..curlen]) to arr[i+newlen..]
             if (delta > 0) {
-              for (int32_t k = curlen; k >= i + oldlen; k--) arr[k + delta] = arr[k];
+              for (int32_t k = curlen; k >= i + oldlen; k--) tc_chr_put(arr, ib, k + delta, tc_chr_get(arr, ib, k));
             } else if (delta < 0) {
-              for (int32_t k = i + oldlen; k <= curlen; k++) arr[k + delta] = arr[k];
+              for (int32_t k = i + oldlen; k <= curlen; k++) tc_chr_put(arr, ib, k + delta, tc_chr_get(arr, ib, k));
             }
             // Write new substring
-            for (int32_t j = 0; j < newlen; j++) arr[i + j] = (int32_t)(uint8_t)newstr[j];
+            for (int32_t j = 0; j < newlen; j++) tc_chr_put(arr, ib, i + j, (int32_t)(uint8_t)newstr[j]);
             curlen = new_curlen;
             i += newlen;
             count++;
           }
           // Null-terminate (defensive — shifts above keep the original \0 in place)
-          if (curlen < maxlen) arr[curlen] = 0;
+          if (curlen < maxlen) tc_chr_put(arr, ib, curlen, 0);
         }
       }
       TC_PUSH(vm, count);
@@ -10329,10 +10740,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = 0;
       if (arr && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *prefix = vm->constants[ci].str.ptr;
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
         result = 1;
         for (int32_t i = 0; prefix[i] != 0; i++) {
-          if (i >= maxlen || arr[i] == 0 || arr[i] != (int32_t)(uint8_t)prefix[i]) {
+          int32_t c = (i < maxlen) ? tc_chr_get(arr, ib, i) : 0;
+          if (i >= maxlen || c == 0 || c != (int32_t)(uint8_t)prefix[i]) {
             result = 0;
             break;
           }
@@ -10349,15 +10762,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = 0;
       if (arr && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *suffix = vm->constants[ci].str.ptr;
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
-        int32_t alen = 0;
-        while (alen < maxlen && arr[alen] != 0) alen++;
+        int32_t alen = tc_str_len_b(arr, ib, maxlen);
         int32_t slen = strlen(suffix);
         if (slen <= alen) {
           int32_t off = alen - slen;
           result = 1;
           for (int32_t i = 0; i < slen; i++) {
-            if (arr[off + i] != (int32_t)(uint8_t)suffix[i]) { result = 0; break; }
+            if (tc_chr_get(arr, ib, off + i) != (int32_t)(uint8_t)suffix[i]) { result = 0; break; }
           }
         }
       }
@@ -10372,15 +10785,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = 0;
       if (arr && ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
         const char *needle = vm->constants[ci].str.ptr;
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
-        int32_t alen = 0;
-        while (alen < maxlen && arr[alen] != 0) alen++;
+        int32_t alen = tc_str_len_b(arr, ib, maxlen);
         int32_t nlen = strlen(needle);
         if (nlen > 0 && nlen <= alen) {
           for (int32_t i = 0; i <= alen - nlen; i++) {
             bool match = true;
             for (int32_t j = 0; j < nlen; j++) {
-              if (arr[i + j] != (int32_t)(uint8_t)needle[j]) { match = false; break; }
+              if (tc_chr_get(arr, ib, i + j) != (int32_t)(uint8_t)needle[j]) { match = false; break; }
             }
             if (match) { result = 1; break; }
           }
@@ -10395,10 +10808,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t arr_ref = TC_POP(vm);
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       if (arr) {
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
-        for (int32_t i = 0; i < maxlen && arr[i] != 0; i++) {
-          int32_t c = arr[i];
-          if (c >= 'a' && c <= 'z') arr[i] = c - 32;
+        for (int32_t i = 0; i < maxlen; i++) {
+          int32_t c = tc_chr_get(arr, ib, i);
+          if (c == 0) break;
+          if (c >= 'a' && c <= 'z') tc_chr_put(arr, ib, i, c - 32);
         }
       }
       break;
@@ -10409,10 +10824,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t arr_ref = TC_POP(vm);
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       if (arr) {
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
-        for (int32_t i = 0; i < maxlen && arr[i] != 0; i++) {
-          int32_t c = arr[i];
-          if (c >= 'A' && c <= 'Z') arr[i] = c + 32;
+        for (int32_t i = 0; i < maxlen; i++) {
+          int32_t c = tc_chr_get(arr, ib, i);
+          if (c == 0) break;
+          if (c >= 'A' && c <= 'Z') tc_chr_put(arr, ib, i, c + 32);
         }
       }
       break;
@@ -10425,22 +10842,23 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       int32_t newlen = 0;
       if (arr) {
+        const bool ib = tc_ref_is_bytes(arr_ref);
         int32_t maxlen = tc_ref_maxlen(vm, arr_ref);
-        int32_t curlen = 0;
-        while (curlen < maxlen && arr[curlen] != 0) curlen++;
+        int32_t curlen = tc_str_len_b(arr, ib, maxlen);
         // Find first non-whitespace
         int32_t s = 0;
-        while (s < curlen && (arr[s] == ' ' || arr[s] == '\t' || arr[s] == '\n' || arr[s] == '\r')) s++;
+        int32_t c;
+        while (s < curlen && ((c = tc_chr_get(arr, ib, s)) == ' ' || c == '\t' || c == '\n' || c == '\r')) s++;
         // Find last non-whitespace
         int32_t e = curlen;
-        while (e > s && (arr[e-1] == ' ' || arr[e-1] == '\t' || arr[e-1] == '\n' || arr[e-1] == '\r')) e--;
+        while (e > s && ((c = tc_chr_get(arr, ib, e-1)) == ' ' || c == '\t' || c == '\n' || c == '\r')) e--;
         newlen = e - s;
         // Shift down
         if (s > 0) {
-          for (int32_t i = 0; i < newlen; i++) arr[i] = arr[s + i];
+          for (int32_t i = 0; i < newlen; i++) tc_chr_put(arr, ib, i, tc_chr_get(arr, ib, s + i));
         }
         // Null-terminate
-        if (newlen < maxlen) arr[newlen] = 0;
+        if (newlen < maxlen) tc_chr_put(arr, ib, newlen, 0);
       }
       TC_PUSH(vm, newlen);
       break;
@@ -10727,11 +11145,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       {
         int32_t *buf = tc_resolve_ref(vm, b);
         if (buf) {
+          // ⚠️ Byte-aware, and it has to be: tc_ref_maxlen() already answered in
+          // BYTES for a packed byte[] (1024 for `byte resp[1024]`), while the
+          // copy below wrote int32 SLOTS. Handing httpGet a byte[] therefore
+          // wrote four times its size and trampled the neighbouring heap
+          // arrays -- silently, and only for a response long enough to reach
+          // past the buffer. tc_chr_put() hides the packing, exactly as the
+          // sprintf/strcat family does since 1.6.58.
+          const bool ist_bytes = tc_ref_is_bytes(b);
           int32_t cap2 = tc_ref_maxlen(vm, b);
           int n = (result > 0 && lbuf) ? result : 0;
           if (n > cap2 - 1) n = cap2 - 1;
-          for (int i = 0; i < n; i++) buf[i] = (int32_t)lbuf[i];
-          if (cap2 > 0) buf[n] = 0;
+          for (int i = 0; i < n; i++) tc_chr_put(buf, ist_bytes, i, (int32_t)lbuf[i]);
+          if (cap2 > 0) tc_chr_put(buf, ist_bytes, n, 0);
           if (result > 0) result = n;                // actual stored length
         }
       }
@@ -10808,11 +11234,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (httpCode > 0) {
         int32_t *buf = tc_resolve_ref(vm, respRef);
         if (buf) {
+          // Byte-aware, same reason as httpGet above: tc_ref_maxlen() counts
+          // BYTES for a packed byte[] while a bare buf[i] writes int32 slots.
+          const bool ist_bytes = tc_ref_is_bytes(respRef);
           int32_t maxLen = tc_ref_maxlen(vm, respRef);
           int len = payload.length();
           if (len > maxLen - 1) len = maxLen - 1;
-          for (int i = 0; i < len; i++) buf[i] = (int32_t)(uint8_t)payload[i];
-          buf[len] = 0;
+          for (int i = 0; i < len; i++) tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)payload[i]);
+          tc_chr_put(buf, ist_bytes, len, 0);
           result = len;
         }
       } else {
@@ -11090,6 +11519,21 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
                       label, val ? "checked" : "", nval, idx);
       break;
     }
+    // ⚠️ The ONLY widget that writes an ARRAY, and the reason it hands the
+    // JavaScript the whole `gref` on top of the widget id: a char[]/byte[] over
+    // HEAP_THRESHOLD (16) elements is heap-allocated, so tc_widget_id()'s low 12
+    // bits are a heap HANDLE, not a global index -- and the ?sv= write-back used
+    // to store the typed text into globals[handle] regardless. Handle 0 meant
+    // globals[0]. Every webText on a buffer larger than 16 silently dropped what
+    // the user typed and overwrote the first scalars of the script instead
+    // (webui_demo/webcall_demo/multipage_demo's `char devname[32]`, lcd_i2c's
+    // custom lines); only ip_in[16] in matter_bridge_ui, exactly at the
+    // threshold, ever worked. Display was never affected -- that path reads
+    // through tc_ref_to_cstr() below, which resolves heap refs correctly, so the
+    // field showed the right text and simply refused to keep a new one.
+    // With the ref in hand the write-back can just call tc_cstr_to_ref(), the
+    // VM's own writer, which knows heap vs global AND the element packing.
+    // (gemu 2026-08-26)
     case SYS_WEB_TEXT: {
       int32_t ci = TC_POP(vm);      // label const idx
       int32_t maxlen = TC_POP(vm);  // max char length
@@ -11102,9 +11546,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       WSContentSend_P(PSTR("<div><label><b>%s</b> "
                            "<input type='text' value='%s' maxlength='%d' style='width:200px' "
                            "onfocusin='pr(0)' onfocusout='pr(1)' "
-                           "onchange='siva(value,%d)'>"
+                           "onchange='siva(value,%d,%d)'>"
                            "</label></div>"),
-                      label, tbuf, maxlen - 1, idx);
+                      label, tbuf, maxlen - 1, idx, (int)gref);
       break;
     }
     case SYS_WEB_NUMBER: {
@@ -11764,6 +12208,27 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       break;
     }
 
+    case SYS_WEB_CHART_Q: {
+      // WebChartQ(scale, offset) — the NEXT WebChart decodes each sample as
+      // value = raw * scale + offset. Its reason for existing is the packed
+      // byte[]: a raw 0..255 is not a temperature, and without a scale the
+      // memory saving would only be reachable by charts of dimensionless
+      // numbers. Applies to any array type, so it doubles as a unit conversion
+      // (W -> kW) on an existing float[].
+      float offset = i2f(TC_POP(vm));
+      float scale  = i2f(TC_POP(vm));
+      // A zero scale flattens every sample onto `offset` — always a mistake,
+      // and a silent one: the chart draws a straight line at the wrong height
+      // instead of failing. Refuse it and stay at identity.
+      if (scale == 0.0f) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: WebChartQ scale 0 ignored — chart would collapse to a flat line"));
+        break;
+      }
+      tc_chart_q_scale  = scale;
+      tc_chart_q_offset = offset;
+      break;
+    }
+
     case SYS_WEB_CHART: {
       // WebChart(type, title, unit, color, pos, count, array, decimals, interval, ymin, ymax)
 #ifdef USE_WEBSERVER
@@ -11782,6 +12247,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       float ymin = i2f(ymin_bits);
       float ymax = i2f(ymax_bits);
       bool fixed_range = (ymin < ymax);
+
+      // Take the WebChartQ pair and clear it HERE, before any of the early
+      // breaks below can skip past. One WebChart is one series, and two byte[]
+      // series in the same chart normally want different scales — so the
+      // setting is one-shot, unlike WebChartSize, whose stickiness across
+      // slots is the standing complaint about chart layout. Identity is left
+      // as a straight copy so an unquantised float[] stays bit-for-bit what it
+      // always was.
+      const float q_scale  = tc_chart_q_scale;
+      const float q_offset = tc_chart_q_offset;
+      const bool  q_active = (q_scale != 1.0f) || (q_offset != 0.0f);
+      tc_chart_q_scale  = 1.0f;
+      tc_chart_q_offset = 0.0f;
 
       const char *title = tc_get_const_str(vm, ci_title);
       const char *unit  = tc_get_const_str(vm, ci_unit);
@@ -11830,6 +12308,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           "<script>"
           "var _tcC=[];"
           "function _tcA(ci,lbl,clr,d,mn,mx,u){_tcC[ci].s.push({l:lbl,c:clr,d:d,mn:mn,mx:mx,u:u||lbl});}"
+          // _tcAy: the same series, sent as a bare y-list plus the x sequence
+          // that generated it. Every x WebChart ever emitted was
+          // -(count-1-i)*interval + timebase, i.e. an arithmetic sequence, so
+          // repeating it per point cost about 8 of the ~14 bytes each point
+          // took on the wire. Rebuilding it in the browser costs one loop and
+          // hands the rest of the file the identical [x,y] shape it already
+          // consumes -- nothing downstream of the push knows the difference.
+          "function _tcAy(ci,lbl,clr,x0,st,y,mn,mx,u){var d=[],i=0;for(;i<y.length;i++)d.push([x0+i*st,y[i]]);_tcA(ci,lbl,clr,d,mn,mx,u);}"
           "function _tcN(ci,t,u,tp,mn,mx,sm){"
             "var lb=null;"
             "if(tp==116){var p=t.indexOf('|');if(p>=0){lb=t.substring(p+1).split('|');t=t.substring(0,p);}}"
@@ -11872,7 +12358,28 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
                 "if(c.s.length>0)for(var k=0;k<c.s[0].d.length;k++){"
                   "var m=c.s[0].d[k][0];"
                   "var xl;"
-                  "if(isCol){if(tp==115&&c.s[0].d.length>7){xl=''+k;}else{var td=new Date(N.getTime()+m*60000);if(c.s[0].d.length==1){xl='';}else if(c.s[0].d.length<=7){xl=['So','Mo','Di','Mi','Do','Fr','Sa'][td.getDay()];}else{xl=('0'+td.getDate()).slice(-2)+'.'+('0'+(td.getMonth()+1)).slice(-2)+'.';};}}else{xl=new Date(N.getTime()+m*60000);}"
+                  // Column-chart x labels. Chosen by the SPAN the series covers,
+                  // not by how many points it has -- the old count rule read
+                  // "more than 7 points" as "more than a week" and stamped the
+                  // DATE on every column. On a 24 h rain chart (288 columns,
+                  // 5 min apart) that is the same day printed 288 times, and
+                  // the one thing the reader needs -- the hour it rained -- is
+                  // nowhere on the axis (gemu, .98, 2026-08-25).
+                  // Span is (points-1) x step, in minutes, straight from the
+                  // x values: <= ~36 h -> HH:MM, <= ~8 days -> weekday, else
+                  // the date. Every existing chart keeps its old label: 7 daily
+                  // bars still span a week (weekday), 31 daily bars a month
+                  // (date), 12 monthly bars a year (date).
+                  "if(isCol){"
+                    "var dd=c.s[0].d,sp=dd.length>1?Math.abs(dd[dd.length-1][0]-dd[0][0]):0;"
+                    "if(tp==115&&dd.length>7){xl=''+k;}"
+                    "else{var td=new Date(N.getTime()+m*60000);"
+                      "if(dd.length==1){xl='';}"
+                      "else if(sp<=2160){xl=('0'+td.getHours()).slice(-2)+':'+('0'+td.getMinutes()).slice(-2);}"
+                      "else if(sp<=11520){xl=['So','Mo','Di','Mi','Do','Fr','Sa'][td.getDay()];}"
+                      "else{xl=('0'+td.getDate()).slice(-2)+'.'+('0'+(td.getMonth()+1)).slice(-2)+'.';}"
+                    "}"
+                  "}else{xl=new Date(N.getTime()+m*60000);}"
                   "var r=[xl];"
                   "for(var j=0;j<c.s.length;j++)r.push(c.s[j].d[k][1]);"
                   "rows.push(r);}"
@@ -12022,10 +12529,25 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         }
       }
 
-      // 4) Resolve float array and emit data as _tcA() call
+      // 4) Resolve the sample array and emit it as one _tcAy() call.
+      // A PACKED byte[] carries one sample per byte instead of one per int32
+      // slot — a quarter of the RAM for the ring buffer, which is what the
+      // chart actually costs on a small device. The flag rides on the ref, so
+      // the packing is invisible to the script: it declares `byte h[288]`
+      // instead of `float h[288]` and adds a WebChartQ() to say what a raw
+      // 0..255 means. tc_resolve_ref strips the flag (the byte view sits on
+      // top of the same storage), and tc_ref_maxlen already answers in BYTES
+      // for a flagged ref — which for a byte[] is exactly the element count,
+      // so the clamp below needs no special case.
+      // A packed int16[] is the middle option: half the RAM of a float[] but,
+      // unlike a byte[], at the FULL resolution of the reading, so it needs no
+      // WebChartQ to be meaningful -- hundredths of a kelvin, a raw ADC word or
+      // a Modbus register go in as they are. Signedness comes off the ref: an
+      // uint16[] carries its own kind precisely so 60000 does not draw as -5536.
+      const int elem_kind = tc_ref_elem_kind(arr_ref);
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       if (!arr) break;
-      int32_t arr_len = tc_ref_maxlen(vm, arr_ref);
+      int32_t arr_len = tc_ref_elem_count(vm, arr_ref);   // in SAMPLES, any width
       if (count > arr_len) count = arr_len;
 
       char cbuf[12];
@@ -12035,10 +12557,17 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       dtostrf(ymin, 1, 1, ymin_a);
       dtostrf(ymax, 1, 1, ymax_a);
 
-      WSContentSend_P(PSTR("<script>_tcA(%d,'%s','%s',["),
-        chart_id, series_name, cbuf);
+      // The x values are an arithmetic sequence — first sample at
+      // -(count-1)*interval, one `interval` step per sample — so they are sent
+      // ONCE as (x0, step) and rebuilt in _tcAy instead of being repeated in
+      // full next to every y. On a 1441-point series that is the difference
+      // between ~20 KB and ~8 KB of response body, and the body is what has to
+      // squeeze through the TLS send path on a C3.
+      int32_t x0 = -((count - 1) * interval) + tc_chart_time_base;
+      WSContentSend_P(PSTR("<script>_tcAy(%d,'%s','%s',%d,%d,["),
+        chart_id, series_name, cbuf, x0, interval);
 
-      // Unwind ring buffer: oldest entry first, interpret as float
+      // Unwind ring buffer: oldest entry first
       // Use count (not arr_len) for wrap — arr_len is "remaining globals" not array size
       for (int32_t i = 0; i < count; i++) {
         // Full ring wrap. pos-count+i is congruent to pos+i (mod count), but the
@@ -12050,13 +12579,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         int32_t idx = (pos + i) % count;
         if (idx < 0) idx += count;
         float fval;
-        memcpy(&fval, &arr[idx], sizeof(float));
-        int32_t mins_ago = -((count - 1 - i) * interval) + tc_chart_time_base;
+        if (elem_kind == TC_ELEM_BYTE) {
+          fval = (float)tc_chr_get(arr, true, idx);   // 0..255, meaning comes from WebChartQ
+        } else if (elem_kind == TC_ELEM_I16) {
+          fval = (float)((const int16_t *)arr)[idx];
+        } else if (elem_kind == TC_ELEM_U16) {
+          fval = (float)((const uint16_t *)arr)[idx];
+        } else {
+          memcpy(&fval, &arr[idx], sizeof(float));
+        }
+        if (q_active) fval = fval * q_scale + q_offset;
         char vbuf[16];
         dtostrf(fval, 1, decimals, vbuf);
-        WSContentSend_P(PSTR("%s[%d,%s]"),
-          (i > 0) ? "," : "",
-          mins_ago, vbuf);
+        WSContentSend_P(PSTR("%s%s"), (i > 0) ? "," : "", vbuf);
         if ((i & 63) == 63) WSContentFlush();
       }
 
@@ -12110,8 +12645,36 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t arr_ref = TC_POP(vm);
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       if (!arr || count <= 1) break;
-      int32_t maxLen = tc_ref_maxlen(vm, arr_ref);
+      int32_t maxLen = tc_ref_elem_count(vm, arr_ref);    // in ELEMENTS, any width
       if (count > maxLen) count = maxLen;
+      // A packed array sorts in its OWN element width. Doing it through the
+      // int32 view would shuffle whole slots -- four byte samples or two 16-bit
+      // ones at a time -- which reorders nothing the script asked for. Floats
+      // do not exist in a packed array, so these branches are integer-only.
+      const int sort_kind = tc_ref_elem_kind(arr_ref);
+      if (sort_kind != TC_ELEM_I32) {
+        const bool absteigend = (flags & 2) != 0;
+        for (int32_t i = 1; i < count; i++) {
+          int32_t key;
+          if      (sort_kind == TC_ELEM_BYTE) key = ((uint8_t  *)arr)[i];
+          else if (sort_kind == TC_ELEM_I16)  key = ((int16_t  *)arr)[i];
+          else                                key = ((uint16_t *)arr)[i];
+          int32_t j = i - 1;
+          while (j >= 0) {
+            int32_t vj;
+            if      (sort_kind == TC_ELEM_BYTE) vj = ((uint8_t  *)arr)[j];
+            else if (sort_kind == TC_ELEM_I16)  vj = ((int16_t  *)arr)[j];
+            else                                vj = ((uint16_t *)arr)[j];
+            if (!(absteigend ? (vj < key) : (vj > key))) break;
+            if      (sort_kind == TC_ELEM_BYTE) ((uint8_t  *)arr)[j + 1] = (uint8_t)vj;
+            else                                ((uint16_t *)arr)[j + 1] = (uint16_t)vj;
+            j--;
+          }
+          if      (sort_kind == TC_ELEM_BYTE) ((uint8_t  *)arr)[j + 1] = (uint8_t)key;
+          else                                ((uint16_t *)arr)[j + 1] = (uint16_t)key;
+        }
+        break;
+      }
       // Insertion sort — small arrays, no extra memory, stable
       for (int32_t i = 1; i < count; i++) {
         int32_t key = arr[i];
@@ -14529,20 +15092,31 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t in_ref  = TC_POP(vm);
 #ifdef ESP32
       int32_t ret = -1;
-      int32_t *inb = tc_resolve_ref(vm, in_ref);
       int32_t inmax = tc_ref_maxlen(vm, in_ref);
-      if (inb && in_len > 0) {
+      if (in_len > 0) {
         if (in_len > inmax) in_len = inmax;
         if (in_len > 512) in_len = 512;
         TC_UBUF(raw, 512);
-        for (int i = 0; i < in_len; i++) raw[i] = (unsigned char)(inb[i] & 0xFF);
-        TC_UBUF(ob, 704); size_t olen = 0;
-        if (mbedtls_base64_encode(ob, sizeof(ob), &olen, raw, in_len) == 0) {
-          int32_t *obuf = tc_resolve_ref(vm, out_ref);
-          int32_t omax = tc_ref_maxlen(vm, out_ref);
-          if (obuf && omax > 0) {
-            int i; for (i = 0; i < (int)olen && i < omax - 1; i++) obuf[i] = ob[i];
-            obuf[i] = 0; ret = i;
+        // input accepts char[] OR byte[] via tc_ref_bytes.
+        int32_t rn = 0;
+        uint8_t *rp = tc_ref_bytes(vm, in_ref, in_len, raw, sizeof(raw), &rn);
+        if (rp && rn > 0) {
+          in_len = rn;
+          TC_UBUF(ob, 704); size_t olen = 0;
+          if (mbedtls_base64_encode(ob, sizeof(ob), &olen, rp, in_len) == 0) {
+            int32_t *obuf = tc_resolve_ref(vm, out_ref);
+            int32_t omax = tc_ref_maxlen(vm, out_ref);
+            const bool out_is_bytes = tc_ref_is_bytes(out_ref);
+            if (obuf && omax > 0) {
+              int i;
+              for (i = 0; i < (int)olen && i < omax - 1; i++) {
+                if (out_is_bytes) ((uint8_t*)obuf)[i] = ob[i];
+                else              obuf[i] = ob[i];
+              }
+              if (out_is_bytes) ((uint8_t*)obuf)[i] = 0;
+              else              obuf[i] = 0;
+              ret = i;
+            }
           }
         }
       }
@@ -14763,12 +15337,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         if (base) {
           // SECURITY: the remote peer controls available(); clamp to the VM
           // array capacity or a large response overflows it.
-          int32_t cap = tc_ref_maxlen(vm, ref);
+          int32_t cap = tc_ref_maxlen(vm, ref);   // byte[] -> bytes, else slots
           if (cap < 0) cap = 0;
+          const bool is_bytes = tc_ref_is_bytes(ref);
           uint16_t slen = _tc->available();
           if ((int32_t)slen > cap) slen = (uint16_t)cap;
           for (uint16_t i = 0; i < slen; i++) {
-            base[i] = _tc->read();
+            int b = _tc->read();
+            if (is_bytes) ((uint8_t*)base)[i] = (uint8_t)b;
+            else          base[i] = b;
           }
           count = slen;
         }
@@ -14784,12 +15361,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (_tc) {
         int32_t *base = tc_resolve_ref(vm, ref);
         if (base) {
+          const bool is_bytes = tc_ref_is_bytes(ref);   // byte[] source: element i is one byte
           uint8_t *abf = (uint8_t*)malloc(num * 4);
           if (abf) {
             uint8_t *p = abf;
             uint16_t dlen = 0;
             for (int32_t i = 0; i < num; i++) {
-              int32_t val = base[i];
+              int32_t val = is_bytes ? (int32_t)((uint8_t*)base)[i] : base[i];
               switch (type) {
                 case 0:  // uint8
                   *p++ = (uint8_t)val;
@@ -15325,8 +15903,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t copy_n = (msg.data_length_code < (uint32_t)max_bytes)
                         ? (int32_t)msg.data_length_code
                         : max_bytes;
-      for (int32_t k = 0; k < copy_n; k++) {
-        buf_p[k] = (int32_t)msg.data[k];
+      // data buffer accepts char[] OR byte[] (the CAN payload is bytes); the
+      // meta array stays int32 (id, ext, dlc are values, not bytes).
+      if (tc_ref_is_bytes(buf_ref)) {
+        for (int32_t k = 0; k < copy_n; k++) ((uint8_t*)buf_p)[k] = msg.data[k];
+      } else {
+        for (int32_t k = 0; k < copy_n; k++) buf_p[k] = (int32_t)msg.data[k];
       }
       TC_PUSH(vm, copy_n);
       break;
@@ -15354,8 +15936,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       msg.flags = mflags;
       msg.identifier = (uint32_t)id;
       msg.data_length_code = (uint8_t)dlc;
-      for (int32_t k = 0; k < dlc; k++) {
-        msg.data[k] = (uint8_t)(buf_p[k] & 0xFF);
+      // data buffer accepts char[] OR byte[] (CAN payload is bytes).
+      if (dlc > 0 && tc_ref_is_bytes(buf_ref)) {
+        for (int32_t k = 0; k < dlc; k++) msg.data[k] = ((uint8_t*)buf_p)[k];
+      } else {
+        for (int32_t k = 0; k < dlc; k++) msg.data[k] = (uint8_t)(buf_p[k] & 0xFF);
       }
       // 0 timeout — drop the frame if the TX queue is full rather than
       // blocking the VM. Scripts can retry on the next tick.
@@ -15821,13 +16406,13 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       TC_PUSH(vm, topic ? tc_mqtt_unsubscribe(topic) : -1);
       break;
     }
-    // ⚠️ MQTT lässt sich am Gerät abschalten: `SetOption3` (Vorgabe MQTT_USE aus
-    // my_user_config.h). Ist er AUS, läuft MqttPublishPayload zwar, aber
-    // `published` bleibt false — die Nachricht geht NICHT hinaus, und der
-    // ganze Xdrv02 antwortet auf keinen MQTT-Befehl mehr (deshalb meldet ein
-    // solches Gerät "MqttHost: Unknown"). Ein Skript soll das unterscheiden
-    // können, statt ins Leere zu senden: -2 = MQTT ist abgeschaltet
-    // (gemu 2026-08-18, an seinem C3 genau so eingestellt).
+    // ⚠️ MQTT can be switched off on the device: `SetOption3` (default MQTT_USE
+    // from my_user_config.h). With it OFF, MqttPublishPayload still runs but
+    // `published` stays false — the message does NOT go out, and all of Xdrv02
+    // stops answering MQTT commands (which is why such a device reports
+    // "MqttHost: Unknown"). A script should be able to tell that apart instead
+    // of sending into the void: -2 = MQTT is disabled (gemu 2026-08-18, set
+    // exactly that way on his C3).
     case SYS_MQTT_PUBLISH_REF: {  // mqttPublish(topic_ref, payload_ref, level)
       int32_t lvl  = TC_POP(vm);
       int32_t pref = TC_POP(vm);
@@ -15840,7 +16425,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int tl = tc_ref_to_cstr(vm, tref, topic, sizeof(topic));
       int pl = tc_ref_to_cstr(vm, pref, payload, sizeof(payload));
       if (tl <= 0) { TC_PUSH(vm, -1); break; }
-      if (!Settings->flag.mqtt_enabled) { TC_PUSH(vm, -2); break; }   // SetOption3 aus
+      if (!Settings->flag.mqtt_enabled) { TC_PUSH(vm, -2); break; }   // SetOption3 off
       if (lvl < LOG_LEVEL_NONE) lvl = LOG_LEVEL_NONE;
       if (lvl > LOG_LEVEL_DEBUG_MORE) lvl = LOG_LEVEL_DEBUG_MORE;
       MqttPublishPayload(topic, payload, 0, false, (uint32_t)lvl);
@@ -15854,7 +16439,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const char *topic = tc_get_const_str(vm, tci);
       const char *payload = tc_get_const_str(vm, pci);
       if (!Settings->flag.mqtt_enabled) {
-        TC_PUSH(vm, -2);                                 // SetOption3 aus — siehe oben
+        TC_PUSH(vm, -2);                                 // SetOption3 off — see above
       } else if (topic && payload) {
         MqttPublishPayload(topic, payload);
         TC_PUSH(vm, 0);
@@ -16761,27 +17346,27 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t enc_flag  = TC_POP(vm);
       int32_t data_ref  = TC_POP(vm);
       int32_t key_ref   = TC_POP(vm);
-      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
-      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
-      if (!key_arr || !data_arr ||
-          tc_ref_maxlen(vm, key_ref) < 16 || tc_ref_maxlen(vm, data_ref) < 16) {
+      // key and data accept char[] OR byte[]: tc_ref_bytes hands out a direct
+      // pointer for byte[] and copies the low bytes into k[]/in[] for int32.
+      uint8_t k[16], in[16], out[16];
+      int32_t klen = 0, dlen = 0;
+      uint8_t *kp = tc_ref_bytes(vm, key_ref,  16, k,  sizeof(k),  &klen);
+      uint8_t *dp = tc_ref_bytes(vm, data_ref, 16, in, sizeof(in), &dlen);
+      if (!kp || !dp || klen < 16 || dlen < 16) {
         TC_PUSH(vm, 0); break;
       }
-      uint8_t k[16], in[16], out[16];
-      for (int i = 0; i < 16; i++) { k[i]  = (uint8_t)(key_arr[i]  & 0xFF); }
-      for (int i = 0; i < 16; i++) { in[i] = (uint8_t)(data_arr[i] & 0xFF); }
       mbedtls_aes_context ctx;
       mbedtls_aes_init(&ctx);
-      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, k, 128)
-                        : mbedtls_aes_setkey_dec(&ctx, k, 128);
+      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, kp, 128)
+                        : mbedtls_aes_setkey_dec(&ctx, kp, 128);
       if (rc == 0) {
         rc = mbedtls_aes_crypt_ecb(&ctx,
               enc_flag ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT,
-              in, out);
+              dp, out);
       }
       mbedtls_aes_free(&ctx);
       if (rc == 0) {
-        for (int i = 0; i < 16; i++) data_arr[i] = (int32_t)out[i];
+        tc_ref_put_bytes(vm, data_ref, out, 16);
         TC_PUSH(vm, 1);
       } else {
         TC_PUSH(vm, 0);
@@ -16800,11 +17385,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t data_ref = TC_POP(vm);
       int32_t iv_ref   = TC_POP(vm);
       int32_t key_ref  = TC_POP(vm);
-      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
-      int32_t *iv_arr   = tc_resolve_ref(vm, iv_ref);
-      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
-      if (!key_arr || !iv_arr || !data_arr ||
-          (len & 15) != 0 || len <= 0 ||
+      if ((len & 15) != 0 || len <= 0 ||
           tc_ref_maxlen(vm, key_ref) < 16 ||
           tc_ref_maxlen(vm, iv_ref)  < 16 ||
           tc_ref_maxlen(vm, data_ref) < len) {
@@ -16820,25 +17401,32 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // stacks and overflowed into adjacent heap, surfacing as
       // StoreProhibited in WiFi RX (esf_buf_alloc). Heap alloc per call is
       // fine — AES is never on a hot path.
+      // key/iv/data accept char[] OR byte[] via tc_ref_bytes: for byte[] `bufp`
+      // points straight into the region (in-place CBC, no copy); for int32 the
+      // low bytes are gathered into `buf` and written back afterwards.
       uint8_t k[16], iv[16];
       uint8_t *buf = (uint8_t*)special_malloc(len);
       if (!buf) { TC_PUSH(vm, 0); break; }
-      for (int i = 0; i < 16;  i++) k[i]  = (uint8_t)(key_arr[i] & 0xFF);
-      for (int i = 0; i < 16;  i++) iv[i] = (uint8_t)(iv_arr[i]  & 0xFF);
-      for (int i = 0; i < len; i++) buf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      int32_t klen = 0, ivlen = 0, dlen = 0;
+      uint8_t *kp   = tc_ref_bytes(vm, key_ref,  16,  k,   sizeof(k),  &klen);
+      uint8_t *ivp  = tc_ref_bytes(vm, iv_ref,   16,  iv,  sizeof(iv), &ivlen);
+      uint8_t *bufp = tc_ref_bytes(vm, data_ref, len, buf, len,        &dlen);
+      if (!kp || !ivp || !bufp || klen < 16 || ivlen < 16 || dlen < len) {
+        free(buf); TC_PUSH(vm, 0); break;
+      }
       mbedtls_aes_context ctx;
       mbedtls_aes_init(&ctx);
-      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, k, 128)
-                        : mbedtls_aes_setkey_dec(&ctx, k, 128);
+      int rc = enc_flag ? mbedtls_aes_setkey_enc(&ctx, kp, 128)
+                        : mbedtls_aes_setkey_dec(&ctx, kp, 128);
       if (rc == 0) {
         rc = mbedtls_aes_crypt_cbc(&ctx,
               enc_flag ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT,
-              len, iv, buf, buf);
+              len, ivp, bufp, bufp);
       }
       mbedtls_aes_free(&ctx);
       if (rc == 0) {
-        for (int i = 0; i < len; i++) data_arr[i] = (int32_t)buf[i];
-        for (int i = 0; i < 16;  i++) iv_arr[i]   = (int32_t)iv[i];   // updated IV
+        tc_ref_put_bytes(vm, data_ref, bufp, len);
+        tc_ref_put_bytes(vm, iv_ref,   ivp,  16);   // updated IV
         TC_PUSH(vm, 1);
       } else {
         TC_PUSH(vm, 0);
@@ -16858,11 +17446,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t data_ref = TC_POP(vm);
       int32_t klen     = TC_POP(vm);
       int32_t key_ref  = TC_POP(vm);
-      int32_t *key_arr  = tc_resolve_ref(vm, key_ref);
-      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
-      int32_t *out_arr  = tc_resolve_ref(vm, out_ref);
-      if (!key_arr || !data_arr || !out_arr ||
-          klen <= 0 || dlen < 0 ||
+      if (klen <= 0 || dlen < 0 ||
           tc_ref_maxlen(vm, key_ref) < klen ||
           tc_ref_maxlen(vm, data_ref) < dlen ||
           tc_ref_maxlen(vm, out_ref) < 32) {
@@ -16873,18 +17457,22 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // the stack, adding 5 KB to tc_vm_step's frame at function entry and
       // overflowing the loop/web-server task stacks. HMAC is never on a hot
       // path. Bounds: 1024 B key / 4 KB data per call (chunk larger payloads).
+      // key/data accept char[] OR byte[] via tc_ref_bytes; the digest is
+      // written back with tc_ref_put_bytes, so out_ref may be byte[] too.
       if (klen > 1024 || dlen > 4096) { TC_PUSH(vm, 0); break; }
       uint8_t *kbuf = (uint8_t*)special_malloc(klen);
       uint8_t *dbuf = (uint8_t*)special_malloc(dlen > 0 ? dlen : 1);
       uint8_t out[32];
       if (!kbuf || !dbuf) { free(kbuf); free(dbuf); TC_PUSH(vm, 0); break; }
-      for (int i = 0; i < klen; i++) kbuf[i] = (uint8_t)(key_arr[i]  & 0xFF);
-      for (int i = 0; i < dlen; i++) dbuf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      int32_t kn = 0, dn = 0;
+      uint8_t *kp = tc_ref_bytes(vm, key_ref,  klen, kbuf, klen, &kn);
+      uint8_t *dp = tc_ref_bytes(vm, data_ref, dlen, dbuf, dlen > 0 ? dlen : 1, &dn);
+      if (!kp || (dlen > 0 && !dp)) { free(kbuf); free(dbuf); TC_PUSH(vm, 0); break; }
       const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-      int rc = mbedtls_md_hmac(info, kbuf, klen, dbuf, dlen, out);
+      int rc = mbedtls_md_hmac(info, kp, klen, dp, dlen, out);
       free(kbuf); free(dbuf);
       if (rc == 0) {
-        for (int i = 0; i < 32; i++) out_arr[i] = (int32_t)out[i];
+        tc_ref_put_bytes(vm, out_ref, out, 32);
         TC_PUSH(vm, 1);
       } else {
         TC_PUSH(vm, 0);
@@ -16901,9 +17489,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t out_ref  = TC_POP(vm);
       int32_t dlen     = TC_POP(vm);
       int32_t data_ref = TC_POP(vm);
-      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
-      int32_t *out_arr  = tc_resolve_ref(vm, out_ref);
-      if (!data_arr || !out_arr || dlen < 0 ||
+      if (dlen < 0 ||
           tc_ref_maxlen(vm, data_ref) < dlen ||
           tc_ref_maxlen(vm, out_ref) < 32 ||
           dlen > 4096) {
@@ -16911,15 +17497,18 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       // Heap-allocate dbuf via special_malloc — see SYS_AES_CBC note above.
       // Was `uint8_t dbuf[4096]` on the stack, contributing to the regression.
+      // data accepts char[] OR byte[]; the digest goes back via put_bytes.
       uint8_t *dbuf = (uint8_t*)special_malloc(dlen > 0 ? dlen : 1);
       uint8_t out[32];
       if (!dbuf) { TC_PUSH(vm, 0); break; }
-      for (int i = 0; i < dlen; i++) dbuf[i] = (uint8_t)(data_arr[i] & 0xFF);
+      int32_t dn = 0;
+      uint8_t *dp = tc_ref_bytes(vm, data_ref, dlen, dbuf, dlen > 0 ? dlen : 1, &dn);
+      if (dlen > 0 && !dp) { free(dbuf); TC_PUSH(vm, 0); break; }
       // mbedtls_sha256(buf, len, out, is_sha224=0) — return 0 on success.
-      int rc = mbedtls_sha256(dbuf, dlen, out, 0);
+      int rc = mbedtls_sha256(dp, dlen, out, 0);
       free(dbuf);
       if (rc == 0) {
-        for (int i = 0; i < 32; i++) out_arr[i] = (int32_t)out[i];
+        tc_ref_put_bytes(vm, out_ref, out, 32);
         TC_PUSH(vm, 1);
       } else {
         TC_PUSH(vm, 0);
@@ -16936,9 +17525,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t out_ref  = TC_POP(vm);
       int32_t dlen     = TC_POP(vm);
       int32_t data_ref = TC_POP(vm);
-      int32_t *data_arr = tc_resolve_ref(vm, data_ref);
-      int32_t *out_arr  = tc_resolve_ref(vm, out_ref);
-      if (!data_arr || !out_arr || dlen < 0 ||
+      if (dlen < 0 ||
           tc_ref_maxlen(vm, data_ref) < dlen ||
           tc_ref_maxlen(vm, out_ref) < 16 ||
           dlen > 4096) {
@@ -16946,14 +17533,17 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_MD5);
       if (!info) { TC_PUSH(vm, 0); break; }   // MD5 not compiled into mbedtls
+      // data accepts char[] OR byte[]; the digest goes back via put_bytes.
       uint8_t *dbuf = (uint8_t*)special_malloc(dlen > 0 ? dlen : 1);
       uint8_t out[16];
       if (!dbuf) { TC_PUSH(vm, 0); break; }
-      for (int i = 0; i < dlen; i++) dbuf[i] = (uint8_t)(data_arr[i] & 0xFF);
-      int rc = mbedtls_md(info, dbuf, dlen, out);
+      int32_t dn = 0;
+      uint8_t *dp = tc_ref_bytes(vm, data_ref, dlen, dbuf, dlen > 0 ? dlen : 1, &dn);
+      if (dlen > 0 && !dp) { free(dbuf); TC_PUSH(vm, 0); break; }
+      int rc = mbedtls_md(info, dp, dlen, out);
       free(dbuf);
       if (rc == 0) {
-        for (int i = 0; i < 16; i++) out_arr[i] = (int32_t)out[i];
+        tc_ref_put_bytes(vm, out_ref, out, 16);
         TC_PUSH(vm, 1);
       } else {
         TC_PUSH(vm, 0);
@@ -16979,27 +17569,32 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t hex_ref = TC_POP(vm);
       int32_t *out_arr = tc_resolve_ref(vm, out_ref);
       if (!out_arr || hex_len < 0) { TC_PUSH(vm, -1); break; }
+      const bool out_is_bytes = tc_ref_is_bytes(out_ref);   // byte[] output packs 1:1
       char *src = (char*)special_malloc(1024);
       if (!src) { TC_PUSH(vm, -1); break; }
       int32_t src_len = 0;
       if (tc_is_const_ref(hex_ref)) {
-        const char *cs = tc_get_const_str(vm, hex_ref);
+        // hex_ref is a const REF (0xC0008000|idx), not a bare index — mask it.
+        // (tc_get_const_str(vm, hex_ref) took the negative ref as an index and
+        // returned null, so hex2bin("..literal..") always returned -1. Pre-
+        // existing since the syscall landed; surfaced by byte_syscall_test.)
+        const char *cs = tc_const_ref_str(vm, hex_ref);
         if (!cs) { free(src); TC_PUSH(vm, -1); break; }
         while (cs[src_len] && src_len < 1023) {
           src[src_len] = cs[src_len]; src_len++;
         }
         if (hex_len > 0 && hex_len < src_len) src_len = hex_len;
       } else {
-        int32_t *hex_arr = tc_resolve_ref(vm, hex_ref);
-        if (!hex_arr) { free(src); TC_PUSH(vm, -1); break; }
-        int32_t cap = tc_ref_maxlen(vm, hex_ref);
-        if (hex_len > cap) hex_len = cap;
+        // hex input accepts char[] OR byte[] via tc_ref_bytes.
         if (hex_len > 1024) hex_len = 1024;
-        for (int i = 0; i < hex_len; i++) src[i] = (char)(hex_arr[i] & 0xFF);
-        src_len = hex_len;
+        int32_t hn = 0;
+        uint8_t *hp = tc_ref_bytes(vm, hex_ref, hex_len, (uint8_t*)src, 1024, &hn);
+        if (!hp) { free(src); TC_PUSH(vm, -1); break; }
+        if (hp != (uint8_t*)src) { memcpy(src, hp, hn); }   // byte[]: copy out of the region
+        src_len = hn;
       }
       // Parse pairs of nibbles, skipping whitespace. Bail on malformed.
-      int32_t out_cap = tc_ref_maxlen(vm, out_ref);
+      int32_t out_cap = tc_ref_maxlen(vm, out_ref);   // byte[] -> bytes, else slots
       int32_t written = 0;
       int bad = 0;
       uint8_t hi = 0; int have_hi = 0;
@@ -17014,7 +17609,10 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         if (!have_hi) { hi = v; have_hi = 1; }
         else {
           if (written >= out_cap) break;
-          out_arr[written++] = (int32_t)((hi << 4) | v);
+          uint8_t b = (uint8_t)((hi << 4) | v);
+          if (out_is_bytes) ((uint8_t*)out_arr)[written] = b;
+          else              out_arr[written] = (int32_t)b;
+          written++;
           have_hi = 0;
         }
       }
@@ -17028,21 +17626,37 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t out_ref = TC_POP(vm);
       int32_t bin_len = TC_POP(vm);
       int32_t bin_ref = TC_POP(vm);
-      int32_t *bin_arr = tc_resolve_ref(vm, bin_ref);
       int32_t *out_arr = tc_resolve_ref(vm, out_ref);
-      if (!bin_arr || !out_arr || bin_len < 0) { TC_PUSH(vm, 0); break; }
-      int32_t bin_cap = tc_ref_maxlen(vm, bin_ref);
+      if (!out_arr || bin_len < 0) { TC_PUSH(vm, 0); break; }
+      int32_t bin_cap = tc_ref_maxlen(vm, bin_ref);   // byte[] -> bytes, else slots
       int32_t out_cap = tc_ref_maxlen(vm, out_ref);
       if (bin_len > bin_cap) bin_len = bin_cap;
       if (bin_len * 2 + 1 > out_cap) bin_len = (out_cap - 1) / 2;
+      // bin input accepts char[] OR byte[]. tmp holds a copy for int32 arrays;
+      // for a byte[] tc_ref_bytes points straight into the region.
+      const bool out_is_bytes = tc_ref_is_bytes(out_ref);
+      uint8_t *tmp = (uint8_t*)special_malloc(bin_len > 0 ? bin_len : 1);
+      if (!tmp) { TC_PUSH(vm, 0); break; }
+      int32_t bn = 0;
+      uint8_t *bp = tc_ref_bytes(vm, bin_ref, bin_len, tmp, bin_len > 0 ? bin_len : 1, &bn);
+      if (bin_len > 0 && !bp) { free(tmp); TC_PUSH(vm, 0); break; }
       static const char hex[] = "0123456789abcdef";
       int32_t w = 0;
       for (int i = 0; i < bin_len; i++) {
-        uint8_t b = (uint8_t)(bin_arr[i] & 0xFF);
-        out_arr[w++] = (int32_t)hex[b >> 4];
-        out_arr[w++] = (int32_t)hex[b & 0x0F];
+        uint8_t b = bp[i];
+        if (out_is_bytes) {
+          ((uint8_t*)out_arr)[w++] = (uint8_t)hex[b >> 4];
+          ((uint8_t*)out_arr)[w++] = (uint8_t)hex[b & 0x0F];
+        } else {
+          out_arr[w++] = (int32_t)hex[b >> 4];
+          out_arr[w++] = (int32_t)hex[b & 0x0F];
+        }
       }
-      if (w < out_cap) out_arr[w] = 0;  // NUL-terminate when room
+      if (w < out_cap) {                 // NUL-terminate when room
+        if (out_is_bytes) ((uint8_t*)out_arr)[w] = 0;
+        else              out_arr[w] = 0;
+      }
+      free(tmp);
       TC_PUSH(vm, w);
       break;
     }
@@ -17384,6 +17998,9 @@ static void tc_scan_watch_indices(TcVM *vm) {
         case OP_JMP: case OP_JZ: case OP_JNZ: case OP_CALL:
         case OP_LOAD_GLOBAL: case OP_STORE_GLOBAL:
         case OP_LOAD_GLOBAL_ARR: case OP_STORE_GLOBAL_ARR:
+        case OP_LOAD_GLOBAL_BYTE: case OP_STORE_GLOBAL_BYTE:
+        case OP_LOAD_GLOBAL_I16:  case OP_STORE_GLOBAL_I16:
+        case OP_LOAD_GLOBAL_U16:
         case OP_ADDR_GLOBAL: case OP_SYSCALL2: case OP_LOAD_CONST:
           skip = 2; break;
         // 1-byte operand
@@ -17394,6 +18011,14 @@ static void tc_scan_watch_indices(TcVM *vm) {
         case OP_LOAD_HEAP_ARR: case OP_STORE_HEAP_ARR:
         case OP_ADDR_HEAP: case OP_ADDR_HEAP_OFF:
         case OP_LOAD_REF_ARR: case OP_STORE_REF_ARR:
+        case OP_LOAD_LOCAL_BYTE: case OP_STORE_LOCAL_BYTE:
+        case OP_LOAD_HEAP_BYTE:  case OP_STORE_HEAP_BYTE:
+        case OP_LOAD_REF_BYTE:   case OP_STORE_REF_BYTE:
+        case OP_LOAD_LOCAL_I16:  case OP_STORE_LOCAL_I16:
+        case OP_LOAD_HEAP_I16:   case OP_STORE_HEAP_I16:
+        case OP_LOAD_REF_I16:    case OP_STORE_REF_I16:
+        case OP_LOAD_LOCAL_U16:  case OP_LOAD_HEAP_U16:
+        case OP_LOAD_REF_U16:
         case OP_SYSCALL:
           skip = 1; break;
         // Superinstructions — 2-byte operand (see the 0xB0 block in the enum).
@@ -18368,6 +18993,201 @@ static int tc_vm_step(TcVM *vm) {
       break;
 
     // ── Heap arrays ───────────────────────
+    // ── Packed byte arrays ────────────────────────────────────────────────
+    // Element i is byte i of the region: same memory, read differently. The
+    // bound is the capacity in BYTES, i.e. slots * 4. For the local and global
+    // variants the element count is not known at runtime, so the check is
+    // against the end of the storage — same as the int32 variants do
+    // (LOAD_LOCAL_ARR checks TC_MAX_LOCALS).
+    case OP_LOAD_LOCAL_BYTE: {
+      uint8_t base = tc_read_u8(vm);
+      a = TC_POP(vm);                                   // index in bytes
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      const int32_t grenze = (int32_t)(TC_MAX_LOCALS - base) * 4;
+      if (base >= TC_MAX_LOCALS || a < 0 || a >= grenze) {
+        tc_log_bounds("local byte", a, grenze, vm->pc); return TC_ERR_BOUNDS;
+      }
+      TC_PUSH(vm, (int32_t)((uint8_t *)(vm->frames[vm->fp].locals + base))[a]);
+      break;
+    }
+    case OP_STORE_LOCAL_BYTE: {
+      uint8_t base = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      const int32_t grenze = (int32_t)(TC_MAX_LOCALS - base) * 4;
+      if (base >= TC_MAX_LOCALS || a < 0 || a >= grenze) {
+        tc_log_bounds("local byte", a, grenze, vm->pc); return TC_ERR_BOUNDS;
+      }
+      ((uint8_t *)(vm->frames[vm->fp].locals + base))[a] = (uint8_t)(val & 0xFF);
+      break;
+    }
+    case OP_LOAD_GLOBAL_BYTE: {
+      addr = tc_read_u16(vm);
+      a = TC_POP(vm);
+      const int32_t grenze = (addr < vm->globals_size) ? (int32_t)(vm->globals_size - addr) * 4 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("global byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_PUSH(vm, (int32_t)((uint8_t *)(vm->globals + addr))[a]);
+      break;
+    }
+    case OP_STORE_GLOBAL_BYTE: {
+      addr = tc_read_u16(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      const int32_t grenze = (addr < vm->globals_size) ? (int32_t)(vm->globals_size - addr) * 4 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("global byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_GLOBALS_LOCK(vm);
+      ((uint8_t *)(vm->globals + addr))[a] = (uint8_t)(val & 0xFF);
+      TC_GLOBALS_UNLOCK(vm);
+      break;
+    }
+    case OP_LOAD_HEAP_BYTE: {
+      uint8_t handle = tc_read_u8(vm);
+      a = TC_POP(vm);
+      if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+          !vm->heap_handles[handle].alive) { tc_log_bounds("heap byte", a, 0, vm->pc); return TC_ERR_BOUNDS; }
+      const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 4;
+      if (a < 0 || a >= grenze) { tc_log_bounds("heap byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_PUSH(vm, (int32_t)((uint8_t *)(vm->heap_data + vm->heap_handles[handle].offset))[a]);
+      break;
+    }
+    case OP_STORE_HEAP_BYTE: {
+      uint8_t handle = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+          !vm->heap_handles[handle].alive) { tc_log_bounds("heap byte", a, 0, vm->pc); return TC_ERR_BOUNDS; }
+      const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 4;
+      if (a < 0 || a >= grenze) { tc_log_bounds("heap byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      ((uint8_t *)(vm->heap_data + vm->heap_handles[handle].offset))[a] = (uint8_t)(val & 0xFF);
+      break;
+    }
+    // Byte array as a parameter: the local slot holds the flagged ref; it is
+    // resolved exactly as OP_LOAD_REF_ARR does, only read byte-wise.
+    case OP_LOAD_REF_BYTE: {
+      uint8_t li = tc_read_u8(vm);
+      a = TC_POP(vm);
+      if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[li];
+      int32_t *basis = tc_resolve_ref(vm, ref);
+      // Capacity of the REGION, four bytes per slot — deliberately not derived
+      // from the ref's own kind: a mistyped argument would otherwise size the
+      // bound by the caller's element width instead of the storage.
+      const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 4;
+      if (!basis || a < 0 || a >= grenze) { tc_log_bounds("ref byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_PUSH(vm, (int32_t)((uint8_t *)basis)[a]);
+      break;
+    }
+    case OP_STORE_REF_BYTE: {
+      uint8_t li = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[li];
+      int32_t *basis = tc_resolve_ref(vm, ref);
+      // Capacity of the REGION, four bytes per slot — deliberately not derived
+      // from the ref's own kind: a mistyped argument would otherwise size the
+      // bound by the caller's element width instead of the storage.
+      const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 4;
+      if (!basis || a < 0 || a >= grenze) { tc_log_bounds("ref byte", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      ((uint8_t *)basis)[a] = (uint8_t)(val & 0xFF);
+      break;
+    }
+
+    // ── Packed 16-bit arrays ──────────────────────────────────────────────
+    // Element i is the i-th 16-bit word of the region, so the bound is the
+    // capacity in WORDS, i.e. slots * 2. Signedness lives in the load: the
+    // stores below write the same sixteen bits for int16 and uint16 alike.
+    case OP_LOAD_LOCAL_I16: case OP_LOAD_LOCAL_U16: {
+      uint8_t base = tc_read_u8(vm);
+      a = TC_POP(vm);                                   // index in words
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 2 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("local i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      void *basis = (void *)(vm->frames[vm->fp].locals + base);
+      TC_PUSH(vm, (op == OP_LOAD_LOCAL_I16) ? (int32_t)((int16_t *)basis)[a]
+                                            : (int32_t)((uint16_t *)basis)[a]);
+      break;
+    }
+    case OP_STORE_LOCAL_I16: {
+      uint8_t base = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 2 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("local i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      ((uint16_t *)(vm->frames[vm->fp].locals + base))[a] = (uint16_t)(val & 0xFFFF);
+      break;
+    }
+    case OP_LOAD_GLOBAL_I16: case OP_LOAD_GLOBAL_U16: {
+      addr = tc_read_u16(vm);
+      a = TC_POP(vm);
+      const int32_t grenze = (addr < vm->globals_size) ? (int32_t)(vm->globals_size - addr) * 2 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("global i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      void *basis = (void *)(vm->globals + addr);
+      TC_PUSH(vm, (op == OP_LOAD_GLOBAL_I16) ? (int32_t)((int16_t *)basis)[a]
+                                             : (int32_t)((uint16_t *)basis)[a]);
+      break;
+    }
+    case OP_STORE_GLOBAL_I16: {
+      addr = tc_read_u16(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      const int32_t grenze = (addr < vm->globals_size) ? (int32_t)(vm->globals_size - addr) * 2 : 0;
+      if (a < 0 || a >= grenze) { tc_log_bounds("global i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_GLOBALS_LOCK(vm);
+      ((uint16_t *)(vm->globals + addr))[a] = (uint16_t)(val & 0xFFFF);
+      TC_GLOBALS_UNLOCK(vm);
+      break;
+    }
+    case OP_LOAD_HEAP_I16: case OP_LOAD_HEAP_U16: {
+      uint8_t handle = tc_read_u8(vm);
+      a = TC_POP(vm);
+      if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+          !vm->heap_handles[handle].alive) { tc_log_bounds("heap i16", a, 0, vm->pc); return TC_ERR_BOUNDS; }
+      const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 2;
+      if (a < 0 || a >= grenze) { tc_log_bounds("heap i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      void *basis = (void *)(vm->heap_data + vm->heap_handles[handle].offset);
+      TC_PUSH(vm, (op == OP_LOAD_HEAP_I16) ? (int32_t)((int16_t *)basis)[a]
+                                           : (int32_t)((uint16_t *)basis)[a]);
+      break;
+    }
+    case OP_STORE_HEAP_I16: {
+      uint8_t handle = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+          !vm->heap_handles[handle].alive) { tc_log_bounds("heap i16", a, 0, vm->pc); return TC_ERR_BOUNDS; }
+      const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 2;
+      if (a < 0 || a >= grenze) { tc_log_bounds("heap i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      ((uint16_t *)(vm->heap_data + vm->heap_handles[handle].offset))[a] = (uint16_t)(val & 0xFFFF);
+      break;
+    }
+    case OP_LOAD_REF_I16: case OP_LOAD_REF_U16: {
+      uint8_t li = tc_read_u8(vm);
+      a = TC_POP(vm);
+      if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[li];
+      int32_t *basis = tc_resolve_ref(vm, ref);
+      const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 2;
+      if (!basis || a < 0 || a >= grenze) { tc_log_bounds("ref i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      TC_PUSH(vm, (op == OP_LOAD_REF_I16) ? (int32_t)((int16_t *)basis)[a]
+                                          : (int32_t)((uint16_t *)basis)[a]);
+      break;
+    }
+    case OP_STORE_REF_I16: {
+      uint8_t li = tc_read_u8(vm);
+      int32_t val = TC_POP(vm);
+      a = TC_POP(vm);
+      if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) return TC_ERR_BOUNDS;
+      int32_t ref = vm->frames[vm->fp].locals[li];
+      int32_t *basis = tc_resolve_ref(vm, ref);
+      const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 2;
+      if (!basis || a < 0 || a >= grenze) { tc_log_bounds("ref i16", a, grenze, vm->pc); return TC_ERR_BOUNDS; }
+      ((uint16_t *)basis)[a] = (uint16_t)(val & 0xFFFF);
+      break;
+    }
+
     case OP_LOAD_HEAP_ARR: {
       uint8_t handle = tc_read_u8(vm);
       a = TC_POP(vm);  // index
@@ -18678,12 +19498,29 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     _dispatch[0xA5] = &&_op_store_watch;
     // Heap address with offset, and ref-offset arithmetic
     _dispatch[0xA6] = &&_op_addr_heap_off;
+    // Packed byte arrays (docs/BYTE_ARRAYS.md). ⚠️ THIS table is the dispatcher
+    // the ESP32 actually uses — the switch further up is the second path. An
+    // opcode that only exists there dies on the device as "Unknown opcode"
+    // (exactly what happened on the C3, 2026-08-21).
+    _dispatch[0xA8] = &&_op_load_local_byte;  _dispatch[0xA9] = &&_op_store_local_byte;
+    _dispatch[0xAA] = &&_op_load_global_byte; _dispatch[0xAB] = &&_op_store_global_byte;
+    _dispatch[0xAC] = &&_op_load_heap_byte;   _dispatch[0xAD] = &&_op_store_heap_byte;
+    _dispatch[0xAE] = &&_op_load_ref_byte;    _dispatch[0xAF] = &&_op_store_ref_byte;
     _dispatch[0xA7] = &&_op_ref_off;
     // Superinstructions
     _dispatch[0xB0] = &&_op_inc_local;
     _dispatch[0xB1] = &&_op_lk_op_st;  _dispatch[0xB2] = &&_op_ll_op_st;
     _dispatch[0xB3] = &&_op_lk32_op_st;
     _dispatch[0xB4] = &&_op_ll_cmp_jz; _dispatch[0xB5] = &&_op_lk32_cmp_jz;
+    // Packed 16-bit arrays (docs/INT16_ARRAYS.md) — same warning as the byte
+    // block above: an opcode that exists only in the switch dies here as
+    // "Unknown opcode".
+    _dispatch[0xB6] = &&_op_load_local_i16;  _dispatch[0xB7] = &&_op_store_local_i16;
+    _dispatch[0xB8] = &&_op_load_global_i16; _dispatch[0xB9] = &&_op_store_global_i16;
+    _dispatch[0xBA] = &&_op_load_heap_i16;   _dispatch[0xBB] = &&_op_store_heap_i16;
+    _dispatch[0xBC] = &&_op_load_ref_i16;    _dispatch[0xBD] = &&_op_store_ref_i16;
+    _dispatch[0xBE] = &&_op_load_local_u16;  _dispatch[0xBF] = &&_op_load_global_u16;
+    _dispatch[0xC0] = &&_op_load_heap_u16;   _dispatch[0xC1] = &&_op_load_ref_u16;
     _dispatch_init = true;
   }
 
@@ -18997,6 +19834,185 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     NEXT();
 
   // Heap arrays
+  // ── Packed byte arrays ────────────────────────────────────────────────────
+  _op_load_local_byte: {
+    uint8_t base = _RD_U8();
+    _a = TC_IPOP();
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 4 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("local byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_IPUSH((int32_t)((uint8_t *)(vm->frames[vm->fp].locals + base))[_a]);
+    NEXT();
+  }
+  _op_store_local_byte: {
+    uint8_t base = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 4 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("local byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint8_t *)(vm->frames[vm->fp].locals + base))[_a] = (uint8_t)(val & 0xFF);
+    NEXT();
+  }
+  _op_load_global_byte: {
+    uint16_t base = _RD_U16();
+    _a = TC_IPOP();
+    const int32_t grenze = (base < vm->globals_size) ? (int32_t)(vm->globals_size - base) * 4 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("global byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_IPUSH((int32_t)((uint8_t *)(vm->globals + base))[_a]);
+    NEXT();
+  }
+  _op_store_global_byte: {
+    uint16_t base = _RD_U16();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    const int32_t grenze = (base < vm->globals_size) ? (int32_t)(vm->globals_size - base) * 4 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("global byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_GLOBALS_LOCK(vm);
+    ((uint8_t *)(vm->globals + base))[_a] = (uint8_t)(val & 0xFF);
+    TC_GLOBALS_UNLOCK(vm);
+    NEXT();
+  }
+  _op_load_heap_byte: {
+    uint8_t handle = _RD_U8();
+    _a = TC_IPOP();
+    if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+        !vm->heap_handles[handle].alive) { tc_log_bounds("heap byte", _a, 0, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 4;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("heap byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_IPUSH((int32_t)((uint8_t *)(vm->heap_data + vm->heap_handles[handle].offset))[_a]);
+    NEXT();
+  }
+  _op_store_heap_byte: {
+    uint8_t handle = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+        !vm->heap_handles[handle].alive) { tc_log_bounds("heap byte", _a, 0, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 4;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("heap byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint8_t *)(vm->heap_data + vm->heap_handles[handle].offset))[_a] = (uint8_t)(val & 0xFF);
+    NEXT();
+  }
+  _op_load_ref_byte: {
+    uint8_t li = _RD_U8();
+    _a = TC_IPOP();
+    if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    int32_t ref = vm->frames[vm->fp].locals[li];
+    int32_t *basis = tc_resolve_ref(vm, ref);
+    const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 4;   // see the step-path twin
+    if (!basis || _a < 0 || _a >= grenze) { tc_log_bounds("ref byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_IPUSH((int32_t)((uint8_t *)basis)[_a]);
+    NEXT();
+  }
+  _op_store_ref_byte: {
+    uint8_t li = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    int32_t ref = vm->frames[vm->fp].locals[li];
+    int32_t *basis = tc_resolve_ref(vm, ref);
+    const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 4;   // see the step-path twin
+    if (!basis || _a < 0 || _a >= grenze) { tc_log_bounds("ref byte", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint8_t *)basis)[_a] = (uint8_t)(val & 0xFF);
+    NEXT();
+  }
+
+  // ── Packed 16-bit arrays ──────────────────────────────────────────────────
+  _op_load_local_i16:
+  _op_load_local_u16: {
+    uint8_t base = _RD_U8();
+    _a = TC_IPOP();
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 2 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("local i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    void *basis = (void *)(vm->frames[vm->fp].locals + base);
+    TC_IPUSH(_op == OP_LOAD_LOCAL_I16 ? (int32_t)((int16_t *)basis)[_a]
+                                      : (int32_t)((uint16_t *)basis)[_a]);
+    NEXT();
+  }
+  _op_store_local_i16: {
+    uint8_t base = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    const int32_t grenze = (base < TC_MAX_LOCALS) ? (int32_t)(TC_MAX_LOCALS - base) * 2 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("local i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint16_t *)(vm->frames[vm->fp].locals + base))[_a] = (uint16_t)(val & 0xFFFF);
+    NEXT();
+  }
+  _op_load_global_i16:
+  _op_load_global_u16: {
+    uint16_t base = _RD_U16();
+    _a = TC_IPOP();
+    const int32_t grenze = (base < vm->globals_size) ? (int32_t)(vm->globals_size - base) * 2 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("global i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    void *basis = (void *)(vm->globals + base);
+    TC_IPUSH(_op == OP_LOAD_GLOBAL_I16 ? (int32_t)((int16_t *)basis)[_a]
+                                       : (int32_t)((uint16_t *)basis)[_a]);
+    NEXT();
+  }
+  _op_store_global_i16: {
+    uint16_t base = _RD_U16();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    const int32_t grenze = (base < vm->globals_size) ? (int32_t)(vm->globals_size - base) * 2 : 0;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("global i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_GLOBALS_LOCK(vm);
+    ((uint16_t *)(vm->globals + base))[_a] = (uint16_t)(val & 0xFFFF);
+    TC_GLOBALS_UNLOCK(vm);
+    NEXT();
+  }
+  _op_load_heap_i16:
+  _op_load_heap_u16: {
+    uint8_t handle = _RD_U8();
+    _a = TC_IPOP();
+    if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+        !vm->heap_handles[handle].alive) { tc_log_bounds("heap i16", _a, 0, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 2;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("heap i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    void *basis = (void *)(vm->heap_data + vm->heap_handles[handle].offset);
+    TC_IPUSH(_op == OP_LOAD_HEAP_I16 ? (int32_t)((int16_t *)basis)[_a]
+                                     : (int32_t)((uint16_t *)basis)[_a]);
+    NEXT();
+  }
+  _op_store_heap_i16: {
+    uint8_t handle = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (handle >= TC_MAX_HEAP_HANDLES || !vm->heap_data || !vm->heap_handles ||
+        !vm->heap_handles[handle].alive) { tc_log_bounds("heap i16", _a, 0, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    const int32_t grenze = (int32_t)vm->heap_handles[handle].size * 2;
+    if (_a < 0 || _a >= grenze) { tc_log_bounds("heap i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint16_t *)(vm->heap_data + vm->heap_handles[handle].offset))[_a] = (uint16_t)(val & 0xFFFF);
+    NEXT();
+  }
+  _op_load_ref_i16:
+  _op_load_ref_u16: {
+    uint8_t li = _RD_U8();
+    _a = TC_IPOP();
+    if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    int32_t ref = vm->frames[vm->fp].locals[li];
+    int32_t *basis = tc_resolve_ref(vm, ref);
+    const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 2;
+    if (!basis || _a < 0 || _a >= grenze) { tc_log_bounds("ref i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    TC_IPUSH(_op == OP_LOAD_REF_I16 ? (int32_t)((int16_t *)basis)[_a]
+                                    : (int32_t)((uint16_t *)basis)[_a]);
+    NEXT();
+  }
+  _op_store_ref_i16: {
+    uint8_t li = _RD_U8();
+    int32_t val = TC_IPOP();
+    _a = TC_IPOP();
+    if (li >= TC_MAX_LOCALS || !vm->frames[vm->fp].locals) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    int32_t ref = vm->frames[vm->fp].locals[li];
+    int32_t *basis = tc_resolve_ref(vm, ref);
+    const int32_t grenze = tc_ref_maxlen_slots(vm, ref) * 2;
+    if (!basis || _a < 0 || _a >= grenze) { tc_log_bounds("ref i16", _a, grenze, _pc); _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    ((uint16_t *)basis)[_a] = (uint16_t)(val & 0xFFFF);
+    NEXT();
+  }
+
   _op_load_heap: {
     uint8_t handle = _RD_U8();
     _a = TC_IPOP();
@@ -19156,11 +20172,11 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     vm->frames[vm->fp].locals[_wdst] = _wr;
     NEXT();
   }
-  // ── Superinstructions: locals[dst] = locals[src] OP (konstante | locals[b]) ──
+  // ── Superinstructions: locals[dst] = locals[src] OP (constant | locals[b]) ──
   _op_lk_op_st:
   _op_ll_op_st: {
-    // _op ist noch der gerade geholte Opcode -- daran haengt, ob rechts eine
-    // Konstante oder ein zweiter Local steht.
+    // _op is still the opcode just fetched -- it decides whether the right-hand
+    // side is a constant or a second local.
     uint8_t _s1 = _RD_U8();
     int32_t _rhs;
     if (_op == OP_LK_OP_ST) { _rhs = (int32_t)(int8_t)_RD_U8(); }
@@ -19549,15 +20565,6 @@ static inline bool tc_slot_dispatchable(const TcSlot *s) {
 // sensorGet() that suddenly takes 400 ms costs the whole loop.
 static bool tc_slot_web_ready(TcSlot *s, const char *name, bool may_wait = true) {
   if (!s || !s->loaded || s->vm.error != TC_OK) { return false; }
-  // No task AND not dispatchable right now: nothing can change that, so the
-  // budget loop below would burn its full time on every callback of every
-  // request. Measured on a C3 (Hans, 2026-08-20) with a freshly uploaded,
-  // never-started slot 0: /tc_api instant, main page 3.6 s, sensor fetch 5.0 s.
-  // ⚠️ NOT `!s->running` alone. A program without TaskLoop ends its task after
-  // main() and is halted-and-dispatchable from then on - callbacks still fire.
-  // Testing running alone drops exactly those programs from every page
-  // (sml_chart: buttons present, not a single row).
-  if (!s->running && !tc_slot_dispatchable(s)) { return false; }
   // ⚠️ Nothing to render means nothing to wait for AND nothing to report lost.
   // Most scripts define one or two of WebCall/WebPage/WebUI/JsonCall, so without
   // this the fan-out waits on -- and counts a skip for -- callbacks that do not
@@ -19874,36 +20881,6 @@ static void TinyCStopVM(TcSlot *s) {
 }
 
 // Helper: start the VM in a specific slot
-#ifdef ESP32
-// ── Slot 0's task stack, reserved at link time ─────────────────────────────
-// xTaskCreate takes the stack from the heap and needs it CONTIGUOUS. On a C3
-// without PSRAM the largest free block drops below the 12 KB default after a
-// few hours of uptime, and starting a program then fails with nothing but
-// "Failed to create task" -- measured 2026-08-20 on Hans' device: 12288 needed,
-// 11676 available, 612 bytes short, while 49 KB were free in total. Stopping or
-// unloading the old program does not help: it returns memory, but not as one
-// long run.
-//
-// A buffer in BSS cannot fail and cannot fragment. The price is that it stays
-// occupied even when no program runs -- the right trade on a device whose
-// purpose is running one. Slot 0 only, because that is where the energy manager
-// lives; the other slots keep the dynamic path.
-// Set TC_STATIC_STACK_SLOT0 to 0 to get the old behaviour back.
-#ifndef TC_STATIC_STACK_SLOT0
-#define TC_STATIC_STACK_SLOT0 1
-#endif
-#if TC_STATIC_STACK_SLOT0
-#ifndef TC_STATIC_STACK_BYTES
-#define TC_STATIC_STACK_BYTES 12288      // matches the TinyCStack default
-#endif
-// ESP-IDF sizes task stacks in BYTES and StackType_t is a byte, so the array
-// length is the byte count.
-static StackType_t  tc_vm_stack0[TC_STATIC_STACK_BYTES];
-static StaticTask_t tc_vm_tcb0;
-static bool         tc_vm_stack0_used = false;
-#endif
-#endif  // ESP32
-
 static bool TinyCStartVM(TcSlot *s) {
   if (!Tinyc || !s || !s->loaded) return false;
   TC_HEAPLOG("startvm.in");
@@ -19993,49 +20970,29 @@ static bool TinyCStartVM(TcSlot *s) {
 
   // Build task name from slot index
   char taskname[16];
-  uint8_t slot_idx = 0;
   snprintf(taskname, sizeof(taskname), "tinyc_vm%d", 0);  // find slot index
   for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
-    if (Tinyc->slots[i] == s) { slot_idx = i; snprintf(taskname, sizeof(taskname), "tinyc_vm%d", i); break; }
+    if (Tinyc->slots[i] == s) { snprintf(taskname, sizeof(taskname), "tinyc_vm%d", i); break; }
   }
 
-  BaseType_t ret = pdFAIL;
-
-#if TC_STATIC_STACK_SLOT0
-  if (slot_idx == 0 && tc_vm_stack_bytes <= TC_STATIC_STACK_BYTES) {
-    // The previous task deleted ITSELF (vTaskDelete(NULL)) and the idle task
-    // takes it off the termination list afterwards. Reusing the same TCB before
-    // that happened corrupts the scheduler, and the stop handshake returns as
-    // soon as task_running goes false -- which the task sets BEFORE deleting
-    // itself. So give the idle task a moment. Once per program start, not hot.
-    if (tc_vm_stack0_used) { delay(50); }
-    s->task_handle = xTaskCreateStatic(tc_vm_task, taskname, TC_STATIC_STACK_BYTES,
-                                       s, 1, tc_vm_stack0, &tc_vm_tcb0);
-    if (s->task_handle) {
-      tc_vm_stack0_used = true;
-      ret = pdPASS;
-      AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: slot 0 task on the static %u B stack"),
-             (unsigned)TC_STATIC_STACK_BYTES);
-    }
-  } else
-#endif
-  {
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2)
   // Single-core variants -- no core affinity
-  ret = xTaskCreate(tc_vm_task, taskname, tc_vm_stack_bytes, s, 1, &s->task_handle);
+  BaseType_t ret = xTaskCreate(tc_vm_task, taskname, tc_vm_stack_bytes, s, 1, &s->task_handle);
 #else
   // Dual-core ESP32/S3 -- pin to core 1
   TC_HEAPLOG("startvm.pretask");
-  ret = xTaskCreatePinnedToCore(tc_vm_task, taskname, tc_vm_stack_bytes, s, 1, &s->task_handle, 1);
+  BaseType_t ret = xTaskCreatePinnedToCore(tc_vm_task, taskname, tc_vm_stack_bytes, s, 1, &s->task_handle, 1);
   TC_HEAPLOG("startvm.posttask");
 #endif
-  }
   if (ret != pdPASS) {
-    // Name both numbers: the stack has to be CONTIGUOUS, so the total free heap
-    // says nothing about why this failed, and "Failed to create task" alone
-    // sends people looking in the wrong place.
-    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Failed to create task for %s: need %u B contiguous, largest block %u - lower TinyCStack or restart"),
-           s->filename, (unsigned)tc_vm_stack_bytes, (unsigned)ESP_getMaxAllocHeap());
+    // xTaskCreate allocates the stack from the heap, so this fails on a
+    // FRAGMENTED heap even with plenty free — the numbers turn "failed" into a
+    // decision (Hans, ottelo: 49 kB free, frag 77 %, largest block 11.7 kB,
+    // 612 B short of the 12 kB stack). Task stacks come from internal DRAM.
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("TCC: Failed to create task for %s: need %u B contiguous, largest block %u - lower TinyCStack or restart"),
+           s->filename, (unsigned)tc_vm_stack_bytes,
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     s->running = false;
     return false;
   }

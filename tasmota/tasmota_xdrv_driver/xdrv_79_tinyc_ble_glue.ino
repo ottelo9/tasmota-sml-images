@@ -215,20 +215,20 @@ void tc_ble_spp_target(const uint8_t *mac, int addrtype, const char *svc) {
 int tc_ble_spp_connect(void) {
   if (!tc_spp.svc[0]) { return 0; }
   BLE_ESP32::BLEEnableUnsaved = 1;    // request NimBLE up, same as the other BLE entry points
-  // ⚠️⚠️ NICHTS IN NIMBLE AUFRUFEN, SOLANGE DER HOST NICHT STEHT. BLEEnableUnsaved
-  // BITTET nur darum, dass BLE hochkommt -- es wartet nicht. Jede Host-Funktion nimmt
-  // aber ble_hs_lock(), und deren Mutex existiert vorher NICHT: der Zugriff endet in
-  // ble_npl_mutex_pend mit Exception 28 / LoadProhibited.
-  // Mit der passenden ELF decodiert (2026-08-06), nachdem ich es dreimal falsch
-  // geraten hatte -- erst auf "falscher Task" getippt, dann auf die falsche Funktion.
-  // Die Absturzadressen lagen alle in derselben Sperrlogik von ble_hs.c.
-  // tc_ble_srv_loop() weiter unten macht es seit jeher richtig und wartet genau so.
-  // Der Aufrufer versucht es einfach erneut; beim naechsten Mal steht der Stapel.
+  // ⚠️⚠️ CALL NOTHING IN NIMBLE WHILE THE HOST IS NOT UP. BLEEnableUnsaved only ASKS
+  // for BLE to come up -- it does not wait. But every host function takes
+  // ble_hs_lock(), and that mutex does NOT exist before then: the access dies in
+  // ble_npl_mutex_pend with exception 28 / LoadProhibited.
+  // Decoded with the matching ELF (2026-08-06) after guessing wrong three times --
+  // first "wrong task", then the wrong function. All the crash addresses were in the
+  // same locking logic in ble_hs.c.
+  // tc_ble_srv_loop() further down has always done it right and waits exactly so.
+  // The caller simply tries again; next time round the stack is up.
   if (!NimBLEDevice::isInitialized()) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("BLE: SPP connect deferred -- NimBLE not up yet"));
     return 0;
   }
-  // Groessere MTU anfordern -- ERST JETZT, denn auch das nimmt die Host-Sperre.
+  // Ask for a larger MTU -- ONLY NOW, because that takes the host lock too.
   NimBLEDevice::setMTU(247);
   if (!tc_spp_client) {
     tc_spp_client = NimBLEDevice::createClient();
@@ -237,10 +237,10 @@ int tc_ble_spp_connect(void) {
   }
   if (tc_spp_client->isConnected()) {
     tc_spp_client->disconnect();
-    // ⚠️ Auf den Abbau WARTEN. disconnect() ist asynchron, und solange die alte
-    // Verbindung im Host steht, lehnt connect() die neue ohne Fehlercode ab
-    // (ble_gap_conn_find_by_addr findet sie). Nur unser eigenes Client-Objekt
-    // abfragen -- kein Aufruf in den BLE-Stapel aus diesem Task.
+    // ⚠️ WAIT for the teardown. disconnect() is asynchronous, and as long as the old
+    // connection still stands in the host, connect() refuses the new one with no
+    // error code (ble_gap_conn_find_by_addr finds it). Only poll our own client
+    // object -- no call into the BLE stack from this task.
     for (int i = 0; i < 40 && tc_spp_client->isConnected(); i++) {
       vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -284,12 +284,11 @@ int tc_ble_spp_connect(void) {
 }
 
 int tc_ble_spp_state(void) {
-  // ⚠️ Der DIENSTZEIGER gehoert zur Bedingung. onDisconnect() setzt ihn auf nullptr,
-  // und tc_ble_spp_write() gibt ohne ihn sofort 0 zurueck. Fragte man hier nur
-  // isConnected(), meldete der Zustand "VERBUNDEN", waehrend jedes Schreiben
-  // scheitert -- genau dieser Widerspruch stand am 2026-08-06 im Log und hat die
-  // Fehlersuche verlaengert. Ein Zustand, der dem Verhalten widerspricht, ist
-  // schlimmer als gar keiner.
+  // ⚠️ The SERVICE POINTER belongs in the condition. onDisconnect() sets it to
+  // nullptr, and without it tc_ble_spp_write() returns 0 straight away. Asking only
+  // isConnected() here reported the state as "CONNECTED" while every write failed --
+  // exactly that contradiction sat in the log on 2026-08-06 and dragged the debugging
+  // out. A state that contradicts the behaviour is worse than no state at all.
   return (tc_spp_client && tc_spp_client->isConnected() && tc_spp_service) ? 1 : 0;
 }
 

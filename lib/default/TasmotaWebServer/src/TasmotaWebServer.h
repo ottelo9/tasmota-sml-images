@@ -83,6 +83,16 @@ public:
 
   bool isChunked(void) const { return _chunked; }
 
+  // True only while the current request has a live multipart UPLOAD context.
+  // The Arduino-ESP32 WebServer routes a RAW (non-multipart) POST body to the
+  // SAME registered upload function (FunctionRequestHandler::raw() -> _ufn),
+  // but with _currentUpload == nullptr. An upload handler that unconditionally
+  // calls upload() then dereferences a null unique_ptr -> LoadProhibited
+  // reboot (the /tc_upload "camera regression": a `curl --data-binary` POST
+  // rebooted the S3). Handlers gate on this and bail on a raw invocation.
+  // _currentUpload is protected in WebServer; this subclass already touches it.
+  bool hasUploadCtx(void) const { return (bool)_currentUpload; }
+
 #ifdef USE_HTTP_KEEPALIVE
   // Per-request keep-alive opt-in. Set inside a request handler AFTER the
   // response has been written. The override of handleClient() below sees

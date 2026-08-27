@@ -447,10 +447,10 @@ static bool TcSppInit(void) {
   if (TcSpp.state != TC_SPP_AUS) { return true; }
   esp_err_t r;
 
-  // ⚠️ largest ausdruecklich MALLOC_CAP_INTERNAL. Mit MALLOC_CAP_DEFAULT zaehlt auf
-  // einem Board MIT PSRAM der PSRAM-Block mit, und dann steht hier ein Megabyte, waehrend
-  // der INTERNE Speicher — der einzige, aus dem Rahmen- und DMA-Anforderungen bedient
-  // werden — knapp ist. Genau die Zahl, wegen der man dann an der falschen Stelle sucht.
+  // ⚠️ "largest" is deliberately MALLOC_CAP_INTERNAL. With MALLOC_CAP_DEFAULT the PSRAM
+  // block counts too on a board WITH PSRAM, so this prints a megabyte while the INTERNAL
+  // memory — the only pool that serves frame and DMA allocations — is nearly gone.
+  // Exactly the number that then sends you looking in the wrong place.
   AddLog(LOG_LEVEL_INFO, PSTR("SPP: status=%d (0=idle 1=inited 2=enabled) heap=%u largest_internal=%u"),
          (int)esp_bt_controller_get_status(),
          (unsigned)ESP_getFreeHeap(),
