@@ -7121,6 +7121,27 @@ bool Xdrv124(uint32_t function) {
           if (_a >= 8) {
             AddLog(LOG_LEVEL_INFO, PSTR("TCC: lwIP TCP PCBs active=%u (pool=16, time_wait=%u) - connections not closing?"), _a, _tw);
           }
+#ifdef USE_HTTP_KEEPALIVE
+          // How often a kept-alive connection had to be given up. The counters
+          // live in TasmotaWebServer and are reported only here — that header
+          // must not depend on anything from the Tasmota core.
+          //
+          // ⚠️ This is the line that was MISSING during ottelo9/tasmota-sml-images#52.
+          // A single held connection takes down the entire web server (the
+          // Arduino WebServer serves one client at a time), and the log said
+          // nothing about it for weeks.
+          //   idle  > 0   peer went away without closing
+          //   other > 0   peer polls so tightly that nobody else would get in;
+          //               without that bound port 80 stays shut for the browser
+          if (Webserver) {
+            static uint16_t _ka_i = 0, _ka_o = 0;
+            uint16_t i = Webserver->kaDropIdle(), o = Webserver->kaDropOther();
+            if (i != _ka_i || o != _ka_o) {
+              AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: http keep-alive dropped idle=%u other=%u"), i, o);
+              _ka_i = i; _ka_o = o;
+            }
+          }
+#endif
         }
       }
 #endif

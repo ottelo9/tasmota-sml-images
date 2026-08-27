@@ -660,7 +660,12 @@ void StartWebserver(int type) {
     if (!Webserver) {
       Webserver = new TasmotaWebServer((HTTP_MANAGER == type || HTTP_MANAGER_RESET_ONLY == type) ? 80 : WEB_PORT);
 
-      const char* headerkeys[] = { "Referer", "Host" };
+      // "Connection" is collected so a handler can honour what the client
+      // actually asked for: TasmotaWebServer::setKeepAlive() refuses to hold
+      // the socket when the request said `close`. Without it every keep-alive
+      // capable handler decides alone, and one client can hold the single
+      // server slot against everyone else.
+      const char* headerkeys[] = { "Referer", "Host", "Connection" };
       size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*);
       Webserver->collectHeaders(headerkeys, headerkeyssize);
 
