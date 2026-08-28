@@ -142,22 +142,25 @@ public:
   // request instead of destroying _currentClient. The flag auto-clears
   // at the start of each new request (caller must re-arm per request)
   // and when a new client connects.
-  // Honours the request: `Connection: close` means close, whatever the handler
-  // asks for. Holding a socket the client did not want costs the single server
-  // slot for nothing -- and with TC_KEEPALIVE_YIELD_AFTER it also costs every
-  // waiting browser its grace period.
+  // Asking to hold the socket is a REQUEST, not a decree: a client that said
+  // `Connection: close` gets closed even when the handler asks for keep-alive.
+  // The EcoTracker-style handlers call webKeepAlive() unconditionally, and this
+  // is what makes that honest -- the handler asks, the client decides.
   //
-  // ⚠️ A MISSING header means keep-alive, not close: HTTP/1.1 says so, and the
-  // devices do it. sdeigm/uni-meter#265 has the only trace against a REAL
-  // EcoTracker -- `GET /v1/json HTTP/1.1` with Host/User-Agent/Accept, no
-  // Connection header, answered with two headers and "Connection #0 left
-  // intact". Requiring the token would refuse exactly the clients this exists
-  // for. "Connection" is collected in xdrv_01_9_webserver.ino.
+  // ⚠️ POLARITY: a MISSING header means keep-alive, not close. HTTP/1.1 defaults
+  // to persistent, and the only trace we have of a real EcoTracker
+  // (sdeigm/uni-meter#265) sends `GET /v1/json HTTP/1.1` with Host, User-Agent
+  // and Accept and NO Connection header at all. Requiring the token would
+  // refuse exactly the clients this feature exists for. (Hans, 2026-08-27.)
+  //
+  // ⚠️ Needs "Connection" in collectHeaders() -- see xdrv_01_9_webserver.ino.
+  // Without it header("Connection") is empty for every request and this reads
+  // as "keep-alive" throughout, which is the old behaviour, not a crash.
   void setKeepAlive(bool en) {
     if (!en) { _ka_flag = false; return; }
-    String c = hasHeader("Connection") ? header("Connection") : String();
+    String c = hasHeader(F("Connection")) ? header(F("Connection")) : String();
     c.toLowerCase();
-    _ka_flag = (c.indexOf("close") < 0);
+    _ka_flag = (c.indexOf(F("close")) < 0);
   }
   bool keepAlive(void) const { return _ka_flag; }
 
