@@ -2079,7 +2079,12 @@ static void HandleTinyCPage(void) {
         // cost far more page bytes than this page can spare. The button follows
         // the selection and disables itself when the chosen program carries no
         // link. `tclI()` is defined once below, after the <select> exists.
-        "<button type='button' id='tclib' class='button' style='width:auto;padding:0 10px;line-height:1.9rem;font-size:1rem'"
+        // ⚠️ line-height und font-size MUESSEN mit: Tasmotas `.button` setzt
+        // 2.4rem/1.2rem, der Knopf wurde damit 38.4 px hoch neben einer 32 px
+        // hohen Liste. Das padding allein zu nullen reicht nicht -- die Hoehe
+        // kommt aus der Zeilenhoehe (Hans, 2026-08-28; nachgemessen auf dem C3).
+        "<button type='button' id='tclib' class='button'"
+        " style='width:auto;padding:0 10px;line-height:2rem;font-size:1rem'"
         " title='Info' onclick='tclI()'>i</button>"
         "<select name='slot' style='width:auto'>"));
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
@@ -2137,7 +2142,9 @@ static void HandleTinyCPage(void) {
             "<fieldset><legend><b> Repository </b></legend>"
             "<div style='display:flex;gap:8px;align-items:center'>"
             "<select id='tcrf' style='flex:1'><option>loading...</option></select>"
-            "<button type='button' id='tcrib' class='button' style='width:auto;padding:0 10px;line-height:1.9rem;font-size:1rem'"
+            // Dieselben zwei Zahlen wie bei tclib -- siehe dort.
+            "<button type='button' id='tcrib' class='button'"
+            " style='width:auto;padding:0 10px;line-height:2rem;font-size:1rem'"
             " title='Info' onclick='tcrI()'>i</button>"
             "<select id='tcrs' style='width:auto'>"));
           for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
@@ -2163,15 +2170,22 @@ static void HandleTinyCPage(void) {
             "function tcrU(){var s=document.getElementById('tcrf');"
             "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
             "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
-            "function tcrS(){var b=document.getElementById('tcrib');if(!b)return;"
-            "b.disabled=!tcrU();b.style.opacity=b.disabled?'.35':'1';"
-            "b.title=b.disabled?'Kein Info-Link hinterlegt':'Info'}"
-            // Die <option> entstehen erst nach dem fetch, also laeuft Chromes
-            // eigene Formular-Wiederherstellung davor ins Leere: nach jedem
-            // Neuladen der Seite -- verworfener Hintergrund-Tab, Zurueck ohne
-            // bfcache -- stand die Liste wieder auf Eintrag 1, obwohl laengst
-            // etwas anderes gewaehlt war. sessionStorage haelt genau so lange
-            // wie der Tab und bleibt auf ihn beschraenkt.
+            // ⚠️ DIE AUSWAHL UEBERLEBT DAS NEULADEN SONST NICHT. Chromes eigene
+            // Formularwiederherstellung laeuft, BEVOR der fetch fertig ist --
+            // zu dem Zeitpunkt ist die Liste durch `s.innerHTML=''` leer, es
+            // gibt also kein <option>, auf das sie zuruecksetzen koennte, und
+            // die Liste steht danach auf Eintrag 1. Nachgemessen auf dem C3:
+            // Index 3 -> neu laden -> Index 0.
+            //
+            // Das sah wie ein Wackelkontakt aus, weil nichts neu aufgebaut
+            // wird, solange man auf der Seite bleibt. Es trifft genau den
+            // Ablauf, den der neue (i)-Knopf erzeugt: Programm waehlen, seine
+            // Seite lesen, zurueck -- Auswahl weg. (Hans, 2026-08-28.)
+            //
+            // sessionStorage ueberlebt das und gilt nur fuer diesen Tab.
+            // ⚠️ Die Load-Program-Liste braucht das NICHT: ihre <option> stehen
+            // im HTML, das der Server liefert, und werden nicht ersetzt --
+            // dort wirkt die Wiederherstellung des Browsers wie vorgesehen.
             "function tcrW(){try{sessionStorage.setItem('tcrf',"
             "document.getElementById('tcrf').value)}catch(e){}}"
             "function tcrL(){var s=document.getElementById('tcrf'),v='';"
@@ -2179,6 +2193,9 @@ static void HandleTinyCPage(void) {
             "if(v)for(var i=0;i<s.options.length;i++)"
             "if(s.options[i].value==v){s.selectedIndex=i;break}"
             "tcrS()}"
+            "function tcrS(){var b=document.getElementById('tcrib');if(!b)return;"
+            "b.disabled=!tcrU();b.style.opacity=b.disabled?'.35':'1';"
+            "b.title=b.disabled?'Kein Info-Link hinterlegt':'Info'}"
             "function tcTxt(s,f){return fetch(tcB()+'/index.txt',{cache:f?'reload':'default'})"
             ".then(function(r){if(!r.ok)throw r.status;return r.text()}).then(function(t){"
             "var ls=t.split(String.fromCharCode(10)).map(function(x){return x.trim()})"
@@ -2206,7 +2223,8 @@ static void HandleTinyCPage(void) {
             "m.textContent='Loaded '+f+' to slot '+sl+', reloading...';"
             "setTimeout(function(){location.reload()},900)}).catch(function(e){"
             "b.disabled=0;b.textContent='Download & Load';m.textContent='Failed: '+e})}"
-            "document.getElementById('tcrf').addEventListener('change',function(){tcrW();tcrS()});"
+            "document.getElementById('tcrf').addEventListener('change',"
+            "function(){tcrW();tcrS()});"
             "tcFill(0);</script>"), repo_url);
         }
       }
@@ -5484,6 +5502,24 @@ static void HandleTinyCUI(void) {
     "function siva(v,i,r){rfsh=1;la('&sv='+i+'_S_'+r+'_'+v);rfsh=0;}"
     "function sivat(v,i){rfsh=1;la('&sv='+i+'_t_'+v);rfsh=0;}"
     "function pr(f){if(f){lt=setTimeout(la,2000);rfsh=1;}else{clearTimeout(lt);rfsh=0;}}"
+    // ⚠️ EIN VERSTECKTER TAB FRAGT WEITER. `la()` bewaffnet den Zeitgeber
+    // bedingungslos neu; Chrome bremst ihn im Hintergrund nur, und der
+    // faellige Tick feuert in dem Augenblick, in dem der Tab wieder sichtbar
+    // wird -- was sich anfuehlt, als lade die Seite beim Umschalten neu.
+    //
+    // Teuer ist es, weil der Webserver IMMER NUR EINEN Client bedient (siehe
+    // TasmotaWebServer::handleClient): jeder offene Tab belegt diesen Platz
+    // alle zwei Sekunden, auch wenn ihn niemand ansieht. Anhalten statt
+    // bremsen -- und bei der Rueckkehr EINMAL sofort holen, damit die Anzeige
+    // nicht zwei Sekunden alt dasteht. (Hans, 2026-08-28.)
+    // ⚠️ Beim Zurueckkommen den VORHERIGEN Zustand wiederherstellen, nicht
+    // einschalten. Erste Fassung setzte `rfsh=1` -- eine Seite, auf der das
+    // Abfragen ueber pr(0) ausgeschaltet war, fing danach an zu fragen. Beim
+    // Nachmessen aufgefallen und nicht beim Lesen.
+    "var vsav=rfsh;"
+    "document.addEventListener('visibilitychange',function(){"
+      "if(document.hidden){vsav=rfsh;clearTimeout(lt);rfsh=0;}"
+      "else if(vsav){rfsh=1;la();}});"
     "window.onload=la;"
     "</script>"
   ), page);
@@ -7461,6 +7497,14 @@ bool Xdrv124(uint32_t function) {
               "function siva(v,i,r){la('&sv='+i+'_S_'+r+'_'+v);}"
               "function sivat(v,i){la('&sv='+i+'_t_'+v);}"
               "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"
+              // Dieselbe Sache wie auf /tc_ui -- siehe die Anmerkung dort.
+              // ⚠️ Hier gibt es kein `rfsh`; ob abgefragt wird, steckt allein
+              // darin, ob `lt` scharf ist. Deshalb ein eigener Merker, und
+              // fortgesetzt wird NUR, was wir selbst angehalten haben.
+              "var vsav=1;"
+              "document.addEventListener('visibilitychange',function(){"
+                "if(document.hidden){vsav=lt?1:0;pr(0);}"
+                "else if(vsav){la();pr(1);}});"
               "</script>"
             ), Settings->web_refresh);
             js_sent = true;
