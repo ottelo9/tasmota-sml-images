@@ -465,6 +465,25 @@ USE_WT32_ETH01
 **(6) Features und Treiber die ich deaktiviert habe:**
 Siehe `#undef FEATURE` in der Datei [user_config_override.h](user_config_override.h).
 
+## Safeboot aktualisieren (wird i.d.R. nicht benötigt)
+Safeboot ist die kleine Rettungs-Firmware, über die jedes OTA läuft. Sie muss praktisch nie erneuert werden — ein Grund wäre ein OTA, das mit `Upload Failed. Not enough space.` abbricht, obwohl genug Platz da ist oder wenn sie total veraltet ist.
+
+Die passende Datei liegt bereits in [`ota_firmware`](ota_firmware) neben den jeweiligem _tc Image.
+
+1. **Firmware Upgrade** öffnen und bei **Use web server** prüfen, ob die Url zu eurem Image passt. Für das Safeboot Update muss am Ende der URL _tc stehen und nicht _tas (ansonsten ändern). Nach erfolgreichem Update könnt ihr es wieder auf euer Image (_tc oder _tas) anpassen:
+   ```
+   .../ota_firmware/ESP32/tasmota32c3_ottelo_tc.bin
+   ```
+   ⚠️ Den Knopf darunter **nicht** drücken, der macht das normale Firmware-Update. Ein Speichern Button gibt es nicht, beim Verlassen wird automatisch gespeichert.
+2. In der **Console** folgendes eingeben (startet Safeboot Update):
+   ```
+   Upgrade 2
+   ```
+
+Das Gerät startet danach normal neu. Bricht der Download ab, passiert nichts Schlimmes — das Gerät bootet weiter wie bisher und `Upgrade 2` kann wiederholt werden.
+
+Sollte ein Gerät doch mal in Safeboot hängenbleiben (reduzierte Oberfläche, kein SML), holt es `http://<ip>/u4?u4=ota` zurück.
+
 ------------------
 Bedanken möchte ich mich besonders bei [gemu2015](https://github.com/gemu2015), der das Tasmota Scripting und SML entwickelt hat und mir immer sofort bei Problemen geholfen hat. 
 Und natürlich beim restlichen [Tasmota Entwickler-Team](https://tasmota.github.io/docs/About/), für das grandiose Tasmota :).
