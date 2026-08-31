@@ -350,7 +350,7 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
 // maintained; got stuck at "v1.3.20" through 5 releases until Andreas's
 // Claude flagged it during the v1.5.2 review.
-#define TC_RELEASE         "1.6.64"     // **TinyC 1.6.64: ELEVEN MORE SYSCALLS WROTE int32 SLOTS INTO A PACKED byte[]. Reported by Hans against webArg(): a `byte a[96]` taking the registration form came back as "o" -- first character right, next three bytes zero, string over -- and the write ran four times the array's length past its end, straight over the neighbouring heap. tc_ref_maxlen() has answered in BYTES for a packed byte[] since 1.6.57; the 1.6.58/1.6.61 rounds fixed the sprintf family, httpGet/httpPost/smlGetStr/tasmCmd and udp(1,buf), but a sweep for the same shape -- every site that resolves a ref and writes without tc_ref_is_bytes -- turned up eleven that were missed: webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr, sppScan. All go through tc_chr_put() now. ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded a single character; it goes through tc_ref_to_cstr() now, which knows both packings, and jsonStr had the same problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments -- an older device refuses the .tcb instead of corrupting its heap. Both directions measured on an ESP32-C3: an abi_rev-28 file on ABI-27 firmware is refused at load with the ABI message, and on ABI-28 firmware a byte[] and a char[] in one handler on one request now agree, UTF-8 included. A char[] argument is untouched and keeps its old abi_rev. Also in this release: a plain name and info link for the program pickers (`// @name:` / `// @info:` in the .tc, carried in the self-describing V6 header, so every device in the field still loads such a .tcb), and two bounds on a kept-alive HTTP connection -- one held socket used to take down the whole web server on port 80 until lwIP's two-hour TCP keepalive reaped it (ottelo9/tasmota-sml-images#52).** || PREVIOUS 1.6.63: webText() FINALLY WRITES BACK. Found while converting lcd_i2c.tc to byte[] -- the question was whether packing survives the web round trip, and the answer was that nothing survived it. A char[]/byte[] over HEAP_THRESHOLD (16 elements) is HEAP-allocated, but the ?sv= write-back stored the typed text one character per int32 GLOBAL slot at `gref & 0x0FFF` -- which for a heap array is the HANDLE, not an index. Handle 0 meant globals[0]. Every webText on a buffer larger than 16 threw the entry away and overwrote the first scalars of the running script instead: `char devname[32]` in webui_demo, webcall_demo and multipage_demo, both custom lines in lcd_i2c. Only matter_bridge_ui's ip_in[16], exactly on the threshold and therefore inline, ever worked. ⚠️ Invisible because ONLY the write-back was wrong -- rendering goes through tc_ref_to_cstr(), which resolves heap refs correctly, so the field always showed the right text and merely refused to keep a new one. ⭐ The fix hands the JavaScript the whole REF (siva(value,id,ref) -> sv=id_S_ref_text) and writes through tc_cstr_to_ref(), the VM's own writer, which knows heap from global AND knows the element packing -- so the byte[] question that started the search is answered on the way past. The ref arrives from a URL and is bounded like the index was: tag 2 (global) or tag 3 without the const-pool bit (heap), nothing else, then tc_ref_maxlen() caps the length. The old s_ form stays for a page still open in a browser. Also: a string LITERAL may now be passed to a byte[] PARAMETER (it was restricted to char[], which made the packing warning's own advice -- move the parameter too -- impossible to follow wherever literals were passed); examples/lcd_i2c.tc converted to byte[] as the proof, 1884 -> 984 B of RAM for 216 B more bytecode; and both syntax highlighters caught up with the language -- do/struct/enum/typedef/const/static/persist/watch/global were drawn as plain identifiers, and byte, int16, short, uint16 and ushort had no colour at all.**
+#define TC_RELEASE         "1.6.65"     // **TinyC 1.6.65: TWO SILENT FAILURES, BOTH REPORTED BY HANS, BOTH FIXED AS DIAGNOSTICS RATHER THAN AS BEHAVIOUR. (1) THE SPRINTF "%s" FAMILY CUTS AT 255 CHARACTERS AND SAID NOTHING. A Shelly emulator wrapped a ~310-character RPC body with sprintf(w, "{...result:%s}", body) and put 296 bytes of INVALID JSON on the wire -- 40 bytes of prefix, then exactly 256. The app dropped the device and never spoke to that port again, which reads like a discovery fault and not a formatting one; the two paths that DO work look identical from outside (UDP EM.GetStatus with an 80-byte body: fine; the same body over HTTP without the %s: fine). TWO buffers cut, and both log now: the SOURCE on its way into the 256-byte scratch -- new helper tc_ref_str_len() reads the true length WITHOUT copying, so an exactly-full buffer is not mistaken for a truncated one -- and the RESULT on its way out of snprintf, where the return value already says how much was needed. ⚠️ All FOUR opcodes are covered, not just the two in the report: SYS_SPRINTF_STR and _STR_CAT plus their _CONST twins, which have the same tmp buffer and the same silence. The cap itself STAYS -- the buffers are per-worker stack, and raising TC_SPRINTF_TMP_SIZE only moves the next quiet cut -- and the message names the way around it: "TCC: sprintf: %s cut at 255 of 310 chars -- use strcat() for long strings". strcat() copies through tc_chr_get/tc_chr_put element by element and is bounded only by the destination. (2) mdnsRegister() ONLY EVER ADDED SERVICES. A script that switches what it emulates (EcoTracker _everhome._tcp <-> Shelly _shelly._tcp) answered as BOTH at once under one hostname; measured with a PTR query after switching, both TXT sets live. Only a DEVICE restart cleared it -- a slot restart takes the same path, so this was never about the once-flag. It removes first now: ESP32 mdns_service_remove_all(), ESP8266 MDNS.end(), which is exactly what Tasmota's own StartMdns() does before begin(). ⚠️ A PLAIN remove-all would have taken TASMOTA's own _http._tcp advert with it, silently and for good: MdnsAddServiceHttp() latches (Mdns.begun 1 -> 2) and never runs again, so nothing would ever put it back. The http advert is therefore re-registered afterwards wherever this call does not supply one of its own -- the shelly branch does, the everhome and generic branches do not. ⚠️ NO ABI STEP: no new syscall, no new opcode, no changed signature; a .tcb built before and after this release is byte-identical, and both directions of the version check are unaffected.** || PREVIOUS 1.6.64: ELEVEN MORE SYSCALLS WROTE int32 SLOTS INTO A PACKED byte[]. Reported by Hans against webArg(): a `byte a[96]` taking the registration form came back as "o" -- first character right, next three bytes zero, string over -- and the write ran four times the array's length past its end, straight over the neighbouring heap. tc_ref_maxlen() has answered in BYTES for a packed byte[] since 1.6.57; the 1.6.58/1.6.61 rounds fixed the sprintf family, httpGet/httpPost/smlGetStr/tasmCmd and udp(1,buf), but a sweep for the same shape -- every site that resolves a ref and writes without tc_ref_is_bytes -- turned up eleven that were missed: webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr, sppScan. All go through tc_chr_put() now. ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded a single character; it goes through tc_ref_to_cstr() now, which knows both packings, and jsonStr had the same problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments -- an older device refuses the .tcb instead of corrupting its heap. Both directions measured on an ESP32-C3: an abi_rev-28 file on ABI-27 firmware is refused at load with the ABI message, and on ABI-28 firmware a byte[] and a char[] in one handler on one request now agree, UTF-8 included. A char[] argument is untouched and keeps its old abi_rev. Also in this release: a plain name and info link for the program pickers (`// @name:` / `// @info:` in the .tc, carried in the self-describing V6 header, so every device in the field still loads such a .tcb), and two bounds on a kept-alive HTTP connection -- one held socket used to take down the whole web server on port 80 until lwIP's two-hour TCP keepalive reaped it (ottelo9/tasmota-sml-images#52).** || PREVIOUS 1.6.63: webText() FINALLY WRITES BACK. Found while converting lcd_i2c.tc to byte[] -- the question was whether packing survives the web round trip, and the answer was that nothing survived it. A char[]/byte[] over HEAP_THRESHOLD (16 elements) is HEAP-allocated, but the ?sv= write-back stored the typed text one character per int32 GLOBAL slot at `gref & 0x0FFF` -- which for a heap array is the HANDLE, not an index. Handle 0 meant globals[0]. Every webText on a buffer larger than 16 threw the entry away and overwrote the first scalars of the running script instead: `char devname[32]` in webui_demo, webcall_demo and multipage_demo, both custom lines in lcd_i2c. Only matter_bridge_ui's ip_in[16], exactly on the threshold and therefore inline, ever worked. ⚠️ Invisible because ONLY the write-back was wrong -- rendering goes through tc_ref_to_cstr(), which resolves heap refs correctly, so the field always showed the right text and merely refused to keep a new one. ⭐ The fix hands the JavaScript the whole REF (siva(value,id,ref) -> sv=id_S_ref_text) and writes through tc_cstr_to_ref(), the VM's own writer, which knows heap from global AND knows the element packing -- so the byte[] question that started the search is answered on the way past. The ref arrives from a URL and is bounded like the index was: tag 2 (global) or tag 3 without the const-pool bit (heap), nothing else, then tc_ref_maxlen() caps the length. The old s_ form stays for a page still open in a browser. Also: a string LITERAL may now be passed to a byte[] PARAMETER (it was restricted to char[], which made the packing warning's own advice -- move the parameter too -- impossible to follow wherever literals were passed); examples/lcd_i2c.tc converted to byte[] as the proof, 1884 -> 984 B of RAM for 216 B more bytecode; and both syntax highlighters caught up with the language -- do/struct/enum/typedef/const/static/persist/watch/global were drawn as plain identifiers, and byte, int16, short, uint16 and ushort had no colour at all.**
 #define TC_FILE_NAME       "/autoexec.tcb"
 #ifdef ESP8266
 #define TC_MAX_PERSIST     64          // ESP8266: keep the table small (simple programs, tight RAM)
@@ -4830,6 +4830,40 @@ static inline int32_t tc_str_write_b(int32_t *base, bool ib, int32_t cap,
   return len;
 }
 
+// True length of the string behind a ref, WITHOUT copying it anywhere.
+// Only used to tell a full buffer apart from a truncated one below.
+static int tc_ref_str_len(TcVM *vm, int32_t ref) {
+  if (tc_is_const_ref(ref)) {
+    uint16_t idx = (uint16_t)(((uint32_t)ref) & 0x7FFF);
+    if (idx < vm->const_count && vm->constants[idx].type == 1 && vm->constants[idx].str.ptr) {
+      return (int)strlen(vm->constants[idx].str.ptr);
+    }
+    return 0;
+  }
+  int32_t *buf = tc_resolve_ref(vm, ref);
+  if (!buf) return 0;
+  return (int)tc_str_len_b(buf, tc_ref_is_bytes(ref), tc_ref_maxlen(vm, ref));
+}
+
+// ⚠️ THE SPRINTF "%s" CAP, AND WHY IT NEEDS A LOG LINE.
+// The sprintf-string family runs its source through a 256-byte scratch buffer
+// and its result through a second one. Both cut SILENTLY. Reported by Hans
+// 2026-08-30: a Shelly emulator wrapped a ~310-char RPC body with
+// sprintf(w, "{...\"result\":%s}", body) and put 296 bytes of INVALID JSON on
+// the wire -- 40 bytes of prefix, then exactly 256. The app dropped the device
+// and stopped talking to it, which reads like a discovery fault, not a
+// formatting one. Nothing pointed at the cap: no message, and the return value
+// counts what WAS written, which a caller has no reason to compare against.
+// The cap itself is defensible (the buffers are per-worker stack, and raising
+// them only moves the next silent cut); being silent is not.
+// The way around it in a script is strcat(), which copies element by element
+// through tc_chr_get/tc_chr_put and is bounded only by the destination.
+static void tc_sprintf_cap_warn(const char *op, int have, int cap) {
+  AddLog(LOG_LEVEL_INFO,
+         PSTR("TCC: %s: %%s cut at %d of %d chars -- use strcat() for long strings"),
+         op, cap - 1, have);
+}
+
 // Find null terminator in VM int32 array, returns offset (capped at maxSlots)
 static int32_t tc_strlen_ref(int32_t *p, int32_t maxSlots) {
   int32_t i = 0;
@@ -7409,8 +7443,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // tc_ref_to_cstr handles both transparently.
       TC_BUF(srcbuf, 256);
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
+      int _slen = tc_ref_str_len(vm, src_ref);
+      if (_slen >= (int)sizeof(srcbuf)) tc_sprintf_cap_warn("sprintf", _slen, sizeof(srcbuf));
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintf", _need, sizeof(tmp));
       TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
@@ -7461,8 +7498,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Const-ref-aware source extraction (same fix as SPRINTF_STR).
       TC_BUF(srcbuf, 256);
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
+      int _slen = tc_ref_str_len(vm, src_ref);
+      if (_slen >= (int)sizeof(srcbuf)) tc_sprintf_cap_warn("sprintfCat", _slen, sizeof(srcbuf));
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintfCat", _need, sizeof(tmp));
       int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
       TC_PUSH(vm, ofs + _w);
       break;
@@ -7479,7 +7519,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!dst || !fmt || !srcStr) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintf", _need, sizeof(tmp));
       TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
@@ -7495,7 +7536,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const bool _dib = tc_ref_is_bytes(dst_ref);
       int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintfCat", _need, sizeof(tmp));
       int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
       TC_PUSH(vm, ofs + _w);
       break;
@@ -12134,6 +12176,26 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         // Start mDNS responder
         const char *cMac = (const char*)mdns_mac;
         String ipStr = NetworkAddress().toString();
+        // ⚠️ EVERY REGISTRATION USED TO LEAVE THE PREVIOUS ONE STANDING.
+        // MDNS.begin() + addService() only ever ADD. A script that switches
+        // what it emulates (EcoTracker _everhome._tcp <-> Shelly _shelly._tcp)
+        // therefore answered as BOTH at once under one hostname, and only a
+        // DEVICE restart cleared it -- reported by Hans 2026-08-30 with a PTR
+        // query showing both records live. A slot restart took the same path
+        // and left the same leftover, so this was never about the once-flag.
+        //
+        // ⚠️ AND WHY NOT A PLAIN mdns_service_remove_all() AND DONE: Tasmota
+        // advertises its own _http._tcp from MdnsAddServiceHttp(), which
+        // latches (Mdns.begun 1 -> 2) and never runs again. Wiping every
+        // service would take that advert with it silently and for good. So it
+        // is put back below, wherever this call does not register an http
+        // service of its own.
+        bool eigenes_http = (0 == strcmp(xtype, "shelly"));
+#ifdef ESP32
+        mdns_service_remove_all();
+#else
+        MDNS.end();           // ESP8266: what StartMdns() itself does before begin()
+#endif
         if (MDNS.begin(mdns_name)) {
           if (!strcmp(xtype, "everhome")) {
             MDNS.addService("everhome", "tcp", 80);
@@ -12156,7 +12218,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             MDNS.addServiceTxt(xtype, "tcp", "ip", ipStr.c_str());
             MDNS.addServiceTxt(xtype, "tcp", "serial", cMac);
           }
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS started, service=%s hostname=%s"), xtype, mdns_name);
+#if defined(USE_DISCOVERY) && defined(WEBSERVER_ADVERTISE)
+          if (!eigenes_http) {
+            MDNS.addService("http", "tcp", WEB_PORT);
+            MDNS.addServiceTxt("http", "tcp", "devicetype", "tasmota");
+          }
+#else
+          (void)eigenes_http;
+#endif
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS (re)started, service=%s hostname=%s"), xtype, mdns_name);
           result = 0;
         } else {
           AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS failed to start"));
