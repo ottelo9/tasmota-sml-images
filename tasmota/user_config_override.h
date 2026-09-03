@@ -129,6 +129,7 @@
   #undef USE_DEEPSLEEP      // +1K https://tasmota.github.io/docs/DeepSleep/
 #else
   #define USE_BMP           // +4K BMP085 BMP180 BMP280 BME280 BME680 (standardmäßig nicht enthalten)!
+  #define DS18X20_MAX_SENSORS 10
 #endif
 
 #undef USE_PZEM004T

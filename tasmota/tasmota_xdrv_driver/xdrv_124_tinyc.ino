@@ -2317,14 +2317,15 @@ static void HandleTinyCPage(void) {
     "localStorage.setItem('tinyc_ide_url',this.value)};</script>"));
 #endif
 #ifdef USE_TINYC_REPO_IDE
-  // The other way round: no IDE on the device at all. /tcrepo is a ~4 KB page
-  // that pulls the compiler out of the repo into the browser and installs a
-  // repo example straight into a slot.
+  // The other way round: no IDE on the device at all. /tcrepo is a ~3 KB page
+  // that pulls the WHOLE IDE out of the repo into the browser and runs it in an
+  // iframe -- edit, compile, upload and run all happen there. Until 2026-09-03
+  // it only installed a repo example and threw the rest of the bundle away.
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
-    "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run example from repo</button>"
+    "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run IDE from repo</button>"
     "</p>"
-    "<p style='text-align:center;font-size:.85em;opacity:.6'>Nothing stored on the device: the browser fetches the compiler from the repo, compiles there and uploads the .tcb. Needs internet in the browser.</p>"));
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>The full IDE, fetched from the repo into the browser -- edit and run without any IDE on the device. It asks this device for its ABI and compiles to match. Needs internet in the browser; the on-device IDE works offline.</p>"));
 #endif
   WSContentSend_P(PSTR("</fieldset>"));
 

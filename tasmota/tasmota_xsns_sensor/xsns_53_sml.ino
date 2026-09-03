@@ -800,6 +800,11 @@ int8_t index;
 #define SML_OPTIONS_NO_WEB      4   // suppress the SML driver's own web (FUNC_WEB_SENSOR) rendering. A TinyC/Scripter program can
                                     // then read the descriptor and render the values inside its OWN card (one card, no duplicate).
                                     // Set from a script via `smlj |= 4` (Scripter) or `tasm_smlj = tasm_smlj | 4` (TinyC).
+#define SML_OPTIONS_MATH_NOWAIT 16  // compute `=m` lines as before: once per second, with whatever the variables happen to hold.
+                                    // Default (bit clear) is the freshness gate: a `=m` line waits until every operand it reads has
+                                    // been updated since that line last computed. That removes both the one-telegram lag and the
+                                    // mixed state where one operand is new and another still holds the previous burst's value.
+                                    // Set this bit only to restore the old timing (`smlj |= 16` / `tasm_smlj = tasm_smlj | 16`).
 #define SML_OPTIONS_JSON_ALL    8   // publish EVERY descriptor line on TelePeriod, including entries the meter has not sent yet.
                                     // Upstream PR #24587 made SML_Show skip values whose `dvalid` flag is still 0, so a meter that
                                     // reports a register only occasionally (or not at all, e.g. unused tariff registers) makes its
@@ -817,6 +822,12 @@ struct SML_GLOBS {
   uint8_t *meter_p;
   double *meter_vars;
   uint8_t *dvalid;
+  // Set whenever a variable receives a fresh value from the meter, cleared by a `=m` line that
+  // consumed it. Deliberately NOT a spare bit of dvalid: the `=d` path uses that byte as a counter
+  // (`+= 1`, valid from 2), and sml_getv() hands it to scripts unmasked -- a high bit would make the
+  // first delta publish early and change a documented script value. maxvars is a uint8_t, so this
+  // costs at most 255 bytes.
+  uint8_t *mfresh;
   double dvalues[MAX_DVARS];
   uint32_t dtimes[MAX_DVARS];
   char sml_start;
@@ -2675,14 +2686,31 @@ void SML_Decode(uint8_t index) {
         uint8_t opr;
         uint8_t mind;
         int32_t ind;
+        // FRESHNESS GATE (see SML_OPTIONS_MATH_NOWAIT). A `=m` line computes only once every
+        // operand it reads has been updated since this line last computed. Without it the result
+        // is at best one telegram old, and on meters whose exchange takes longer than the one-second
+        // math tick it can mix a NEW value with the PREVIOUS burst's -- which on a meter that reports
+        // import and export in separate registers is wrong by the whole export power.
+        // An operand the meter has never sent (dvalid still 0) is NOT required to be fresh, so a
+        // descriptor referencing an unused register keeps computing exactly as before.
+        uint8_t fresh_ok = 1;
+        uint8_t used[9];              // first operand + up to 8 more
+        uint8_t used_cnt = 0;
+        uint8_t gate = sml_globs.mfresh && !(sml_globs.sml_options & SML_OPTIONS_MATH_NOWAIT);
+        double result;
         mind = strtol((char*)mp, (char**)&mp, 10);
         if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
+        if (gate) {
+          used[used_cnt++] = mind - 1;
+          if (sml_globs.dvalid[mind - 1] && !sml_globs.mfresh[mind - 1]) fresh_ok = 0;
+        }
         dvar = sml_globs.meter_vars[mind - 1];
+        result = dvar;
         while (*mp==' ') mp++;
         for (uint8_t p = 0; p < 8; p++) {
           if (*mp == '@') {
-            // store result
-            sml_globs.meter_vars[vindex] = dvar;
+            // store result (committed after the loop, once the freshness gate has passed)
+            result = dvar;
             mp++;
             break;
           }
@@ -2696,6 +2724,10 @@ void SML_Decode(uint8_t index) {
           ind = strtol((char*)mp, (char**)&mp, 10);
           mind = ind;
           if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
+          if (gate && !iflg) {
+            if (used_cnt < sizeof(used)) used[used_cnt++] = mind - 1;
+            if (sml_globs.dvalid[mind - 1] && !sml_globs.mfresh[mind - 1]) fresh_ok = 0;
+          }
           switch (opr) {
               case '+':
                 if (iflg) dvar += ind;
@@ -2716,16 +2748,23 @@ void SML_Decode(uint8_t index) {
           }
           while (*mp==' ') mp++;
           if (*mp == '@') {
-            // store result
-            sml_globs.meter_vars[vindex] = dvar;
+            // store result (committed after the loop, once the freshness gate has passed)
+            result = dvar;
             mp++;
             break;
           }
         }
         double fac = CharToDouble((char*)mp);
-        sml_globs.meter_vars[vindex] /= fac;
-        SML_Immediate_MQTT((const char*)mp, vindex, mindex);
-        sml_globs.dvalid[vindex] = 1;
+        if (fresh_ok) {
+          sml_globs.meter_vars[vindex] = result / fac;
+          SML_Immediate_MQTT((const char*)mp, vindex, mindex);
+          sml_globs.dvalid[vindex] = 1;
+          if (gate) {
+            // consume the operands, and mark the result fresh so a chained `=m` reading it works
+            for (uint8_t u = 0; u < used_cnt; u++) sml_globs.mfresh[used[u]] = 0;
+            sml_globs.mfresh[vindex] = 1;
+          }
+        }
         // get sfac
       } else if (*mp == 'd') {
         // calc deltas d ind 10 (eg every 10 secs)
@@ -3235,6 +3274,7 @@ void SML_Decode(uint8_t index) {
       if (found) {
         // matches, get value
         sml_globs.dvalid[vindex] = 1;
+        if (sml_globs.mfresh) sml_globs.mfresh[vindex] = 1;
         mp++;
 #if defined(ED300L) || defined(AS2020) || defined(DTZ541) || defined(USE_SML_SPECOPT)
         sml_globs.g_mindex = mindex;
@@ -4287,6 +4327,10 @@ void SML_Init(void) {
       free(sml_globs.dvalid);
       sml_globs.dvalid = 0;
     }
+    if (sml_globs.mfresh) {
+      free(sml_globs.mfresh);
+      sml_globs.mfresh = 0;
+    }
 #ifdef USE_SML_MEDIAN_FILTER
     if (sml_globs.sml_mf) {
       free(sml_globs.sml_mf);
@@ -4959,6 +5003,7 @@ next_line:
 
   sml_globs.meter_vars = (double*)calloc(sml_globs.maxvars, sizeof(double));
   sml_globs.dvalid = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
+  sml_globs.mfresh = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
 
 #ifdef USE_SML_MEDIAN_FILTER
   sml_globs.sml_mf = (struct SML_MEDIAN_FILTER*)calloc(sml_globs.maxvars, sizeof(struct SML_MEDIAN_FILTER));
