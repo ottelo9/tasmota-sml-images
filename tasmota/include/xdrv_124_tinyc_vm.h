@@ -12201,12 +12201,43 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         // is put back below, wherever this call does not register an http
         // service of its own.
         bool eigenes_http = (0 == strcmp(xtype, "shelly"));
+        // ⚠️ THE REMOVE ONLY RUNS FROM THE SECOND CALL ON, and that is not a
+        // nicety -- it is a crash fix. On ESP32 mdns_service_remove_all()
+        // dereferences the IDF's _mdns_server, which is NULL until something
+        // has called mdns_init(). The only thing that does so here is
+        // MDNS.begin() itself, one line further down, so on the very first
+        // registration the load faulted at 0x38 and the device rebooted a
+        // few seconds after the script started.
+        //
+        // ⚠️ IT NEEDS SetOption55 OFF TO SHOW, WHICH IS THE DEFAULT: with
+        // Tasmota's own mDNS on, StartMdns() has already initialised the
+        // responder and the same code is harmless -- presumably the
+        // configuration 1.6.65 was written and tested on. Reported by Hans
+        // 2026-09-04 against the Shelly/EcoTracker emulator on an
+        // ESP32-C3, with both directions verified on the device
+        // (SetOption55 1 + restart made it run again).
+        //
+        // ⚠️ AND THE 1.6.65 COMMENT WAS WRONG ABOUT THE PRECEDENT: Tasmota's
+        // StartMdns() calls MDNS.end() on ESP8266 ONLY, with its own note
+        // that it "does not seem necessary for ESP32" and "will break Matter
+        // support". There is no ESP32 precedent for wiping every service --
+        // one more reason not to do it on the first call, when there is
+        // nothing of ours to clear anyway and Tasmota's or Matter's records
+        // are all that could be hit.
+        //
+        // The duplicate-service fix stays intact: switching
+        // _everhome._tcp <-> _shelly._tcp still removes the previous set,
+        // because by then this call HAS started the responder.
+        static bool tc_mdns_started = false;
+        if (tc_mdns_started) {
 #ifdef ESP32
-        mdns_service_remove_all();
+          mdns_service_remove_all();
 #else
-        MDNS.end();           // ESP8266: what StartMdns() itself does before begin()
+          MDNS.end();
 #endif
+        }
         if (MDNS.begin(mdns_name)) {
+          tc_mdns_started = true;
           if (!strcmp(xtype, "everhome")) {
             MDNS.addService("everhome", "tcp", 80);
             MDNS.addServiceTxt("everhome", "tcp", "ip", ipStr.c_str());

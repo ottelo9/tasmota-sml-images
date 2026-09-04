@@ -19,6 +19,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
 | tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
 | tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4 (solo1, s3 mit Ethernet Support) |
+| tasmota32x_ottelo-safeboot       |  |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! In den entsprechenden komprimiert Ordnern sind die Scripte ohne Kommentare, sie können 1:1 kopiert werden. |
@@ -35,36 +36,31 @@ Falls Tasmota bereits auf dem ESP ist, werden die Images einfach via OTA übertr
 Ist das nicht der Fall muss das (Factory ESP32) Image (.bin) geflasht werden z.B. mit [Tasmota Web Installer](https://tasmota.github.io/install/)   
 I.d.R. haben die ESP Boards eine USB-Buchse, die am PC einen COM-Port zur Verfügung stellen. Über diese wird das Image dann geflasht. Ist sowas nicht vorhanden braucht ihr einen USB-Seriell Adapter.  
 
-### Passende Tasmota SML / Shelly / EcoTracker Scripte
-Die findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
+### Passende Tasmota Scripte / TinyC Programme
+Die wählt ihr direkt auf eurem ESP in Tasmota aus: Tools > Edit Script oder Tools > TinyC Console > Repo  
+Den Sourcecode der Programme findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
-### Shelly Pro 3EM / EcoTracker Emulation für smarte Akkus (wie z.B. Marstek Venus C,E, Jupiter, Hoymiles, Growatt NOAH 2000)
+### Shelly / Marstek CT002 / EcoTracker Emulation für smarte Akkus (wie z.B. Marstek Venus C,E, Jupiter, Hoymiles, Growatt NOAH 2000)
 [Kompatible Akku Liste](https://github.com/ottelo9/tasmota-sml-script/blob/main/README.md#pvakku-powermeter-emulator-esp32)  
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas findet ihr im [ESP8266 Ordner](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266/pvakku-powermeter-emulator/komprimiert)). Die Scripte findet ihr direkt auf euren ESP in Tasmota (DropDown) oder [hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
-## TinyC - Alternative zum Scripting/Berry (ESP32 / ESP8266 4M+)
-**TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry. Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert und von dort auch ausgeführt. Es können sogar mehrere Programme parallel ausgeführt werden. Das Ganze läuft wesentlich schneller als Scripting und benötigt auch weniger Platz. Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.
+## TinyC - Alternative zum Scripting/Berry (nur ESP32)
+**TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry.  
 
 **Image-Variante wählen:**  
-Ab dieser Release gibt es pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig wird nicht mehr gebaut, weil das Flash unnötig aufbläht. ESP8266 (1M + 4M) gibt es nur als `_tas`.
+Es gibt pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig biete ich nicht an. ESP8266 gibt es nur als `_tas`.
 
-**SML in `_tc`-Builds aktivieren:**  
-Wenn ihr eins der [sml Beispielprogramme von gemus Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc/examples) verwendet (sml_..tc), dann müsst ihr einmal SML aktivieren via Checkbox (erreichbar via Button Einstellungen / Daten). Damit ihr die Beispielprogramme selbst kompilieren könnt müsst ihr vorher übrigens sml_chart_common.tc und sml_descriptor.tc via Manage File System hochladen!  
-Wenn ihr ein eigenes Programm schreiben wollt, dann muss in eurem Code einmalig `tasm_rule = 1;` gesetzt werden (in `main()` oder `BootInit()`). Der Treiber lädt dann den Meter-Descriptor aus `/sml_meter.def`. Boot-festes Pattern siehe [`marstek_emu.tc`](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/examples/marstek_emu.tc):
-```c
-int main() {
-tasm_rule = 1;
-    return 0;
-}
-```
+**Fertige TinyC Programme laden**  
+Unter Tools > TinyC Console > Repository findet ihr eine Liste mit meinen TinyC Programmen (wie Scripte). Einfach auswählen und "Download & Load" Slot 0 wählen. Ist bereits ein Programm im Slot 0, wird es entladen und das neue geladen. Wenn zuwenig RAM frei ist schlägt das fehl und man muss 1x neustarten und dann das Programm nochmal laden.  
 
-**=>** hier findet ihr eine [allgemeine Beschreibung](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal/tasmota/tinyc). Und hier die TinyC Referenz in [Englisch ](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference.md) und [Deutsch](https://github.com/gemu2015/Sonoff-Tasmota/blob/universal/tasmota/tinyc/TinyC_Reference_DE.md).
-**=>** Die IDE ist nicht vorinstalliert und muss 1x via Manage File System hochgeladen werden. Da die IDE immer weiter von gemu angepasst wird solltet ihr immer nur die IDE von meiner Repo verwenden, da diese für mein erzeugtes Images passt. Ansonsten gibt es ein Versions Hinweis in der IDE. Download der [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tinyc/tinyc_ide.html.gz) und dann via File Upload auf euren ESP laden (Tools > Manage File System). Dann könnt ihr die IDE starten (Tools > TinyC Console)  
-<img width="640" height="266" alt="image" src="https://github.com/user-attachments/assets/92bce2d3-cc8d-42eb-beb5-d7d98ee6ecea" />  
-<img width="300" height="366" alt="image" src="https://github.com/user-attachments/assets/b18e905c-58bb-4252-8580-d76ca0374169" />
+**Eigene Programme schreiben**  
+Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele (von gemu) im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert. Es können sogar mehrere Programme parallel ausgeführt werden (Slots). Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.  
 
-### Partitionslayout für TinyC-Images (4 MB ESP32)
-TinyC speichert IDE (~150 KB), Source (`.tc`), Bytecode (`.tcb`), persist-Daten (`.pvs`) und ggf. `/sml_meter.def` im Filesystem. Default-Layout (`app2880k_fs320k`) hat nur 320 KB FS — bei TinyC wird's schnell eng. Gleichzeitig ist die TinyC-Firmware ~120 KB schlanker als Scripter+Charts, der App-Bereich kann also kleiner sein.
+**=>** hier findet ihr die offizielle [TinyC Hilfeseite](https://gemu2015.github.io/Sonoff-Tasmota/).  
+**=>** Die neuste TinyC-IDE kann online gestartet werden via "Run IDE from repo" (aus gemus Repo) oder auf den ESP geladen werden via "Update IDE" (aus meiner Repo). Eine Kopie der TinyC-IDE, mit der ich meine Images gebaut habe, findet ihr sonst auch hier [tinyc_ide.html.gz](https://github.com/ottelo9/tasmota-sml-images/blob/main/tinyc/tinyc_ide.html.gz). Via File Upload auf euren ESP laden (Tools > Manage File System).  
+
+### Partitionslayout für TinyC-Images
+TinyC speichert Bytecode (`.tcb`), persist-Daten (`.pvs`) und `/sml_meter.def` im Filesystem. Default-Layout (`app2880k_fs320k`) hat nur 320 KB FS — bei TinyC wird's schnell eng. Gleichzeitig ist die TinyC-Firmware ~120 KB schlanker als Scripter+Charts, der App-Bereich kann also kleiner sein.
 
 Deswegen nutzen die `_tc`-Images auf 4 MB-Boards das Layout [`esp32_partition_app1856k_fs1344k.csv`](https://github.com/arendst/Tasmota/blob/development/partitions/esp32_partition_app1856k_fs1344k.csv): 1856 KB app0 + 1344 KB FS (statt 2880 KB / 320 KB). Siehe auch [Discussion #37](https://github.com/ottelo9/tasmota-sml-images/discussions/37) und [Tasmota Safeboot-Doku](https://tasmota.github.io/docs/Safeboot/).
 
@@ -73,10 +69,10 @@ Deswegen nutzen die `_tc`-Images auf 4 MB-Boards das Layout [`esp32_partition_ap
 | `tasmota32_ottelo_tc`, `tasmota32c3_ottelo_tc`, `tasmota32c6_ottelo_tc`, `tasmota32s2_ottelo_tc`, `tasmota32solo1_ottelo_tc` | `app1856k_fs1344k` (1024 KB mehr FS) |
 | `tasmota32s3_ottelo_tc` | Default (16 MB Flash: `app3904k_fs11584k`) |
 | `tasmota32p4_ottelo_tc` | Default (boardabhängig) |
-| alle `_tas` | Default belassen — Scripter+Charts+HA+InfluxDB+MQTT-TLS würde 1856 KB sprengen |
+| alle `_tas` | Default belassen |
 
 #### Partitionen ohne Factory-Flash umstellen — `chkpt`
-Der **gemu-Fork** (auf dem die ottelo-Images basieren) hat einen Laufzeit-Partition-Manager eingebaut — du brauchst kein USB-Kabel und keinen Factory-Flash, um das Layout zu ändern. Im TinyC-Build heißt der Befehl `TinyCChkpt`, in Builds ohne TinyC `chkpt`.
+In meinen Tasmota Images ist ein Partition-Manager eingebaut — du brauchst kein USB-Kabel und keinen Factory-Flash, um das Layout zu ändern. Im TinyC-Build heißt der Befehl `TinyCChkpt`, in Builds ohne TinyC `chkpt`.
 
 **Befehle:**
 | Befehl | Wirkung |
@@ -87,71 +83,56 @@ Der **gemu-Fork** (auf dem die ottelo-Images basieren) hat einen Laufzeit-Partit
 | `TinyCChkpt p 2880` | Zurück zum Default-Layout (wenn die laufende Firmware reinpasst) |
 
 **Praktischer Workflow** (Lesegerät im Einsatz, kein Aufschrauben):
-1. Files via WebUI → "Manage File System" sichern (Settings.json, Skripte, `/sml_meter.def`, `tinyc_ide.html.gz`).
-2. OTA-Upgrade auf das neue `_tc`-Image (`.bin.gz` über "Firmware Upgrade → Use file upload"). Das überschreibt nur app0, Partitionen bleiben unverändert.
+1. Files via WebUI → "Manage File System" sichern.
+2. OTA-Upgrade auf das neue `_tc`-Image (`.bin` über "Firmware Upgrade → Use file upload"). Das überschreibt nur app0, Partitionen bleiben unverändert.
 3. Nach dem Reboot in der Konsole: `TinyCChkpt p 1856` → packt um, formatiert FS, rebootet automatisch.
 4. Files wieder hochladen.
 
-**Voraussetzungen / Stolperfallen:**
-- **Safeboot-Partition muss existieren** (Recovery-Pfad). Ohne Safeboot lehnt `chkpt p` ab. Bei allen ottelo-ESP32-Builds ist Safeboot dabei.
+**Voraussetzungen / Probleme:**
+- **Safeboot darf nicht zu alt sein** Ohne passendes Safeboot lehnt `chkpt p` ab. Die Version des Safeboots erkennt ihr, wenn ich ein Update macht. Tasmota bootet dann in den Safeboot. Ab 15.x sollte `TinyCChkpt` funktionieren. Wie ihr das Safeboot Images aktualisiert findet ihr weiter unten.  
 - **Neue app0 ≥ laufende Firmware.** Sonst meldet der Befehl `requested size too small for current firmware!` und macht nichts.
-- **FS wird IMMER formatiert** bei `chkpt p`, auch wenn die Tabelle sich nicht ändert ("nothing to do" → trotzdem `LittleFS.format()`). Backup vorher ist Pflicht.
-- Nach `chkpt p` ist ein **Reboot** nötig, sonst zeigt die Info-Seite noch den alten FS-Wert (Tasmota cached `LittleFS.totalBytes()` beim Boot).
 
 **Factory-Flash** brauchst du nur noch, wenn:
 - Das Image zu groß für die aktuell konfigurierte app0 ist,
-- Kein Safeboot vorhanden ist,
+- Ein zu altes Safeboot-Image vorhanden ist < 15.x,
 - Du das Layout sauber neu aufsetzen willst (z.B. nach einem unsauberen `chkpt`-Abbruch).
 
 ## Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdofree.com zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
-Die Dateien in euer Tasmota Projektverzeichnis von Visual Studio Code oder Gitpod kopieren (ggf. überschreiben). Basis ist der offizielle [Tasmota Source](https://github.com/arendst/Tasmota) in der jeweiligen Release-Version. (Liste kann unvollständig sein)
+Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (z.B. Tasmota 15.5.0) von Visual Studio Code kopieren und überschreiben!! Basis ist der offizielle [Tasmota Source](https://github.com/arendst/Tasmota) in der jeweiligen Release-Version. (Liste kann unvollständig sein)
 
 **A) Meine Build-Konfiguration** (die braucht ihr immer)
 - TasmotaProjekt/`tasmota/user_config_override.h` — alle Features/Treiber (#define / #undef) + die `_tas`/`_tc`-Variantenlogik
 - TasmotaProjekt/`platformio_tasmota_cenv.ini` — meine Build-Umgebungen (envs) mit `lib_ignore`, Partitionen, `-D`-Flags
 - TasmotaProjekt/`platformio_tasmota32.ini` — **eigener Patch:** pinnt eine ältere ESP32-Platform-Version, siehe [Issue 52](https://github.com/ottelo9/tasmota-sml-images/issues/52) / [Issue 53](https://github.com/ottelo9/tasmota-sml-images/issues/53). Bei Problemen mit der neuesten Platform hier die Zeile `platform = ...` umschalten
 - TasmotaProjekt/`ccache_wrapper.py` — (optional) siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten
-- TasmotaProjekt/`boards/` — Board-Definitionen aus der gemu2015 Repo, die es im offiziellen Tasmota nicht gibt: `esp32c6cdc.json` (C6 mit USB-CDC), `esp32s2cdc.json` (S2 mit USB-CDC), `esp32p4_32m.json` (P4 mit 32M Flash). Nur nötig, wenn ihr das jeweilige Board in `platformio_tasmota_cenv.ini` verwendet.
+- TasmotaProjekt/`boards/` — neue Board-Definitionen
   Die ESP32-S3-Boards (`esp32s3-qio_qspi` usw.) liegen ebenfalls in gemus `boards/`-Ordner. Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
 
 **B) Sourcen aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal)** (Scripter / SML / TinyC — im offiziellen Tasmota nicht oder nur älter enthalten)
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_10_scripter.ino` — Scripter-Engine
-- TasmotaProjekt/tasmota/tasmota_xsns_sensor/`xsns_53_sml.ino` — SML/OBIS Smartmeter-Treiber
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_1_webserver_mail.ino` — Mail-Client (`USE_SENDMAIL`), vom Scripter genutzt
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_50_filesystem.ino` — Filesystem-Erweiterungen (u.a. für Scripter/TinyC-Dateizugriffe)
-- TasmotaProjekt/tasmota/include/`tasmota_configurations_ESP32.h` — ESP32-Feature-Matrix des Forks
-- TasmotaProjekt/tasmota/`lvgl_berry/tasmota_lv_conf.h`, tasmota_xdrv_driver/`xdrv_54_lvgl.ino`, `xdrv_54_lvgl_tinyc.inc` — LVGL-Anbindung inkl. TinyC-Glue (nur bei Display-Builds nötig)
-- TasmotaProjekt/lib/… — angepasste Bibliotheken des Forks: `lib/default/TasmotaSerial-3.7.0`, `lib/default/TasmotaWebServer`, `lib/lib_ssl/tls_mini`, `lib/lib_ssl/bearssl-esp8266`, `lib/lib_deprecated/Xlatb_RA8876-gemu-1.0`, `lib/libesp32_eink/epdiy`
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_84_esp32_hosted.ino` — **nur für ESP32-P4 nötig.** Ohne sie bricht der P4-Build ab: `error: 'esp_hosted_get_cp_info' was not declared in this scope`. Die Funktion gibt es erst ab esp_hosted 2.12.2, das Framework pinnt aber 2.11.7 — gemus Version kapselt den Aufruf in einen Versions-Guard
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/...
+- TasmotaProjekt/tasmota/tasmota_xsns_sensor/...
+- TasmotaProjekt/tasmota/include/...
+- TasmotaProjekt/tasmota/...
+- TasmotaProjekt/lib/...
 
-**C) TinyC** (nur für die `_tc`-Images — [Beschreibung](#tinyc---alternative-zum-scriptingberry-esp32--esp8266-4m))
-- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_vm.h` — **wichtig:** die TinyC-VM, ändert sich fast täglich
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_124_tinyc.ino` — TinyC-Treiber (XDRV_124) mit IDE-Endpoint, Konsolen-Befehlen und `TinyCChkpt`-Partitionsmanager
-- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_camera.h` — MIPI-CSI-Kamera für ESP32-P4 (nur bei Kamera-Nutzung)
-- TasmotaProjekt/tasmota/include/`xdrv_124_tinyc_spp.h` — Bluetooth-Classic (RFCOMM/SPP) als TinyC-Primitive
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_123_plugins.ino` — BinPlugin-Loader (`USE_BINPLUGINS`), lädt nachladbare Plugin-`.bin` zur Laufzeit
-- TasmotaProjekt/`tasmota/Plugins/modules_def.h` — Header, den der Plugin-Loader inkludiert (ohne ihn bricht der Build ab)
-- TasmotaProjekt/lib/libesp32_div/`matter_c/` — Matter-Bibliothek (`USE_MATTER_C`), komplett kopieren. Braucht zusätzlich `USE_DISCOVERY` (ist in meiner `user_config_override.h` schon gesetzt)
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_125_partedit.ino` — Partitions-Konverter (altes Dual-OTA → safeboot), gedacht für Safeboot-Images
-
-**D) Meine eigenen Patches am offiziellen Tasmota-Code** (optional, rein kosmetisch)
+**C) Meine eigenen Patches am offiziellen Tasmota-Code** (optional, rein kosmetisch)
 - TasmotaProjekt/tasmota/`tasmota.ino` — `image_name`-Buffer von 33 auf 64 Bytes erweitert, damit lange `CODE_IMAGE_STR` (z.B. `ESP32-C3 TC ottelo.jimdofree.com`) nicht abgeschnitten werden
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` — HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends`
 
-**E) Zum Flashen / Ausliefern**
+**D) Zum Flashen / Ausliefern**
 - `tinyc/tinyc_ide.html.gz` — die TinyC-IDE, kommt **nicht** ins Projektverzeichnis, sondern via File Upload auf den ESP (Tools > Manage File System)
 - `make_tasmota_zips_extended.sh` — packt nach dem Build die Release-ZIPs, siehe [unten](#release-zips-erstellen-mit-make_tasmota_zips_extendedsh)
 
 > **Hinweis:** Welche gemu2015-Commit-Version ich zuletzt übernommen habe, steht in [`gemu2015 Repo Update.txt`](gemu2015%20Repo%20Update.txt).
 
-Eine ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
+Eine weitere ausführliche Anleitung zum Einrichten von Tasmota und weitere Details findet ihr auf meinem Blog:
 [https://ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
 ### Kompilieren
-Zum Kompilieren unter Gitpod/VSC den passenden Befehl in die Console eingeben: 
+Zum Kompilieren unter VSC den passenden Befehl in die Console eingeben: 
 
 Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `pio run -e tasmota32-safeboot`.  
 

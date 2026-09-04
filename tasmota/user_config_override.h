@@ -293,15 +293,17 @@
   // Braucht zwingend USE_DISCOVERY (mDNS) für Service-Advertising, sonst
   // gibt's Linker-Error "undefined reference to StartMdns()" beim Matter-Init.
   // Tasmota's my_user_config.h hat USE_DISCOVERY per Default auskommentiert.
-  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) && !defined(TASMOTA4M_OTTELO) )
-    #define USE_MATTER_C
-    #define USE_DISCOVERY        //+8KB Flash, +0.3KB RAM — mDNS, von Matter benötigt
-    #define WEBSERVER_ADVERTISE  //<Hostname>.local/ — Standard zusammen mit mDNS
-    //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
-    //-- (Audio, Sensoren, …) zur Laufzeit in die custom-Partition — ohne die
-    //-- Firmware neu zu flashen. Nicht automatisch an (siehe Plugins/readme.md)
-    #define USE_BINPLUGINS
-  #endif
+  #define USE_MATTER_C
+  #define USE_DISCOVERY        //+8KB Flash, +0.3KB RAM — mDNS, von Matter benötigt
+  #define WEBSERVER_ADVERTISE  //<Hostname>.local/ — Standard zusammen mit mDNS
+  //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
+  //-- (Audio, Sensoren, …) zur Laufzeit in die custom-Partition — ohne die
+  //-- Firmware neu zu flashen. Nicht automatisch an (siehe Plugins/readme.md)
+  #define USE_BINPLUGINS
+  
+  // run the FULL IDE from the repo, WITHOUT the IDE living on the device. ~3 KB
+  // new https://github.com/gemu2015/Sonoff-Tasmota/commit/9dde7b0478e4034e309875d439e6e332b328d131
+  #define USE_TINYC_REPO_IDE
 
   //-- TinyC braucht USE_RULES nicht — der SML-Init-Gate (`Settings->rule_enabled`
   //-- Bit 0) wird vom TinyC-Programm direkt über die Built-in-Variable `tasm_rule`
