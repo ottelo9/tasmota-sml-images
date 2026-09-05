@@ -468,3 +468,10 @@ Sollte ein Gerät doch mal in Safeboot hängenbleiben (reduzierte Oberfläche, k
 ------------------
 Bedanken möchte ich mich besonders bei [gemu2015](https://github.com/gemu2015), der das Tasmota Scripting und SML entwickelt hat und mir immer sofort bei Problemen geholfen hat. 
 Und natürlich beim restlichen [Tasmota Entwickler-Team](https://tasmota.github.io/docs/About/), für das grandiose Tasmota :).
+
+------------------
+## Lizenz
+
+Die Images sind Builds von Tasmota und stehen damit unter der [GPL-3.0](LICENSE).
+
+Der zugehörige Quelltext ist der Zweig `universal` von [gemu2015/Sonoff-Tasmota](https://github.com/gemu2015/Sonoff-Tasmota); den genauen Commit, aus dem die hier abgelegten Images gebaut wurden, nennt `gemu2015 Repo Update.txt`. Die Overlay-Dateien dieser Repo liegen daneben.
