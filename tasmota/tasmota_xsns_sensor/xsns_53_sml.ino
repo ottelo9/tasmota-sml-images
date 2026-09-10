@@ -805,6 +805,9 @@ int8_t index;
                                     // been updated since that line last computed. That removes both the one-telegram lag and the
                                     // mixed state where one operand is new and another still holds the previous burst's value.
                                     // Set this bit only to restore the old timing (`smlj |= 16` / `tasm_smlj = tasm_smlj | 16`).
+                                    // NB "since THAT LINE last computed": the bookkeeping is per line. The first implementation
+                                    // cleared a shared per-variable flag instead -- see the `mseen` comment in SML_GLOBS.
+#define SML_MATH_OPERANDS 9         // first operand + up to 8 more, matching the `=m` parser below
 #define SML_OPTIONS_JSON_ALL    8   // publish EVERY descriptor line on TelePeriod, including entries the meter has not sent yet.
                                     // Upstream PR #24587 made SML_Show skip values whose `dvalid` flag is still 0, so a meter that
                                     // reports a register only occasionally (or not at all, e.g. unused tariff registers) makes its
@@ -822,12 +825,20 @@ struct SML_GLOBS {
   uint8_t *meter_p;
   double *meter_vars;
   uint8_t *dvalid;
-  // Set whenever a variable receives a fresh value from the meter, cleared by a `=m` line that
-  // consumed it. Deliberately NOT a spare bit of dvalid: the `=d` path uses that byte as a counter
-  // (`+= 1`, valid from 2), and sml_getv() hands it to scripts unmasked -- a high bit would make the
-  // first delta publish early and change a documented script value. maxvars is a uint8_t, so this
-  // costs at most 255 bytes.
-  uint8_t *mfresh;
+  // Per variable: a generation counter, bumped every time the variable receives a fresh value --
+  // from the meter, or as the result of a `=m` line. Deliberately NOT a spare bit of dvalid: the
+  // `=d` path uses that byte as a counter (`+= 1`, valid from 2), and sml_getv() hands it to scripts
+  // unmasked -- a high bit would make the first delta publish early and change a documented script
+  // value. maxvars is a uint8_t, so this costs at most 255 bytes. 0 means "never updated", so the
+  // counter skips 0 when it wraps.
+  uint8_t *mgen;
+  // Per `=m` line (indexed by that line's own vindex): the generation each of its operands had when
+  // this line last computed. THE POINT IS THAT IT IS PER LINE. The first version cleared a shared
+  // per-variable "is fresh" flag on the operands instead, so of two `=m` lines reading the same
+  // variable the first consumed it and the second was blocked -- on every telegram, for good. And it
+  // failed silently: a line that never computes never sets dvalid, so its value did not go stale, it
+  // vanished from the JSON altogether. Costs maxvars * SML_MATH_OPERANDS bytes.
+  uint8_t *mseen;
   double dvalues[MAX_DVARS];
   uint32_t dtimes[MAX_DVARS];
   char sml_start;
@@ -2694,15 +2705,19 @@ void SML_Decode(uint8_t index) {
         // An operand the meter has never sent (dvalid still 0) is NOT required to be fresh, so a
         // descriptor referencing an unused register keeps computing exactly as before.
         uint8_t fresh_ok = 1;
-        uint8_t used[9];              // first operand + up to 8 more
+        uint8_t used[SML_MATH_OPERANDS];   // first operand + up to 8 more
         uint8_t used_cnt = 0;
-        uint8_t gate = sml_globs.mfresh && !(sml_globs.sml_options & SML_OPTIONS_MATH_NOWAIT);
+        uint8_t gate = sml_globs.mgen && sml_globs.mseen && !(sml_globs.sml_options & SML_OPTIONS_MATH_NOWAIT);
+        // This line's own record of what it last consumed. The operands parse in a fixed order, so
+        // slot k always refers to the same variable and can be compared from pass to pass.
+        uint8_t *seen = gate ? &sml_globs.mseen[(uint32_t)vindex * SML_MATH_OPERANDS] : NULL;
         double result;
         mind = strtol((char*)mp, (char**)&mp, 10);
         if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
         if (gate) {
-          used[used_cnt++] = mind - 1;
-          if (sml_globs.dvalid[mind - 1] && !sml_globs.mfresh[mind - 1]) fresh_ok = 0;
+          used[used_cnt] = mind - 1;
+          if (sml_globs.dvalid[mind - 1] && sml_globs.mgen[mind - 1] == seen[used_cnt]) fresh_ok = 0;
+          used_cnt++;
         }
         dvar = sml_globs.meter_vars[mind - 1];
         result = dvar;
@@ -2724,9 +2739,10 @@ void SML_Decode(uint8_t index) {
           ind = strtol((char*)mp, (char**)&mp, 10);
           mind = ind;
           if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
-          if (gate && !iflg) {
-            if (used_cnt < sizeof(used)) used[used_cnt++] = mind - 1;
-            if (sml_globs.dvalid[mind - 1] && !sml_globs.mfresh[mind - 1]) fresh_ok = 0;
+          if (gate && !iflg && used_cnt < SML_MATH_OPERANDS) {
+            used[used_cnt] = mind - 1;
+            if (sml_globs.dvalid[mind - 1] && sml_globs.mgen[mind - 1] == seen[used_cnt]) fresh_ok = 0;
+            used_cnt++;
           }
           switch (opr) {
               case '+':
@@ -2760,9 +2776,12 @@ void SML_Decode(uint8_t index) {
           SML_Immediate_MQTT((const char*)mp, vindex, mindex);
           sml_globs.dvalid[vindex] = 1;
           if (gate) {
-            // consume the operands, and mark the result fresh so a chained `=m` reading it works
-            for (uint8_t u = 0; u < used_cnt; u++) sml_globs.mfresh[used[u]] = 0;
-            sml_globs.mfresh[vindex] = 1;
+            // Record what we consumed IN THIS LINE'S OWN SLOTS. Nothing global is cleared, so a
+            // second `=m` line may read the same operand. Bump the result's generation so a chained
+            // `=m` reading it still sees a change.
+            for (uint8_t u = 0; u < used_cnt; u++) seen[u] = sml_globs.mgen[used[u]];
+            uint8_t g = sml_globs.mgen[vindex] + 1;
+            sml_globs.mgen[vindex] = g ? g : 1;
           }
         }
         // get sfac
@@ -3274,7 +3293,10 @@ void SML_Decode(uint8_t index) {
       if (found) {
         // matches, get value
         sml_globs.dvalid[vindex] = 1;
-        if (sml_globs.mfresh) sml_globs.mfresh[vindex] = 1;
+        if (sml_globs.mgen) {
+          uint8_t g = sml_globs.mgen[vindex] + 1;
+          sml_globs.mgen[vindex] = g ? g : 1;   // 0 is reserved for "never updated"
+        }
         mp++;
 #if defined(ED300L) || defined(AS2020) || defined(DTZ541) || defined(USE_SML_SPECOPT)
         sml_globs.g_mindex = mindex;
@@ -4327,9 +4349,13 @@ void SML_Init(void) {
       free(sml_globs.dvalid);
       sml_globs.dvalid = 0;
     }
-    if (sml_globs.mfresh) {
-      free(sml_globs.mfresh);
-      sml_globs.mfresh = 0;
+    if (sml_globs.mgen) {
+      free(sml_globs.mgen);
+      sml_globs.mgen = 0;
+    }
+    if (sml_globs.mseen) {
+      free(sml_globs.mseen);
+      sml_globs.mseen = 0;
     }
 #ifdef USE_SML_MEDIAN_FILTER
     if (sml_globs.sml_mf) {
@@ -5003,7 +5029,8 @@ next_line:
 
   sml_globs.meter_vars = (double*)calloc(sml_globs.maxvars, sizeof(double));
   sml_globs.dvalid = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
-  sml_globs.mfresh = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
+  sml_globs.mgen = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
+  sml_globs.mseen = (uint8_t*)calloc((uint32_t)sml_globs.maxvars * SML_MATH_OPERANDS, sizeof(uint8_t));
 
 #ifdef USE_SML_MEDIAN_FILTER
   sml_globs.sml_mf = (struct SML_MEDIAN_FILTER*)calloc(sml_globs.maxvars, sizeof(struct SML_MEDIAN_FILTER));

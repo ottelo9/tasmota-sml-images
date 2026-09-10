@@ -350,6 +350,10 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
 // counter is gone before the crash, so it never accumulates across
 // reboots and Tasmota's no_autoexec never fires.
 #define TC_BOOT_MARKER "/tinyc.boot.lock"
+// Why autoexec is off. Written when a boot loop clears the flags, read on every later boot, and
+// removed as soon as autoexec is switched back on. Separate from TC_BOOT_MARKER, which is the
+// short-lived "a VM is starting right now" lock.
+#define TC_BOOTLOOP_FLAG "/tinyc.bootloop"
 #ifndef TC_BOOT_STABLE_S
 #define TC_BOOT_STABLE_S 30   // uptime at which boot is considered "succeeded"
 #endif
@@ -382,6 +386,16 @@ static void TinyCSaveSettings(void) {
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
   f.close();
+  // Autoexec on again anywhere? Then the boot-loop explanation has served its purpose. Note this
+  // runs on the load path too (stale entries), but there every autoexec is already 0 after a wipe.
+  bool any_autoexec = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec) { any_autoexec = true; break; }
+  }
+  if (any_autoexec && fs->exists(TC_BOOTLOOP_FLAG)) {
+    fs->remove(TC_BOOTLOOP_FLAG);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: autoexec re-enabled — boot-loop notice cleared"));
+  }
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Settings saved"));
 }
 
@@ -600,8 +614,31 @@ static void TinyCLoadSettings(void) {
         AddLog(LOG_LEVEL_ERROR,
                PSTR("TCC: Boot loop (count=%d) — %s rewritten with autoexec=0 for all slots"),
                RtcReboot.fast_reboot_count, TC_CFG_FILE);
+        // Leave a trace that outlives THIS boot. The line above is printed exactly once, on the
+        // boot that does the rewrite. Every later boot then shows the ordinary
+        // "Slot 0: /x.tcb (autoexec=0 prefix=)" and is indistinguishable from a slot the user
+        // switched off himself -- which took a `Status 12` dump to untangle in the field
+        // (Hans, report 05.09.2026).
+        File mf = fs->open(TC_BOOTLOOP_FLAG, "w");
+        if (mf) {
+          mf.printf("%d", RtcReboot.fast_reboot_count);
+          mf.close();
+        }
       }
     }
+  }
+
+  // Still off because of a boot loop? Then say so on every boot, not just on the one that did the
+  // clearing. Cleared by TinyCSaveSettings as soon as any slot has autoexec again.
+  if (fs->exists(TC_BOOTLOOP_FLAG)) {
+    File bf = fs->open(TC_BOOTLOOP_FLAG, "r");
+    String cnt = bf ? bf.readString() : String();
+    if (bf) bf.close();
+    cnt.trim();
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("TCC: autoexec is OFF for every slot because a boot loop was detected "
+                "(fast_reboot_count=%s) — not because it was switched off. Enable a slot to clear this."),
+           cnt.length() ? cnt.c_str() : "?");
   }
 
   File f = fs->open(TC_CFG_FILE, "r");
@@ -5206,6 +5243,44 @@ static void HandleTinyCWebOn7(void) { HandleTinyCWebOn(7); }
 
 // ---- Camera JPEG endpoint: /tc_cam?slot=N — serve PSRAM slot directly ----
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+// Einen Kamera-Slot als EIN JPEG ausliefern.
+//
+// ⚠️ ERST KOPIEREN, DANN SENDEN. Der Slot wird von der VM-Task fortlaufend
+// neu beschrieben; `writing` ist nur ein Merker fuer den Augenblick, keine
+// Sperre ueber die Dauer des Sendens. Wer direkt aus dem Slot sendet, liefert
+// ein halbes altes und ein halbes neues Bild -- in Safari sah man genau das:
+// „es wird manchmal nur halb gezeichnet" (gemu 04.09.2026). Der Streampfad
+// macht es seit jeher richtig und sagt es sogar im Kommentar
+// („Copy frame to send buffer first"); die beiden Einzelbild-Handler taten es
+// nicht.
+//
+// Nach dem Kopieren wird NOCHMAL geprueft: faengt der Schreiber waehrend des
+// memcpy an, ist die Kopie schon zerrissen. Dann lieber 503 und der Aufrufer
+// holt sich das naechste Bild -- ein Bild zu ueberspringen faellt bei 10 Bildern
+// je Sekunde niemandem auf, ein zerrissenes schon.
+static void TC_SendCamSlotAsJpeg(int idx) {
+  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
+    Webserver->send(503, "text/plain", "no image");
+    return;
+  }
+  uint32_t len = tc_cam_slot[idx].len;
+  uint8_t *kopie = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!kopie) { kopie = (uint8_t *)malloc(len); }
+  if (!kopie) {
+    Webserver->send(503, "text/plain", "no memory");
+    return;
+  }
+  memcpy(kopie, tc_cam_slot[idx].buf, len);
+  if (tc_cam_slot[idx].writing || tc_cam_slot[idx].len != len) {
+    free(kopie);
+    Webserver->send(503, "text/plain", "frame changed");
+    return;
+  }
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store"));
+  Webserver->send_P(200, "image/jpeg", (const char *)kopie, len);
+  free(kopie);
+}
+
 static void HandleTinyCCam(void) {
   int slot = 1;  // default slot 1
   if (Webserver->hasArg("slot")) {
@@ -5215,13 +5290,7 @@ static void HandleTinyCCam(void) {
     Webserver->send(400, "text/plain", "invalid slot");
     return;
   }
-  int idx = slot - 1;
-  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
-    Webserver->send(503, "text/plain", "no image");
-    return;
-  }
-  Webserver->sendHeader("Cache-Control", "no-cache, no-store");
-  Webserver->send_P(200, "image/jpeg", (const char*)tc_cam_slot[idx].buf, tc_cam_slot[idx].len);
+  TC_SendCamSlotAsJpeg(slot - 1);
 }
 
 // ---- MJPEG streaming server on port 81 ----
@@ -5231,6 +5300,32 @@ static void TC_CamStreamHandler(void) {
   tc_cam_stream.client = tc_cam_stream.server->client();
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client connected"));
 }
+
+// GET /tc_cam.jpg — EIN Bild, dann Schluss.
+//
+// ⚠️ WOZU, wo es doch einen Stream gibt: Safari zeigte meistens kein Bild
+// (gemu 04.09.2026), Chrome immer. Zwei Gründe, und beide treffen nur Safari:
+//
+//   * `multipart/x-mixed-replace` in einem `<img>` ist in Safari seit Jahren
+//     unzuverlässig. `webcam.tc` trägt für dasselbe Symptom längst eine
+//     Umgehung mit genau diesem Kommentar -- nur zeichnet beim TinyC-Treiber
+//     das Bild hier in C++, und hier fehlte sie.
+//   * Der Streamserver auf Port 81 hält GENAU EINEN Client
+//     (`tc_cam_stream.client = server->client()`), und alle drei URIs
+//     (/stream, /cam.mjpeg, /cam.jpg) landen im selben Multipart-Handler --
+//     ein Einzelbild gab es dort gar nicht. Safari öffnet Verbindungen gern
+//     spekulativ doppelt; die zweite verdrängt die erste, und das `<img>` auf
+//     dem Schirm hängt an der verworfenen. Das erklärt das „meistens".
+//
+// Deshalb liegt dieser Handler am HAUPTserver (Port 80): der verträgt mehrere
+// Verbindungen, und die Seite kommt von dort -- gleiche Herkunft, keine
+// Sonderfälle.
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+static void HandleTinyCCamJpg(void) {
+  if (!HttpCheckPriviledgedAccess()) { return; }
+  TC_SendCamSlotAsJpeg(0);
+}
+#endif
 
 static void TC_CamStreamRoot(void) {
   tc_cam_stream.server->sendHeader("Location", "/cam.mjpeg");
@@ -7453,12 +7548,23 @@ bool Xdrv124(uint32_t function) {
       if ((tc_cam_stream.server || tc_cam_stream.pending) && tc_cam_slot[0].len > 0) {
         // Use onload script to set src AFTER page is fully rendered
         // This prevents the stream request from blocking page load
+        // ⚠️ SAFARI BEKOMMT EINZELBILDER, alle anderen den Multipart-Strom.
+        // Warum, steht bei HandleTinyCCamJpg(). Die Bilder werden VERKETTET
+        // geholt -- das nächste erst, wenn das vorige da ist -- statt mit
+        // einem festen setInterval: bei einer langsamen Verbindung stapeln
+        // sich sonst die Anfragen, und der ESP beantwortet sie alle.
         WSContentSend_P(PSTR("<p></p><center>"
-          "<img id='tccam' onerror='setTimeout(()=>{this.src=\"http://%_I:%d/stream\";},2000)' "
-          "alt='TinyC Camera' style='width:99%%;'>"
+          "<img id='tccam' alt='TinyC Camera' style='width:99%%;'>"
           "</center><p></p>"
-          "<script>window.addEventListener('load',()=>{document.getElementById('tccam').src="
-          "'http://%_I:%d/stream';});</script>"),
+          "<script>window.addEventListener('load',function(){"
+          "var c=document.getElementById('tccam');"
+          "if(/^((?!chrome|android).)*safari/i.test(navigator.userAgent)){"
+          "var n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
+          "c.onload=function(){setTimeout(n,80);};"
+          "c.onerror=function(){setTimeout(n,1000);};n();"
+          "}else{"
+          "c.onerror=function(){setTimeout(function(){c.src='http://%_I:%d/stream';},2000);};"
+          "c.src='http://%_I:%d/stream';}});</script>"),
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
       }
@@ -7547,6 +7653,9 @@ bool Xdrv124(uint32_t function) {
       break;
     case FUNC_WEB_ADD_HANDLER:
       WebServer_on(PSTR("/tc"), HandleTinyCPage);
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      WebServer_on(PSTR("/tc_cam.jpg"), HandleTinyCCamJpg);
+#endif
 #ifdef USE_TINYC_REPO_IDE
       WebServer_on(PSTR("/tcrepo"), HandleTinyCRepoIde);
 #endif
