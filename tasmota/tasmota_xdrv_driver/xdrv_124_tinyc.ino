@@ -49,6 +49,43 @@
 #define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/tinyc_ide.html.gz"
 #endif
 
+// Selectable repositories for the drop-down on the TinyC page.
+//
+// ONE BASE URL PER ENTRY. Everything a repository serves hangs below the same
+// base and is derived from it:
+//
+//     <base>/bytecode           .tcb + index.json   (program list)
+//     <base>/examples           .tc                 (IDE example browser)
+//     <base>/tinyc_ide.html.gz  IDE self-update
+//     <base>                    the /tcrepo page
+//
+// That is deliberate, not a shortcut. Switching a repository switches ALL of
+// it at once, so nobody can end up running one fork's examples against
+// another fork's bytecode. Mixed states are structurally impossible instead of
+// merely unlikely (Hans/gemu, 2026-09-14).
+//
+// ⚠️ THE FIRMWARE ON THE DEVICE DOES NOT FOLLOW THE SWITCH. A .tcb built for a
+// different opcode set does not crash -- it computes the wrong thing. The
+// version marker that guards this belongs in the repository's index.json.
+//
+// Format: one entry per line, "Display name|base URL". The list is compiled in
+// so a freshly flashed image already has it; if /tinyc_repos.cfg exists on the
+// filesystem it REPLACES this list (Hans, 2026-09-14: having to upload a file
+// after flashing defeats the purpose).
+#ifndef TINYC_REPO_LIST
+#define TINYC_REPO_LIST "TinyC (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc"
+#endif
+
+// Cap for the list, whether compiled in or read from the file. Four entries of
+// name + GitHub raw URL fit comfortably; a longer list is truncated rather than
+// overflowing, and the page still works with what fits.
+#ifndef TINYC_REPO_LIST_SIZE
+#define TINYC_REPO_LIST_SIZE 512
+#endif
+#ifndef TINYC_REPO_MAX
+#define TINYC_REPO_MAX 8
+#endif
+
 // Global pause flag — set by filesystem upload handler (xdrv_50) to pause VM during uploads
 bool tc_global_pause = false;
 
@@ -113,6 +150,17 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 #include "include/xdrv_124_tinyc_camera.h"
 
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
+#ifdef USE_TINYC_ESPDL
+// ⚠️ The VM header is included HERE, while the detector class below is
+// defined much further down — so the camControl dispatch inside it cannot see
+// that class. These two plain functions are the seam.
+//   tc_dl_person_run(score_thr_x100) takes the current camera frame and
+//   returns the number of persons found, -1 on error.
+//   tc_dl_person_get(sel) reads the result: 0=count 1=best score x100
+//   2..5=box x,y,w,h  6=net ms  7=jpeg ms
+int32_t tc_dl_person_run(int32_t schwelle_x100);
+int32_t tc_dl_person_get(int32_t sel);
+#endif
 #include "include/xdrv_124_tinyc_vm.h"
 #include "include/xdrv_124_tinyc_repoide.h"   // /tcrepo page (USE_TINYC_REPO_IDE)
 
@@ -1021,6 +1069,10 @@ void CmndCheckPartition(void);
 void CmndTinyCIde(void);
 #ifdef ESP32
 void CmndTinyCStack(void);
+#ifdef USE_TINYC_ESPDL
+void CmndTinyCDl(void);
+void CmndTinyCDlCam(void);
+#endif
 void CmndTinyCHttpRx(void);
 #endif
 void CmndTinyCUnload(void);
@@ -1042,6 +1094,9 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
   "|MtrCrypto"
 #endif
 #endif
+#ifdef USE_TINYC_ESPDL
+  "|Dl|DlCam"
+#endif
   ;
 
 void (* const TinyCCommand[])(void) PROGMEM = {
@@ -1055,6 +1110,9 @@ void (* const TinyCCommand[])(void) PROGMEM = {
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
   , &CmndMatterCryptoTest
 #endif
+#endif
+#ifdef USE_TINYC_ESPDL
+  , &CmndTinyCDl, &CmndTinyCDlCam
 #endif
 };
 
@@ -1185,6 +1243,358 @@ void CmndMatterCryptoTest(void) {
 }
 #endif // TINYC_MTRC_CRYPTO_SELFTEST (Fork-B crypto-seam scaffold — off by default)
 #endif // USE_MATTER_C
+
+// --- TinyCDl: run an ESP-DL model straight off the filesystem -------------
+#ifdef USE_TINYC_ESPDL
+#include "dl_model_base.hpp"
+#include "dl_detect_base.hpp"
+#include "dl_detect_pico_postprocessor.hpp"
+#include "dl_image_preprocessor.hpp"
+
+// ── Personenerkenner ───────────────────────────────────────────────────────
+// Rebuilt from models/pedestrian_detect/pedestrian_detect.cpp, but WITHOUT its
+// Kconfig scaffolding: the original wrapper hangs off CONFIG_* symbols and a
+// model-packing step at build time. We load the very same .espdl from a file;
+// the three lines below it are identical (minimize + preprocessing + the Pico
+// postprocessor with the same strides).
+namespace {
+class TcPersonen : public dl::detect::DetectImpl {
+ public:
+  TcPersonen(const char *pfad, float score_thr, float nms_thr) {
+    m_model = new dl::Model(pfad, fbs::MODEL_LOCATION_IN_SDCARD);
+    if (m_model->get_fbs_model()) {
+      m_model->minimize();
+      m_image_preprocessor = new dl::image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1});
+      m_postprocessor = new dl::detect::PicoPostprocessor(
+          m_model, m_image_preprocessor, score_thr, nms_thr, 10,
+          {{8, 8, 4, 4}, {16, 16, 8, 8}, {32, 32, 16, 16}});
+    }
+  }
+  bool geladen(void) { return m_model && m_model->get_fbs_model() && m_postprocessor; }
+};
+}  // namespace
+
+// Stays loaded: 1.1 s off the SD card is not affordable per frame.
+static TcPersonen *tc_dl_personen = nullptr;
+
+// Result of the last run — the command and the syscall share this one.
+static struct {
+  int32_t n;
+  int32_t best;            // bester Score x100
+  int32_t x, y, w, h;      // Kasten des besten Treffers
+  uint32_t ms_netz, ms_jpeg, ms_laden;
+} tc_dl_erg = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+#ifndef TC_DL_PERSON_MODEL
+#define TC_DL_PERSON_MODEL "/sd/ped.espdl"
+#endif
+
+// TinyCDl <path.espdl> [max_internal_bytes]
+//
+// ⚠️ THE MODEL IS A FILE, NOT PART OF THE FIRMWARE.
+// `fbs::MODEL_LOCATION_IN_SDCARD` is a misleading name: the loader simply does
+// fopen()/fread() on the path (esp-dl/fbs_loader/src/fbs_loader.cpp), so ANY
+// path on Tasmota's LittleFS works. That is the whole point of doing it this
+// way — the models stay out of the firmware image, an OTA stays small, and a
+// model is replaced with a file upload instead of a reflash. The price is
+// PSRAM: the entire file is read into it and stays there while the model
+// lives. On a board with 2 MB PSRAM this would be the wrong trade.
+//
+// Why each reported number is here:
+//   Test          the .espdl carries its own test input AND the expected
+//                 output, so correctness is provable with no camera and not a
+//                 single picture — this is what makes the measurement honest.
+//   Plan          from the library's own get_memory_info(), split the way the
+//                 memory manager really allocated: psram / internal / flash.
+//   Actual        heap deltas measured here, because Plan covers the tensors
+//                 and not everything the load costs.
+//   LoadMs/RunMs  measured here: Espressif's published latency does not say
+//                 which memory layout it was taken with, and that is exactly
+//                 the open question.
+void CmndTinyCDl(void) {
+  if (!XdrvMailbox.data_len) {
+    ResponseCmndChar_P(PSTR("usage: TinyCDl <path.espdl> [max_internal_bytes]"));
+    return;
+  }
+  char *cp = XdrvMailbox.data;
+  while (*cp == ' ') { cp++; }
+  int max_internal = 0;
+  char *sp = strchr(cp, ' ');
+  if (sp) { *sp = '\0'; max_internal = strtol(sp + 1, nullptr, 10); }
+  if (!*cp) { ResponseCmndChar_P(PSTR("no path")); return; }
+
+  // ⚠️ ESP-DL reports its own failures through ESP_LOGE, which on this board
+  // goes to the USB-CDC console and is invisible over HTTP — "load failed"
+  // alone says nothing. So check the two things that actually go wrong here
+  // first: can the C library open this path at all (Tasmota mounts LittleFS
+  // with an EMPTY base path, so the VFS name is the plain Tasmota name), and
+  // does the file start with a magic the loader knows.
+  char magie[5] = {0};
+  long groesse = -1;
+  FILE *f = fopen(cp, "rb");
+  if (f) {
+    if (fread(magie, 1, 4, f) != 4) { magie[0] = '\0'; }
+    fseek(f, 0, SEEK_END);
+    groesse = ftell(f);
+    fclose(f);
+  } else {
+    // ⚠️ WHY THIS MUCH DETAIL FOR A FAILED fopen:
+    // ESP-DL opens the model with plain fopen(), while Tasmota reaches its
+    // filesystem through the Arduino FS object (ffsp). Both are supposed to
+    // end up in the same LittleFS — it is mounted with an EMPTY base path, so
+    // it is the VFS fallback and a bare "/name" should reach it. If the two
+    // disagree, that is the whole bug, and errno says which way.
+    int fehler = errno;
+    bool arduino_kennt = (ffsp && ffsp->exists(cp));
+    size_t arduino_groesse = 0;
+    if (arduino_kennt) {
+      File pruefdatei = ffsp->open(cp, "r");
+      if (pruefdatei) { arduino_groesse = pruefdatei.size(); pruefdatei.close(); }
+    }
+    Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Error\":\"fopen failed\","
+                    "\"Errno\":%d,\"ErrText\":\"%s\","
+                    "\"ArduinoSees\":%d,\"ArduinoBytes\":%u}}"),
+               cp, fehler, strerror(fehler),
+               arduino_kennt ? 1 : 0, (uint32_t)arduino_groesse);
+    return;
+  }
+
+  // ⚠️ THE max_internal_size KNOB HAS A HARD CLIFF, AND IT IS NOT A SOFT ONE.
+  // Measured on the DFR1154 on 16.09.2026 with pedestrian_detect: 0 and 64 kB
+  // are fine (195 ms / 152 ms), 128 kB REBOOTS THE DEVICE — the boot banner
+  // says LoadProhibited, EXCVADDR 00000000, i.e. esp-dl does not check the
+  // allocation it just failed to get and dereferences null. So the limit is
+  // clamped here; a number typed on the console must not cost a reboot.
+  // ⚠️⚠️ THE ARENA-IN-INTERNAL-RAM KNOB IS NOT SAFE ON THIS BOARD, AT ANY SIZE.
+  // Measured on the DFR1154 on 16.09.2026 with pedestrian_detect, camera
+  // running: 0 gives a steady 195 ms. 64 kB gave 152 ms — TWICE — and then
+  // rebooted the device on the very next identical call, and again after that.
+  // 128 kB and half the free heap (~90 kB) reboot it every time. The boot
+  // banner always says LoadProhibited with EXCVADDR 00000000: esp-dl does not
+  // check the allocation it failed to get and dereferences null. So the
+  // failure depends on how the internal heap happens to be fragmented at that
+  // instant — it is NOT a threshold we can compute, and a 22 % gain is not
+  // worth an unpredictable reboot on a camera that is meant to be watching.
+  // The knob is therefore clamped to 0 until esp-dl checks its own mallocs.
+  // Raise TC_DL_MAX_INTERNAL only for deliberate experiments on a spare board.
+  #define TC_DL_MAX_INTERNAL 0
+  uint32_t in_frei = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  int      in_deckel = TC_DL_MAX_INTERNAL;
+  int      gewuenscht = max_internal;
+  if (max_internal > in_deckel) { max_internal = in_deckel; }
+
+  uint32_t ps_vorher = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t in_vorher = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+  uint32_t t0 = millis();
+  dl::Model *model = new dl::Model(cp, fbs::MODEL_LOCATION_IN_SDCARD, max_internal);
+  uint32_t ms_laden = millis() - t0;
+
+  // ⚠️ On a bad path load() fails, the constructor SKIPS build() and
+  // m_fbs_model stays null — test()/run() would then dereference it and take
+  // the device down. get_fbs_model() is the only way to see that from here,
+  // so a typo must not cost a reboot.
+  if (!model->get_fbs_model()) {
+    delete model;
+    Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Error\":\"load failed\","
+                    "\"Magic\":\"%s\",\"Bytes\":%ld}}"), cp, magie, groesse);
+    return;
+  }
+
+  uint32_t ps_nach_laden = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t in_nach_laden = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+  esp_err_t pruef = model->test();
+
+  // ⚠️ RUN REGARDLESS OF WHAT test() SAID.
+  // test() only works when the model was exported with export_test_values —
+  // the tutorial model has them, the model-zoo ones do not. Gating the timing
+  // on test() therefore reported RunMs 0 for exactly the models we care about.
+  // Without test vectors the input tensor holds whatever is in the arena: the
+  // result is numerically meaningless, but the same multiplications happen, so
+  // the LATENCY is valid. Three runs, because the first one warms the caches.
+  t0 = millis();
+  model->run();
+  uint32_t ms_erst = millis() - t0;
+  t0 = millis();
+  model->run();
+  model->run();
+  model->run();
+  uint32_t ms_lauf = (millis() - t0) / 3;
+
+  size_t ps = 0, in = 0, fl = 0;
+  for (auto &e : model->get_memory_info()) {
+    ps += e.second.psram;
+    in += e.second.internal;
+    fl += e.second.flash;
+  }
+
+  Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Magic\":\"%s\",\"Bytes\":%ld,\"Test\":\"%s\","
+                  "\"LoadMs\":%u,\"RunFirstMs\":%u,\"RunMs\":%u,"
+                  "\"MaxInternal\":%d,\"MaxInternalAsked\":%d,\"InternalFree\":%u,"
+                  "\"Plan\":{\"PSRAM\":%u,\"Internal\":%u,\"Flash\":%u},"
+                  "\"Used\":{\"PSRAM\":%d,\"Internal\":%d}}}"),
+             cp, magie, groesse, (ESP_OK == pruef) ? "OK" : "FAIL",
+             ms_laden, ms_erst, ms_lauf, max_internal, gewuenscht, in_frei,
+             (uint32_t)ps, (uint32_t)in, (uint32_t)fl,
+             (int32_t)(ps_vorher - ps_nach_laden), (int32_t)(in_vorher - in_nach_laden));
+  delete model;
+}
+
+// ── Person detection on the current camera frame ──────────────────────────
+// One place, two callers: the console command TinyCDlCam and the syscall
+// camControl(21,…) that a script uses. The result lands in tc_dl_erg.
+//
+// ⚠️ The JPEG is decoded by jpg2rgb565() from esp32-camera, not by ESP-DL's
+// own path: dl_image_jpeg.cpp needs the esp_new_jpeg component, while
+// jpg2rgb565 is already in this firmware — and it is the only one of the two
+// that can decode SCALED DOWN.
+//
+// Scale 1/2: 640x480 becomes 320x240, still larger than the model's 224x224
+// input, so nothing is lost — but it is a quarter of the pixels and RGB565
+// instead of RGB888. Measured 252 ms instead of 305 ms.
+// Going smaller buys little (1/4: 225 ms) and 1/8 would be too coarse at
+// 80x60: the Huffman pass scales with the COMPRESSED data and cannot be
+// skipped, only the IDCT and the output do.
+static int tc_dl_skala = 2;   // 0 = voll ueber fmt2rgb888, sonst 2/4/8
+static int tc_dl_bo = 0;      // RGB565: 0 = little endian, 1 = big endian
+
+int32_t tc_dl_person_run(int32_t schwelle_x100) {
+  float schwelle = (schwelle_x100 > 0 && schwelle_x100 < 100)
+                       ? (float)schwelle_x100 / 100.0f
+                       : 0.7f;
+  tc_dl_erg.n = 0;
+  tc_dl_erg.best = 0;
+  tc_dl_erg.ms_laden = 0;
+
+  if (!tc_dl_personen) {
+    uint32_t t = millis();
+    tc_dl_personen = new TcPersonen(TC_DL_PERSON_MODEL, schwelle, 0.5f);
+    tc_dl_erg.ms_laden = millis() - t;
+    if (!tc_dl_personen->geladen()) {
+      delete tc_dl_personen;
+      tc_dl_personen = nullptr;
+      return -1;
+    }
+  } else {
+    tc_dl_personen->set_score_thr(schwelle);
+  }
+
+  // ⚠️ THE JPEG MUST BE COPIED OUT FIRST.
+  // Decoding takes ~250 ms and the camera keeps rewriting that same slot in
+  // the meantime. Decoding straight out of the slot worked on the first call
+  // and failed on every one after it with "jpeg decode failed". So copy, then
+  // check AFTERWARDS whether it was written during the copy — the same
+  // pattern as TC_SendCamSlotAsJpeg.
+  uint32_t breite = 0, hoehe = 0, len = 0;
+  uint8_t *jpg = nullptr;
+  for (int versuch = 0; versuch < 5 && !jpg; versuch++) {
+    if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 || tc_cam_slot[0].writing ||
+        tc_cam_slot[0].width == 0) { delay(30); continue; }
+    len = tc_cam_slot[0].len;
+    breite = tc_cam_slot[0].width;
+    hoehe = tc_cam_slot[0].height;
+    uint8_t *k = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!k) { return -2; }
+    memcpy(k, tc_cam_slot[0].buf, len);
+    if (tc_cam_slot[0].writing || tc_cam_slot[0].len != len) { free(k); delay(30); continue; }
+    jpg = k;
+  }
+  if (!jpg) { return -3; }
+
+  uint32_t aus_b = breite, aus_h = hoehe;
+  uint8_t *rgb = nullptr;
+  bool ok = false;
+  uint32_t t0 = millis();
+  if (0 == tc_dl_skala) {
+    rgb = (uint8_t *)heap_caps_malloc(breite * hoehe * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rgb) { ok = fmt2rgb888(jpg, len, PIXFORMAT_JPEG, rgb); }
+  } else {
+    aus_b = breite / tc_dl_skala;
+    aus_h = hoehe / tc_dl_skala;
+    esp_jpeg_image_scale_t sc = (2 == tc_dl_skala) ? JPG_SCALE_2X
+                              : (4 == tc_dl_skala) ? JPG_SCALE_4X : JPG_SCALE_8X;
+    rgb = (uint8_t *)heap_caps_malloc(aus_b * aus_h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rgb) { ok = jpg2rgb565(jpg, len, rgb, sc); }
+  }
+  tc_dl_erg.ms_jpeg = millis() - t0;
+  free(jpg);
+  if (!rgb) { return -2; }
+  if (!ok) { free(rgb); return -4; }
+
+  dl::image::img_t bild;
+  bild.data = rgb;
+  bild.width = (uint16_t)aus_b;
+  bild.height = (uint16_t)aus_h;
+  bild.pix_type = (0 == tc_dl_skala) ? dl::image::DL_IMAGE_PIX_TYPE_RGB888
+                : (0 == tc_dl_bo)    ? dl::image::DL_IMAGE_PIX_TYPE_RGB565LE
+                                     : dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+  t0 = millis();
+  std::list<dl::detect::result_t> &treffer = tc_dl_personen->run(bild);
+  tc_dl_erg.ms_netz = millis() - t0;
+  free(rgb);
+
+  tc_dl_erg.n = (int32_t)treffer.size();
+  // ⚠️ The boxes are in the SCALED-DOWN image. They are scaled back to the
+  // original size for the script and the display, or a box drawn at scale 1/2
+  // would point at the wrong half of the picture.
+  int32_t f = (0 == tc_dl_skala) ? 1 : tc_dl_skala;
+  for (auto &r : treffer) {
+    int32_t sc100 = (int32_t)(r.score * 100.0f);
+    if (sc100 > tc_dl_erg.best) {
+      tc_dl_erg.best = sc100;
+      tc_dl_erg.x = r.box[0] * f;
+      tc_dl_erg.y = r.box[1] * f;
+      tc_dl_erg.w = (r.box[2] - r.box[0]) * f;
+      tc_dl_erg.h = (r.box[3] - r.box[1]) * f;
+    }
+  }
+  return tc_dl_erg.n;
+}
+
+int32_t tc_dl_person_get(int32_t sel) {
+  switch (sel) {
+    case 0: return tc_dl_erg.n;
+    case 1: return tc_dl_erg.best;
+    case 2: return tc_dl_erg.x;
+    case 3: return tc_dl_erg.y;
+    case 4: return tc_dl_erg.w;
+    case 5: return tc_dl_erg.h;
+    case 6: return (int32_t)tc_dl_erg.ms_netz;
+    case 7: return (int32_t)tc_dl_erg.ms_jpeg;
+    default: return -1;
+  }
+}
+
+// TinyCDlCam [schwelle] [skala] [byteordnung]
+void CmndTinyCDlCam(void) {
+  float schwelle = 0.7f;
+  if (XdrvMailbox.data_len) {
+    char *cp = XdrvMailbox.data;
+    float v = CharToFloat(cp);
+    if (v > 0.0f && v < 1.0f) { schwelle = v; }
+    char *sp = strchr(cp, ' ');
+    if (sp) {
+      int sk = strtol(sp + 1, &sp, 10);
+      if (0 == sk || 2 == sk || 4 == sk || 8 == sk) { tc_dl_skala = sk; }
+      if (sp && *sp) { tc_dl_bo = strtol(sp, nullptr, 10) ? 1 : 0; }
+    }
+  }
+
+  int32_t n = tc_dl_person_run((int32_t)(schwelle * 100.0f));
+  if (n < 0) {
+    Response_P(PSTR("{\"TinyCDlCam\":{\"Error\":%d,\"File\":\"%s\"}}"), (int)n, TC_DL_PERSON_MODEL);
+    return;
+  }
+  Response_P(PSTR("{\"TinyCDlCam\":{\"Scale\":%d,\"Thr\":%.2f,\"LoadMs\":%u,\"JpegMs\":%u,"
+                  "\"DetectMs\":%u,\"Found\":%d,\"Best\":%d,"
+                  "\"Box\":[%d,%d,%d,%d]}}"),
+             tc_dl_skala, schwelle, tc_dl_erg.ms_laden, tc_dl_erg.ms_jpeg,
+             tc_dl_erg.ms_netz, (int)n, (int)tc_dl_erg.best,
+             (int)tc_dl_erg.x, (int)tc_dl_erg.y, (int)tc_dl_erg.w, (int)tc_dl_erg.h);
+}
+
+#endif // USE_TINYC_ESPDL
 
 // --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
 #ifdef ESP32
@@ -2165,6 +2575,38 @@ static void HandleTinyCPage(void) {
         if (!repo_url[0] && !cfg_present) {
           strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
         }
+        // --- Which repositories can be chosen? ----------------------------
+        // Compiled-in list, REPLACED by /tinyc_repos.cfg when that exists.
+        //
+        // ⚠️ NOT /tinyc_repo.cfg -- that one holds a BYTECODE url
+        // (<base>/bytecode) and is read above. Reusing it here would make an
+        // existing device look for examples under <base>/bytecode/examples and
+        // find nothing, without an error message. Different meaning, different
+        // file.
+        char repo_list[TINYC_REPO_LIST_SIZE] = {};
+        char *repo_ent[TINYC_REPO_MAX] = {};
+        uint8_t repo_cnt = 0;
+        {
+          File lcfg = ufsp->open("/tinyc_repos.cfg", "r");
+          if (lcfg) {
+            int n = lcfg.read((uint8_t*)repo_list, sizeof(repo_list) - 1);
+            if (n > 0) { repo_list[n] = 0; }
+            lcfg.close();
+          }
+          if (!repo_list[0]) { strlcpy(repo_list, TINYC_REPO_LIST, sizeof(repo_list)); }
+          // Tokenise in place: one entry per line, "Name|base". Lines without a
+          // '|' and lines starting with '#' are skipped, so the file can carry
+          // a comment header.
+          for (char *l = repo_list; *l && repo_cnt < TINYC_REPO_MAX; ) {
+            char *e = strpbrk(l, "\r\n");
+            if (e) { *e = 0; }
+            while (' ' == *l || '\t' == *l) { l++; }
+            if (*l && '#' != *l && strchr(l, '|')) { repo_ent[repo_cnt++] = l; }
+            if (!e) { break; }
+            l = e + 1;
+          }
+        }
+
         if (repo_url[0]) {
           // Repo index + .tcb download run CLIENT-SIDE (in the browser): the device
           // does ZERO remote I/O for the repository. A synchronous HTTPS GET on the
@@ -2176,7 +2618,40 @@ static void HandleTinyCPage(void) {
           // fetches index.txt + each .tcb directly; the .tcb is POSTed to /tc_upload
           // (local FS only). (gemu 2026-06-24)
           WSContentSend_P(PSTR(
-            "<fieldset><legend><b> Repository </b></legend>"
+            "<fieldset><legend><b> Repository </b></legend>"));
+
+          // --- Source chooser (only when there is something to choose) ------
+          // ⚠️ WITH ONE ENTRY THE PAGE STAYS EXACTLY AS IT WAS. An image that
+          // only overrides TINYC_DEFAULT_REPO -- which is what Hans's does
+          // today -- must not suddenly grow a drop-down that contradicts its
+          // own default.
+          if (repo_cnt > 1) {
+            WSContentSend_P(PSTR(
+              "<div style='display:flex;gap:8px;align-items:center;margin-bottom:6px'>"
+              "<select id='tcrp' style='flex:1'>"));
+            for (uint8_t i = 0; i < repo_cnt; i++) {
+              char *bar = strchr(repo_ent[i], '|');
+              *bar = 0;
+              const char *name = repo_ent[i];
+              char *base = bar + 1;
+              while (' ' == *base || '\t' == *base) { base++; }
+              // Trailing slash off, so <base>/bytecode never becomes a double
+              // slash -- GitHub raw answers 404 on those.
+              size_t bl = strlen(base);
+              while (bl && '/' == base[bl-1]) { base[--bl] = 0; }
+              // Preselect the entry the device is actually serving right now.
+              char derived[220];
+              snprintf_P(derived, sizeof(derived), PSTR("%s/bytecode"), base);
+              WSContentSend_P(PSTR("<option value='%s'%s>%s</option>"),
+                              base, (0 == strcmp(derived, repo_url)) ? " selected" : "",
+                              name);
+              *bar = '|';   // put the line back, the pointers stay valid
+            }
+            WSContentSend_P(PSTR(
+              "</select></div>"));
+          }
+
+          WSContentSend_P(PSTR(
             "<div style='display:flex;gap:8px;align-items:center'>"
             "<select id='tcrf' style='flex:1'><option>loading...</option></select>"
             // Dieselben zwei Zahlen wie bei tclib -- siehe dort.
@@ -2239,7 +2714,15 @@ static void HandleTinyCPage(void) {
             ".filter(function(x){return x.slice(-4)=='.tcb'});s.innerHTML='';"
             "if(!ls.length){s.innerHTML='<option>(empty)</option>';return}"
             "ls.forEach(function(n){tcOpt(s,n,'','')})})}"
+            // ⚠️ DIE ALTE MELDUNG ZUERST WEG. Sie wird nur im Fehlerfall
+            // gesetzt und nirgends geloescht -- bisher fiel das nicht auf,
+            // weil ein fehlgeschlagener Abruf hiess, dass das Repo dauerhaft
+            // nicht zu erreichen war. Mit dem Auswahlmenue schaltet man hin
+            // und zurueck, und dann steht "Repo list fetch failed: 404" neben
+            // einer Liste, die einwandfrei geladen hat. Am Geraet nachgemessen
+            // (.186, 2026-09-14).
             "function tcFill(f){var s=document.getElementById('tcrf');"
+            "var m0=document.getElementById('tcrmsg');if(m0)m0.textContent='';"
             "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
             "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
             "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';s.innerHTML='';"
@@ -2262,6 +2745,40 @@ static void HandleTinyCPage(void) {
             "b.disabled=0;b.textContent='Download & Load';m.textContent='Failed: '+e})}"
             "document.getElementById('tcrf').addEventListener('change',"
             "function(){tcrW();tcrS()});"
+            // --- The source chooser -------------------------------------
+            // TCBASE is the ONE url everything else hangs below; the IDE
+            // buttons further down read it from window. Empty when there is
+            // nothing to choose -- then every consumer keeps its own default
+            // and the page behaves exactly as before.
+            //
+            // ⚠️ THE REMEMBERED PROGRAM BELONGS TO THE OLD REPOSITORY. tcrL()
+            // restores the previous selection from sessionStorage after every
+            // refill; without clearing it, switching sources re-selects a file
+            // name that may not exist in the new one -- and the list then
+            // silently shows entry 1 while the label still says the old name.
+            // ⚠️ THE STORED BASE IS WRITTEN ON LOAD, NOT ONLY ON CHANGE.
+            // /tcrepo reads it and has no other way to learn which source this
+            // image serves. Writing it only in the change handler would leave
+            // it empty for everyone who never touches the drop-down -- and on
+            // an image whose first entry is NOT the built-in default (Hans's,
+            // for instance) /tcrepo would then quietly pull the IDE from the
+            // wrong repository.
+            //
+            // ⚠️ And without a chooser the key is REMOVED, not left alone: it
+            // may still hold a base from an earlier configuration, and a stale
+            // one is worse than none -- /tcrepo would follow it while the page
+            // right here serves something else.
+            "var TCBASE='';"
+            "(function(){var s=document.getElementById('tcrp');"
+            "if(!s){try{localStorage.removeItem('tinyc_base')}catch(e){}return}"
+            "try{var v=localStorage.getItem('tinyc_base');if(v)"
+            "for(var i=0;i<s.options.length;i++)if(s.options[i].value==v){s.selectedIndex=i;break}}"
+            "catch(e){}"
+            "function ap(){TCBASE=s.value;TCREPO=TCBASE+'/bytecode';"
+            "try{localStorage.setItem('tinyc_base',TCBASE)}catch(e){}}ap();"
+            "s.addEventListener('change',function(){ap();"
+            "try{sessionStorage.removeItem('tcrf')}catch(e){}"
+            "tcFill(1)});})();"
             "tcFill(0);</script>"), repo_url);
         }
       }
@@ -2332,7 +2849,17 @@ static void HandleTinyCPage(void) {
     "<button id='tcide_upd' onclick=\""
     "if(!confirm('Update the IDE from the repository? (downloads tinyc_ide.html.gz%s, and replaces the served IDE)'))return;"
     "var b=this;b.disabled=1;b.textContent='Updating...';"
-    "fetch('/cm?cmnd=TinyCIde').then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
+    // ⚠️ THE IDE FOLLOWS THE CHOSEN SOURCE TOO. Switching repositories and
+    // then updating the IDE from the OTHER one is how you get an IDE whose
+    // examples and opcode set disagree with the bytecode next to them.
+    // Without a chooser window.TCBASE is undefined and the command runs bare,
+    // exactly as before, on TINYC_DEFAULT_IDE_URL.
+    //
+    // ⚠️ The space before the url stays a literal space: fetch() percent-encodes
+    // it on its own, and writing %20 here would go through vsnprintf first --
+    // this string already carries a %s.
+    "fetch('/cm?cmnd=TinyCIde'+(window.TCBASE?' '+encodeURIComponent(window.TCBASE+'/tinyc_ide.html.gz'):''))"
+    ".then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
     "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes). Re-open the IDE.');}"
     "else{b.disabled=0;b.textContent='Update IDE';"
     "alert('IDE update failed: '+(d.msg||('error '+d.error))+'\\n\\nThe old IDE was kept.');}})"
@@ -2360,6 +2887,10 @@ static void HandleTinyCPage(void) {
   // it only installed a repo example and threw the rest of the bundle away.
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
+    // The page pulls the WHOLE IDE out of a repository, so it has to be the
+    // repository that was chosen. It reads that from localStorage by itself --
+    // see the comment on RAW in xdrv_124_tinyc_repoide.h for why it must not
+    // come in through the url.
     "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run IDE from repo</button>"
     "</p>"
     "<p style='text-align:center;font-size:.85em;opacity:.6'>The full IDE, fetched from the repo into the browser -- edit and run without any IDE on the device. It asks this device for its ABI and compiles to match. Needs internet in the browser; the on-device IDE works offline.</p>"));
@@ -5430,12 +5961,25 @@ static void TC_CamMotionDetect(void) {
       tc_cam_slot[0].width == 0 || tc_cam_slot[0].height == 0 ||
       tc_cam_slot[0].writing) return;
 
-  uint32_t w = tc_cam_slot[0].width;
-  uint32_t h = tc_cam_slot[0].height;
+  // ⚠️ DECODE AT 1/8, NOT FULL SIZE.
+  // Measured on the DFR1154 on 16.09.2026: a 640x480 frame to RGB888 costs
+  // 289 ms and 0.88 MB of PSRAM — and this runs in the MAIN LOOP, which is
+  // why enabling motion detection multiplied Tasmota's LoadAvg by 19 (40 ->
+  // 760) and blocked the loop for ~0.75 s at a time.
+  // jpg2rgb565 with JPG_SCALE_8X does the same job in 43 ms into 9.4 kB.
+  // Halving or quartering barely helps (252 / 225 ms): the Huffman pass scales
+  // with the COMPRESSED data and cannot be skipped, only the IDCT and the
+  // output do. At 1/8 the decoder needs just the DC coefficient per block,
+  // and that is the whole win.
+  // 80x60 is plenty here: this measure is a mean over the entire frame, it has
+  // no notion of where anything is.
+  uint32_t w = tc_cam_slot[0].width / 8;
+  uint32_t h = tc_cam_slot[0].height / 8;
   uint32_t pixels = w * h;
+  if (!pixels) return;
 
-  // Decode JPEG to RGB888 in temp buffer
-  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  // RGB565, two bytes per pixel
+  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) return;
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
@@ -5444,7 +5988,7 @@ static void TC_CamMotionDetect(void) {
   free(rgb);
   return;
 #else
-  if (!fmt2rgb888(tc_cam_slot[0].buf, tc_cam_slot[0].len, PIXFORMAT_JPEG, rgb)) {
+  if (!jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X)) {
     free(rgb);
     return;
   }
@@ -5457,10 +6001,13 @@ static void TC_CamMotionDetect(void) {
     tc_cam_motion.ref_size = pixels;
     if (tc_cam_motion.ref_buf) {
       // First frame — fill reference, no comparison
-      uint8_t *pxi = rgb;
+      // RGB565 -> grey. The exact weighting does not matter: this value is
+      // only ever compared against the SAME transform of the next frame.
+      uint16_t *pxi = (uint16_t *)rgb;
       for (uint32_t i = 0; i < pixels; i++) {
-        tc_cam_motion.ref_buf[i] = (pxi[0] + pxi[1] + pxi[2]) / 3;
-        pxi += 3;
+        uint16_t p = pxi[i];
+        tc_cam_motion.ref_buf[i] =
+            ((((p >> 11) & 0x1F) << 3) + (((p >> 5) & 0x3F) << 2) + ((p & 0x1F) << 3)) / 3;
       }
     }
     free(rgb);
@@ -5470,14 +6017,13 @@ static void TC_CamMotionDetect(void) {
   // Compare with reference
   uint64_t accu = 0;
   uint64_t bright = 0;
-  uint8_t *pxi = rgb;
+  uint16_t *pxi = (uint16_t *)rgb;
   uint8_t *pxr = tc_cam_motion.ref_buf;
   for (uint32_t i = 0; i < pixels; i++) {
-    int32_t gray = (pxi[0] + pxi[1] + pxi[2]) / 3;
-    int32_t lgray = pxr[0];
-    pxr[0] = gray;
-    pxi += 3;
-    pxr++;
+    uint16_t p = pxi[i];
+    int32_t gray = ((((p >> 11) & 0x1F) << 3) + (((p >> 5) & 0x3F) << 2) + ((p & 0x1F) << 3)) / 3;
+    int32_t lgray = pxr[i];
+    pxr[i] = gray;
     accu += abs(gray - lgray);
     bright += gray;
   }

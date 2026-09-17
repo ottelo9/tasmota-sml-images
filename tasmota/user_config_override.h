@@ -333,7 +333,20 @@
   //--           ersetzt. Vollstaendiger Dateiname, kein Slash dahinter.
   //-- Wirkt nur mit den #ifndef-Guards in xdrv_124_tinyc.ino (Zeilen 35/42).
   #define TINYC_DEFAULT_REPO    "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc/bytecode"
-  #define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/tinyc/tinyc_ide.html.gz"
+  #define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc/tinyc_ide.html.gz"
+
+  //-- Repo-Auswahl (DropDown auf /tc) (gemus Commit dba1f72). Ein Eintrag je Zeile,
+  //-- "Klarname|BASIS-URL" -- Basis, NICHT .../bytecode. Daraus leitet die
+  //-- Firmware ab:  <basis>/bytecode (.tcb + index.json/index.txt),
+  //--               <basis>/tinyc_ide.html.gz (Update IDE + /tcrepo),
+  //--               <basis>/examples (.tc, IDE -- bei gemu noch offen).
+  //-- Mit nur EINEM Eintrag erscheint kein Menue. Vorauswahl = der Eintrag, dessen
+  //-- <basis>/bytecode gleich TINYC_DEFAULT_REPO ist -> ottelo steht daher oben
+  //-- und muss exakt zu TINYC_DEFAULT_REPO passen.
+  //-- Zur Laufzeit ersetzbar durch /tinyc_repos.cfg (Mehrzahl!, gleiches Format).
+  #define TINYC_REPO_LIST \
+    "SmartMeter/PV/Emulator (ottelo)|https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc\n" \
+    "TinyC Examples (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc"
 
   //-- TLS-Empfangspuffer: seit gemus a52ccc35c waehlt der Treiber selbst
   //-- zwischen 16384 und 4096, je nach groesstem freiem Block. Kein #define

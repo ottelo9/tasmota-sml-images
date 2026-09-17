@@ -54,7 +54,29 @@ a{color:#1fa3ec}#ide{border:0;width:100%;height:calc(100% - 33px);display:none;b
 <span style="flex:1"></span><a href="/tc">console</a><a href="/">menu</a></div>
 <iframe id="ide"></iframe>
 <script>
-var RAW='https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc';
+// Which repository does the IDE come from? The TinyC page writes the chosen
+// base url to localStorage; without a choice the built-in default applies,
+// exactly as before. The device stays out of it -- everything here happens in
+// the browser.
+//
+// ⚠️⚠️ localStorage AND NOT A QUERY PARAMETER. Whatever ends up in RAW is
+// fetched and its content is written into the frame as a document, i.e. it
+// RUNS under this device's origin and can reach the device's HTTP API. A
+// ?b=<url> would make that reachable through a crafted link
+// (http://device/tcrepo?b=https://evil/...) from anywhere. localStorage can
+// only be written by a page of this device itself, so the value can only come
+// from the chooser on /tc.
+//
+// The scheme check is the second lock, for the case where someone did get a
+// value in there: anything but plain https is ignored.
+var RAW=(function(){
+  var d='https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc';
+  try{
+    var b=localStorage.getItem('tinyc_base');
+    if(b && /^https:\/\/[^\s"'<>]+$/.test(b)) return b.replace(/\/+$/,'');
+  }catch(e){}
+  return d;
+})();
 var st=document.getElementById('st'),fr=document.getElementById('ide');
 function say(s,bad){st.textContent=s;st.className=bad?'e':'';}
 

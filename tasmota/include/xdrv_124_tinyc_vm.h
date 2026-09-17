@@ -343,8 +343,9 @@ extern uint16_t tc_vm_stack_bytes;
 // Bump BOTH in lockstep whenever syscall NUMBERS are inserted/renumbered (pure
 // appends don't need it). The loader warns (still loads) on a .tcb abi_rev mismatch.
 #include "xdrv_124_tinyc_spp.h"
+#include "xdrv_124_tinyc_usb.h"
 
-#define TC_SYSCALL_ABI     29    // V29: NO new syscall -- ONE new OPCODE, LLK_OP2_ST (0xC2), the fusion for `x = y OP (z OP k)`. It closes the last gap of the fusion run: after the six fusions of 2026-08-08 the bench_int loop still spent 13 opcodes per iteration, and SIX of them were this one unfused line, `sum = sum - (i / 2)` -- load, load, push, operate, operate, store. It is EIGHT now: one instruction per source statement plus the loop head and the jump back, which is the floor for a stack VM. ⚠️ THE SHAPE WAS COUNTED, NOT GUESSED: across the 224 shipped examples it occurs ten times, and every time with an i8 constant on the inside -- never with three locals, never with a wide constant. Hence exactly one opcode and no family, and no LLK32 twin: it would not have fired in a single example. A pure fusion, NO new expressiveness -- the unfused form stays valid and a program means the same either way. ⭐ EQUIVALENCE CHECKED: 5600 cases (all 100 operator pairs x 8 constants x 7 start values, including INT_MIN, division by zero and shifts) fused against unfused in the JS VM -- ZERO differences, error messages included (scripts/check_fusion.mjs). ⚠️ As with V21, newer bytecode on older firmware dies with BAD_OPCODE mid-loop, so the loader refuses a .tcb whose abi_rev is higher than its own. The compiler stamps 29 exactly when it emits the opcode (hook in emit()). || PREVIOUS V28: NO new syscall -- a BUG FIX that changes what eleven existing ones accept, the same shape as V26 and found the same way. tc_ref_maxlen() has long answered in BYTES for a packed byte[], but webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr and sppScan still wrote one int32 SLOT per character: handing any of them a byte[] wrote four times the array's size straight over the neighbouring heap. Reported by Hans against webArg() into a `byte a[96]` -- the mail address came back as "o", first character right and string over, which is the harmless half of the same write. All eleven now go through tc_chr_put(). ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded one character; it goes through tc_ref_to_cstr() now, which knows both packings. jsonStr had the same reading problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. Measured on an ESP32-C3 with a byte[] and a char[] in one handler on one request: before byte[16]="o" / char[16]="otto@example.org", after both "otto@example.org", and UTF-8 survives. || PREVIOUS V27: NO new syscall -- twelve new OPCODES (0xB6..0xC1) for packed 16-bit arrays, `int16[]` and `uint16[]`. Two bytes per element instead of four: (n+1)/2 slots, element i at ((int16*)base)[i]. Same purpose as byte[], one step finer -- byte[] saves four times the RAM but costs resolution, which is the whole reason WebChartQ's scale and offset exist; an int16 carries a temperature in hundredths of a kelvin, a raw ADC word or a Modbus register with NO decoding, at half the RAM of an int[]. Measured on a 1441-sample ring: float 5.6 KB, int16 2.8 KB, byte 1.4 KB. ⚠️ Signedness lives in the LOAD, not in the storage: STORE_*_I16 writes the same sixteen bits for int16 and uint16 alike, while the compiler picks the sign-extending (0xB6/0xB8/0xBA/0xBC) or zero-extending load (0xBE..0xC1) from the declared type. That is why uint16 costs four opcodes rather than eight. ⚠️ The byte flag in a ref grew into a TWO-BIT field (heap 8-9, global 16-17, local 24-25): 00 = int32, 01 = byte, 10 = int16, 11 = uint16. The 01 is the old byte bit unchanged, so every .tcb in the field still means exactly what it meant -- the ABI step hangs on the new opcodes alone, and the compiler stamps it precisely when it emits one (hook in emit()). An older device refuses the .tcb instead of dying on BAD_OPCODE mid-loop. || PREVIOUS V26: NO new syscall — a BUG FIX that changes what existing ones accept. httpGet, httpPost, smlGetStr and tasmCmd filled their destination buffer with int32 SLOTS while tc_ref_maxlen() already answered in BYTES for a packed byte[]. Handing any of them a byte[] therefore wrote four times the array's size and trampled the neighbouring heap -- silently, and only once a response was long enough to reach past the buffer. All four now go through tc_chr_put(), like the sprintf/strcat family has since 1.6.58. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 26 whenever a byte[] is passed to one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. This is what made the SML family's text buffers convertible: on sml_chart_ct002 they were 18.7 KB of the 26.9 KB contiguous block. || PREVIOUS V25: + SYS_WEB_CHART_Q (545) -- WebChartQ(scale, offset), an affine decode applied to the NEXT WebChart's samples. It exists so a chart can be fed from a PACKED byte[] instead of a float[]: one byte per sample plus a scale/offset carries a temperature at 0.5 K over -40..87.5 degC, a humidity or an SOC at 0.4 %, for a QUARTER of the RAM. That matters because chart ring buffers are the largest single heap consumer on a C3 -- the shipped examples hold three float[1441] rings (5.7 KB each) out of a 64 KB TC_MAX_HEAP, and the heap is claimed as ONE contiguous block at load time. ⚠️ The byte[] side is NOT a pure append even though the syscall is: WebChart (166) is unchanged in number and signature, but the compiler now marks a byte[] array argument with the packed-ref flag bit, and OLDER firmware would strip that bit and read the array as float slots -- garbage, silently, with no missing-syscall complaint to point at it. The compiler therefore stamps abi_rev 25 on any WebChart whose array argument is a byte[] (CodeGenerator._istBytesVar), so an old device refuses the .tcb instead of drawing nonsense. A WebChart on a float[] still compiles byte-identically and keeps its old abi_rev. Also in this release, and needing no ABI at all because it is pure server-side HTML: the per-sample wire form changed from _tcA's [x,y] pairs to _tcAy's bare y-list plus x0/step, since the x axis was always the arithmetic sequence -(count-1-i)*interval + timebase. About 14 bytes per point became about 6 -- a 1441-point series went from ~20 KB of response body to ~8 KB. _tcA stays defined alongside it. || PREVIOUS V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || PREVIOUS V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || PREVIOUS V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || PREVIOUS V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || PREVIOUS V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
+#define TC_SYSCALL_ABI     31    // V31: + serialReadArray (555) -- read a whole BLOCK off a serial port in ONE syscall, into an int32 array or a packed byte[]. serialRead() has always cost one syscall PER BYTE; measured on a real ESP32-S3 (2026-09-13) the VM manages 95 969 serial syscalls per second against 333 333 for an empty loop -- about 10 us a byte, so 230400 baud (23 kB/s) would spend a quarter of the VM on fetching alone, before any work at all. Came out of the VarioLab bridge, which needed a second source next to the USB host: same device, but wired to plain RX/TX pins on any ESP32 instead of an FTDI on the OTG socket. Read-only on purpose: serialWriteBytes(h, buf, len) has been there all along and takes char[], byte[] AND int32 arrays. ⚠️ In the same change, serialWriteBytes stopped SILENTLY DROPPING everything when len > 256 -- no error, no return value, just nothing on the wire; it writes in chunks now. Pure append, no .tcb format change. || PREVIOUS V30: + FTDI am USB-Host (546-554) -- usbInit, usbState, usbOpen, usbAvailable, usbRead, usbWrite, usbClose, usbDeinit, usbInfo. Ein serieller Draht zu allem, was hinter einem FTDI am USB-Host haengt; das Protokoll lebt im SKRIPT, genau wie bei SPP. Entstanden, weil gemus VarioLab seinen FTDI eingeloetet hat und es KEINEN Weg an die UART davor gibt -- der einzige Zugang ist, selbst Host zu sein (12.09.2026). ⭐ DER STAPEL WAR SCHON DA: Tasmotas eigener arduino-esp32-Zweig (3.3.8 / IDF 5.5) liefert libusb.a fuer den S3 mit usb_host_install, usb_host_client_register, usb_host_lib_handle_events und usb_host_transfer_alloc als ausgefuehrte Symbole, dazu usb/usb_host.h und die CONFIG_USB_HOST_*-Einstellungen. Belegt durch Bauen UND Laufen: der VarioLab meldete sich als 0403:6001 (FT232R). Es musste NICHTS am Framework geaendert werden, und die esp-usb-Komponenten (cdc_acm_host.c allein 52 KB) werden NICHT gebraucht -- ein FTDI ist herstellereigen, kein CDC, also adoptiert ihn ohnehin kein Klassentreiber. Was er braucht, sind vier Steuerbefehle und ein Bulk-Paar. ⚠️ DIE FTDI-EIGENHEIT: jedes IN-Paket beginnt mit ZWEI STATUSBYTES (Modem und Leitung), die abgeschnitten werden muessen -- sonst steht alle 62 Byte Muell in den Daten, was wie ein Baudratenfehler aussieht und einen an der falschen Stelle suchen laesst. ⚠️ Braucht USE_TINYC_USBSERIAL und einen S3/S2; auf allen anderen Zielen faellt alles weg und die Syscalls geben 0. ⚠️ Nur mit ZWEI USB-Buchsen bequem: der Host belegt auf dem S3 dieselben Leitungen wie die native USB-Konsole. Reiner Anhang, kein Formatwechsel. || PREVIOUS V29: NO new syscall -- ONE new OPCODE, LLK_OP2_ST (0xC2), the fusion for `x = y OP (z OP k)`. It closes the last gap of the fusion run: after the six fusions of 2026-08-08 the bench_int loop still spent 13 opcodes per iteration, and SIX of them were this one unfused line, `sum = sum - (i / 2)` -- load, load, push, operate, operate, store. It is EIGHT now: one instruction per source statement plus the loop head and the jump back, which is the floor for a stack VM. ⚠️ THE SHAPE WAS COUNTED, NOT GUESSED: across the 224 shipped examples it occurs ten times, and every time with an i8 constant on the inside -- never with three locals, never with a wide constant. Hence exactly one opcode and no family, and no LLK32 twin: it would not have fired in a single example. A pure fusion, NO new expressiveness -- the unfused form stays valid and a program means the same either way. ⭐ EQUIVALENCE CHECKED: 5600 cases (all 100 operator pairs x 8 constants x 7 start values, including INT_MIN, division by zero and shifts) fused against unfused in the JS VM -- ZERO differences, error messages included (scripts/check_fusion.mjs). ⚠️ As with V21, newer bytecode on older firmware dies with BAD_OPCODE mid-loop, so the loader refuses a .tcb whose abi_rev is higher than its own. The compiler stamps 29 exactly when it emits the opcode (hook in emit()). || PREVIOUS V28: NO new syscall -- a BUG FIX that changes what eleven existing ones accept, the same shape as V26 and found the same way. tc_ref_maxlen() has long answered in BYTES for a packed byte[], but webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr and sppScan still wrote one int32 SLOT per character: handing any of them a byte[] wrote four times the array's size straight over the neighbouring heap. Reported by Hans against webArg() into a `byte a[96]` -- the mail address came back as "o", first character right and string over, which is the harmless half of the same write. All eleven now go through tc_chr_put(). ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded one character; it goes through tc_ref_to_cstr() now, which knows both packings. jsonStr had the same reading problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. Measured on an ESP32-C3 with a byte[] and a char[] in one handler on one request: before byte[16]="o" / char[16]="otto@example.org", after both "otto@example.org", and UTF-8 survives. || PREVIOUS V27: NO new syscall -- twelve new OPCODES (0xB6..0xC1) for packed 16-bit arrays, `int16[]` and `uint16[]`. Two bytes per element instead of four: (n+1)/2 slots, element i at ((int16*)base)[i]. Same purpose as byte[], one step finer -- byte[] saves four times the RAM but costs resolution, which is the whole reason WebChartQ's scale and offset exist; an int16 carries a temperature in hundredths of a kelvin, a raw ADC word or a Modbus register with NO decoding, at half the RAM of an int[]. Measured on a 1441-sample ring: float 5.6 KB, int16 2.8 KB, byte 1.4 KB. ⚠️ Signedness lives in the LOAD, not in the storage: STORE_*_I16 writes the same sixteen bits for int16 and uint16 alike, while the compiler picks the sign-extending (0xB6/0xB8/0xBA/0xBC) or zero-extending load (0xBE..0xC1) from the declared type. That is why uint16 costs four opcodes rather than eight. ⚠️ The byte flag in a ref grew into a TWO-BIT field (heap 8-9, global 16-17, local 24-25): 00 = int32, 01 = byte, 10 = int16, 11 = uint16. The 01 is the old byte bit unchanged, so every .tcb in the field still means exactly what it meant -- the ABI step hangs on the new opcodes alone, and the compiler stamps it precisely when it emits one (hook in emit()). An older device refuses the .tcb instead of dying on BAD_OPCODE mid-loop. || PREVIOUS V26: NO new syscall — a BUG FIX that changes what existing ones accept. httpGet, httpPost, smlGetStr and tasmCmd filled their destination buffer with int32 SLOTS while tc_ref_maxlen() already answered in BYTES for a packed byte[]. Handing any of them a byte[] therefore wrote four times the array's size and trampled the neighbouring heap -- silently, and only once a response was long enough to reach past the buffer. All four now go through tc_chr_put(), like the sprintf/strcat family has since 1.6.58. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 26 whenever a byte[] is passed to one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. This is what made the SML family's text buffers convertible: on sml_chart_ct002 they were 18.7 KB of the 26.9 KB contiguous block. || PREVIOUS V25: + SYS_WEB_CHART_Q (545) -- WebChartQ(scale, offset), an affine decode applied to the NEXT WebChart's samples. It exists so a chart can be fed from a PACKED byte[] instead of a float[]: one byte per sample plus a scale/offset carries a temperature at 0.5 K over -40..87.5 degC, a humidity or an SOC at 0.4 %, for a QUARTER of the RAM. That matters because chart ring buffers are the largest single heap consumer on a C3 -- the shipped examples hold three float[1441] rings (5.7 KB each) out of a 64 KB TC_MAX_HEAP, and the heap is claimed as ONE contiguous block at load time. ⚠️ The byte[] side is NOT a pure append even though the syscall is: WebChart (166) is unchanged in number and signature, but the compiler now marks a byte[] array argument with the packed-ref flag bit, and OLDER firmware would strip that bit and read the array as float slots -- garbage, silently, with no missing-syscall complaint to point at it. The compiler therefore stamps abi_rev 25 on any WebChart whose array argument is a byte[] (CodeGenerator._istBytesVar), so an old device refuses the .tcb instead of drawing nonsense. A WebChart on a float[] still compiles byte-identically and keeps its old abi_rev. Also in this release, and needing no ABI at all because it is pure server-side HTML: the per-sample wire form changed from _tcA's [x,y] pairs to _tcAy's bare y-list plus x0/step, since the x axis was always the arithmetic sequence -(count-1-i)*interval + timebase. About 14 bytes per point became about 6 -- a 1441-point series went from ~20 KB of response body to ~8 KB. _tcA stays defined alongside it. || PREVIOUS V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || PREVIOUS V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || PREVIOUS V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || PREVIOUS V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || PREVIOUS V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // REMINDER: when bumping TC_RELEASE, also update the visible <h1> label
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
@@ -1373,7 +1374,33 @@ enum TcSyscall {
   SYS_WEB_CHART_SIZE  = 233, // (width, height) -> void — set chart div size in pixels (0=default)
   SYS_WEB_CHART_TBASE = 261, // (minutes) -> void — set time base offset from "now" for chart x-axis
   SYS_WEB_CHART_JS    = 354, // (js_str) -> void — attach script JS to the last WebChart (runs in draw scope with dt,o,el; set o.done to take over the draw)
-  SYS_WEB_CHART_Q     = 545, // (scale, offset) -> void — affine decode for the NEXT WebChart: value = raw * scale + offset. ONE-SHOT (cleared by the WebChart that uses it). Turns a packed byte[] into a physical quantity.
+  SYS_WEB_CHART_Q     = 545, // (scale, offset) -> void — affine decode for the NEXT WebChart
+
+  // ── FTDI am USB-Host (ESP32-S3/S2, USE_TINYC_USBSERIAL) ────────────────
+  // Same shape as the SPP family: a serial wire, the protocol lives in the
+  // script. Reading NEVER blocks.
+  SYS_USB_INIT        = 546, // ()              -> int  1=host running, 0=not possible
+  SYS_USB_STATE       = 547, // ()              -> int  0=off 1=ready 2=FTDI there 3=open 4=error
+  SYS_USB_OPEN        = 548, // (baud)          -> int  1=open, 0=no
+  SYS_USB_AVAILABLE   = 549, // ()              -> int  bytes waiting
+  SYS_USB_READ        = 550, // (buf_ref, n)    -> int  bytes read (0 = nothing there)
+  SYS_USB_WRITE       = 551, // (buf_ref, n)    -> int  bytes sent, -1=error
+  SYS_USB_CLOSE       = 552, // ()              -> int  0
+  SYS_USB_DEINIT      = 553, // ()              -> int  0; stack down, RAM back
+  SYS_USB_INFO        = 554, // (sel)           -> int  0=vid 1=pid 2=rx 3=tx 4=lost (ring overflow)
+  // ── Serial in BLOCKS ───────────────────────────────────────────────────
+  // WHY this exists next to serialRead(): that one costs ONE SYSCALL PER BYTE.
+  // Measured on a real ESP32-S3 (2026-09-13): 95 969 serial syscalls per
+  // second, while an empty loop manages 333 333 -- about 10 us per byte. At
+  // 230400 baud (23 kB/s) a quarter of the VM would go into fetching alone,
+  // before any work. In blocks it is one call per round.
+  // ⚠️ Takes an ARRAY ref, and accepts both kinds: int32 array (one byte per
+  // slot) and packed byte[] -- like usbRead/tcpReadArray, so a bridge needs no
+  // copying in between.
+  // ⚠️ READ ONLY. For writing there is serialWriteBytes(h, buf, len), which
+  // already takes char[], byte[] and int32 arrays (tc_ref_bytes gathers the
+  // low bytes). A second syscall for that would be a duplicate.
+  SYS_SERIAL_READ_ARR  = 555, // (h, arr_ref, n) -> int  bytes read (0 = nothing there)
   SYS_WEB_REPO_PULLDOWN = 280, // (gref, label_c, json_url_c, index_key_c, dest_path_c) -> void — Scripter smlpd()-style remote JSON directory picker
   SYS_SML_APPLY_PINS    = 281, // (path_c, rx, tx, smlf) -> int — idempotent SML descriptor pin substitution (%0?rxpin%/%0?txpin%/%0?smlf%, leading 0 optional). Inserts "; <template>" comment line above each active line on first call; rebuilds active line from template on subsequent calls. Values are substituted verbatim (e.g. tx=-1 becomes the literal "-1" which SML accepts as "no tx pin"); the original placeholder text is preserved only in the template comment. Returns # subs done, 0 = no change, -1 = err.
   SYS_SML_SCRIPTER_LOAD = 282, // (path_c) -> int — extract >F/>S sections from descriptor, compile to bytecode, run on EverySecond/Every100ms ticks. Subset: lnv0..lnv9, +=/-=/*=//=/=, +-*/% < <= > >= == !=, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX"). Returns # sections compiled (0..2), -1 = err.
@@ -2106,6 +2133,14 @@ static inline void tc_chart_response_reset(void) {
 }
 #define TC_MAX_SERIAL_PORTS 3
 static TasmotaSerial *tc_serial_ports[TC_MAX_SERIAL_PORTS] = {}; // TinyC serial ports (up to 3, one per handle)
+// ⚠️ Which pins each open port drives. TasmotaSerial does not expose them, and
+// patching a vendored library for a lookup would be the wrong place -- see the
+// pin check in SYS_SERIAL_BEGIN for why it has to be answerable at all.
+// {rx, tx}; -1 means "none" and never collides.
+// ⚠️ -1, NICHT 0. Ein mit {} vorbelegtes Feld steht auf 0, und GPIO 0 ist ein
+// gueltiger Pin -- die Sperre haette dann jedes serialBegin auf Pin 0
+// abgelehnt, solange irgendein Port offen ist.
+static int16_t tc_serial_pins[TC_MAX_SERIAL_PORTS][2] = {{-1,-1},{-1,-1},{-1,-1}};
 
 // Image store for dspLoadImage / dspPushImageRect (watchface backgrounds etc.)
 // Slots from imgCreate() additionally carry a RendererCanvas so that all
@@ -3892,7 +3927,30 @@ static void tc_udp_stop(void) {
     }
   }
   Tinyc->tcp_cli_slot = 0;
-  // Stop TCP server
+  // ⚠️⚠️ THE TCP SERVER USED TO BE TORN DOWN HERE, AND IT COST A WORKING
+  // BRIDGE. Two things were wrong with that: a TCP listener has nothing to do
+  // with stopping UDP, and -- unlike the UDP part three lines up -- it was
+  // NOT guarded by "does another slot still need this". tc_udp_stop() runs on
+  // EVERY slot unload, so unloading an unrelated slot 2 silently closed the
+  // port that slot 1 was serving on. Seen on 2026-09-13: TCUS still said
+  // "tcp 1" while port 2000 answered "connection refused", because the script
+  // has no way to notice. Now in tc_tcp_server_stop_if_unused(), called from
+  // the unload path with the same guard the UDP side has.
+}
+
+// Close the shared TCP listener -- but only when no OTHER slot is still
+// loaded. There is no per-VM "uses the server" flag to go by, so the
+// conservative test is the right one: a listener that outlives its script
+// costs one socket, a listener torn out from under a running script costs the
+// service.
+static void tc_tcp_server_stop_if_unused(void *ausser) {
+  if (!Tinyc) return;
+  for (int i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i] && (void *)Tinyc->slots[i] != ausser
+                        && Tinyc->slots[i]->loaded) {
+      return;                       // somebody else may be serving on it
+    }
+  }
   if (Tinyc->tcp_server) {
     Tinyc->tcp_client.stop();
     Tinyc->tcp_server->stop();
@@ -4510,12 +4568,36 @@ static void tc_close_vm_files(TcVM *owner) {
   tc_file_handle_unlock();
 }
 
+// ⚠️⚠️ CLOSING MUST NOT BE ABLE TO HANG. It used to call
+// TasmotaSerial::flush(), which on ESP32 drains the RX side with
+//     while (TSerial->available()) { TSerial->read(); }
+// -- an UNBOUNDED loop. Watched it stop dead on 2026-09-13: a script opened
+// two ports and closed them, the "serial port N closed" line never appeared,
+// and the slot reported Instr: 0 across two queries eight seconds apart. The
+// VM task was gone, and it took the whole device with it a minute later --
+// only a power cycle brought it back.
+//
+// A drain is a convenience, not a contract: whatever is still in the RX buffer
+// of a port that is being closed is by definition unwanted. So it gets a
+// CEILING. Anything beyond that is not a full buffer, it is a UART that keeps
+// answering "one more byte" -- and then stopping is exactly right.
 static void tc_serial_close(int h) {
   if (h >= 0 && h < TC_MAX_SERIAL_PORTS && tc_serial_ports[h]) {
+    // TX out first -- that side is bounded by the hardware FIFO.
     tc_serial_ports[h]->flush();
-    delay(50);
+    // ⚠️ Two ceilings, not one: a byte count AND a wall clock. A port that
+    // delivers endlessly would satisfy the byte count in microseconds; one
+    // that delivers slowly would sit here for its whole buffer.
+    uint32_t bis = millis() + 50;
+    int32_t rest = 4096;
+    while (rest-- > 0 && !TimeReached(bis)) {
+      if (!tc_serial_ports[h]->available()) { break; }
+      tc_serial_ports[h]->read();
+    }
     delete tc_serial_ports[h];
     tc_serial_ports[h] = nullptr;
+    tc_serial_pins[h][0] = -1;
+    tc_serial_pins[h][1] = -1;
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial port %d closed"), h);
   }
 }
@@ -6956,6 +7038,30 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (bufsize < 64) bufsize = 64;
       if (bufsize > 2048) bufsize = 2048;
       if (config < 0 || config > 23) config = 3;  // default 8N1
+      // ⚠️⚠️ THE SAME PIN MUST NOT GO TO TWO PORTS. On ESP32 every TinyC
+      // serial port is a hardware UART, and freeUart() hands them out from
+      // the top; pointing a second UART at a pin the first one drives leaves
+      // both in a state neither can leave. Measured on 2026-09-13 (S3): a
+      // script opened rx=-1/tx=17 and rx=17/tx=-1, got both handles back --
+      // but only ONE "opened" line appeared in the log, and closing them never
+      // returned. The next script then received UART0, i.e. the console, and
+      // the device stopped answering altogether. Only a power cycle helped.
+      //
+      // The check costs nothing and turns a wedged device into a -1 and a line
+      // in the log.
+      for (int i = 0; i < TC_MAX_SERIAL_PORTS; i++) {
+        if (!tc_serial_ports[i]) { continue; }
+        if ((rxpin >= 0 && (tc_serial_pins[i][0] == rxpin
+                         || tc_serial_pins[i][1] == rxpin)) ||
+            (txpin >= 0 && (tc_serial_pins[i][0] == txpin
+                         || tc_serial_pins[i][1] == txpin))) {
+          AddLog(LOG_LEVEL_ERROR,
+                 PSTR("TCC: serialBegin — pin %d/%d already used by port %d"),
+                 rxpin, txpin, i);
+          TC_PUSH(vm, -1);
+          goto serial_begin_fertig;
+        }
+      }
 #ifdef ESP32
       if (Is_gpio_used(rxpin) || Is_gpio_used(txpin)) {
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial warning — pins %d/%d may be in use"), rxpin, txpin);
@@ -6979,6 +7085,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           // misframed. See TasmotaSerial::setRxFifoFull doc comment.
           tc_serial_ports[slot]->setRxFifoFull(10);
 #endif
+          tc_serial_pins[slot][0] = (int16_t)rxpin;
+          tc_serial_pins[slot][1] = (int16_t)txpin;
           AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial[%d] opened rx=%d tx=%d baud=%d cfg=%d buf=%d hw=%d rxfifo=10"),
                  slot, rxpin, txpin, baud, config, bufsize, tc_serial_ports[slot]->hardwareSerial());
           TC_PUSH(vm, slot);
@@ -6992,6 +7100,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: serial alloc failed"));
         TC_PUSH(vm, -1);
       }
+      serial_begin_fertig:
       break;
     }
     case SYS_SERIAL_CLOSE: {
@@ -7070,19 +7179,94 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       }
       break;
     }
+    // ── Serial in Bloecken: ein Aufruf statt einer je Byte ────────────────
+    // Wort fuer Wort wie SYS_USB_READ/WRITE: die VM haelt EIN int32 je
+    // Element, auch fuer Bytes, also geht alles ueber einen Zwischenpuffer.
+    case SYS_SERIAL_READ_ARR: {
+      // serialReadArray(h, arr, n) -> bytes read
+      int32_t n   = TC_POP(vm);   // count
+      int32_t ref = TC_POP(vm);   // array
+      int32_t hh  = TC_POP(vm);   // handle
+      TasmotaSerial *p = tc_serial_get(hh);
+      if (!p || n <= 0) { TC_PUSH(vm, 0); break; }
+      // ⚠️ Never write past the array -- `n` comes from the program.
+      int32_t kap = tc_ref_maxlen(vm, ref);
+      if (n > kap) { n = kap; }
+      // ⚠️ Ask available() ONCE, not per byte: that second call per byte is
+      // the very reason this syscall exists.
+      int32_t da = p->available();
+      if (da < n) { n = da; }
+      // ⚠️⚠️ Do NOT write into the array by hand. The first attempt did
+      // `buf[i] = byte` through tc_resolve_ref(): right for an int32 array and
+      // WRONG for a packed byte[], where four bytes share one slot. The two
+      // kinds are told apart explicitly below.
+      TC_UBUF(tmp, 256);
+      int32_t gesamt = 0;
+      while (gesamt < n) {
+        int32_t teil = n - gesamt;
+        if (teil > (int32_t)sizeof(tmp)) { teil = sizeof(tmp); }
+        int32_t k = 0;
+        while (k < teil) {
+          int c = p->read();
+          if (c < 0) { break; }          // nothing left -- do NOT wait
+          tmp[k] = (uint8_t)(c & 0xFF);
+          k++;
+        }
+        if (k <= 0) { break; }
+        // ⚠️ Write back at offset `gesamt`. tc_ref_put_bytes() has no offset
+        // argument, so the two array kinds are handled here directly rather
+        // than by moving the ref (which would be a different array).
+        if (tc_ref_is_bytes(ref)) {
+          int32_t *basis = tc_resolve_ref(vm, ref);
+          if (!basis) { break; }
+          memcpy((uint8_t *)basis + gesamt, tmp, (size_t)k);
+        } else {
+          int32_t *basis = tc_resolve_ref(vm, ref);
+          if (!basis) { break; }
+          for (int32_t i = 0; i < k; i++) { basis[gesamt + i] = (int32_t)tmp[i]; }
+        }
+        gesamt += k;
+        if (k < teil) { break; }
+      }
+      TC_PUSH(vm, gesamt);
+      break;
+    }
     case SYS_SERIAL_WRITE_BUF: {
       // serialWriteBytes(h, buf_ref, len) — write exactly len bytes (binary safe)
       b = TC_POP(vm);  // len
       a = TC_POP(vm);  // buf_ref
       int hh = TC_POP(vm);  // handle
       TasmotaSerial *p = tc_serial_get(hh);
-      if (p && b > 0 && b <= 256) {
-        // accepts char[] OR byte[]: tc_ref_bytes points into a byte[] region
-        // directly and gathers the low bytes of an int32 array into tbuf.
-        TC_UBUF(tbuf, 256);
-        int32_t n = 0;
-        uint8_t *bp = tc_ref_bytes(vm, a, b, tbuf, sizeof(tbuf), &n);
-        if (bp && n > 0) p->write(bp, n);
+      // ⚠️⚠️ This used to read `b <= 256`, and longer meant writing NOTHING
+      // AT ALL. No error, no return value (the function returns void), just
+      // silence -- hand a 1024-byte block from a bridge to it and the whole
+      // block disappears, with the wire the obvious place to look. It now
+      // writes in chunks, as many as it takes.
+      if (p && b > 0) {
+        const int32_t kap = tc_ref_maxlen(vm, a);
+        if (b > kap) { b = kap; }
+        if (tc_ref_is_bytes(a)) {
+          // Packed byte[]: the bytes already sit that way in memory, so they
+          // go out in ONE write -- no length limit.
+          int32_t *basis = tc_resolve_ref(vm, a);
+          if (basis && b > 0) { p->write((uint8_t *)basis, (size_t)b); }
+        } else {
+          // int32 array: gather the low bytes, chunk by chunk.
+          int32_t *basis = tc_resolve_ref(vm, a);
+          if (basis) {
+            TC_UBUF(tbuf, 256);
+            int32_t ab = 0;
+            while (ab < b) {
+              int32_t teil = b - ab;
+              if (teil > (int32_t)sizeof(tbuf)) { teil = sizeof(tbuf); }
+              for (int32_t k = 0; k < teil; k++) {
+                tbuf[k] = (uint8_t)(basis[ab + k] & 0xFF);
+              }
+              p->write(tbuf, (size_t)teil);
+              ab += teil;
+            }
+          }
+        }
       }
       break;
     }
@@ -7709,6 +7893,92 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
     // storage). LittleFS/FFat do it natively. The target is NOT overwritten
     // silently: if it exists the call returns -1 -- otherwise a typo in the
     // target name could destroy data.
+    // ── FTDI am USB-Host ──────────────────────────────────────────────────
+    case SYS_USB_INIT:
+    case SYS_USB_STATE:
+    case SYS_USB_AVAILABLE:
+    case SYS_USB_CLOSE:
+    case SYS_USB_DEINIT: {
+#ifdef USE_TINYC_USBSERIAL
+      if (id == SYS_USB_INIT)            { TC_PUSH(vm, TcUsbInit() ? 1 : 0); }
+      else if (id == SYS_USB_STATE)      { TC_PUSH(vm, TcUsb.state); }
+      else if (id == SYS_USB_AVAILABLE)  { TC_PUSH(vm, TcUsbAvailable()); }
+      else if (id == SYS_USB_CLOSE)      { TcUsbClose(); TC_PUSH(vm, 0); }
+      else                               { TcUsbDeinit(); TC_PUSH(vm, 0); }
+#else
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_USB_OPEN: {
+#ifdef USE_TINYC_USBSERIAL
+      int32_t baud = TC_POP(vm);
+      if (baud <= 0) { baud = 115200; }
+      TC_PUSH(vm, TcUsbOpen((uint32_t)baud) ? 1 : 0);
+#else
+      TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    case SYS_USB_INFO: {
+#ifdef USE_TINYC_USBSERIAL
+      int32_t sel = TC_POP(vm);
+      int32_t w = 0;
+      switch (sel) {
+        case 0: w = TcUsb.vid; break;
+        case 1: w = TcUsb.pid; break;
+        case 2: w = (int32_t)TcUsb.rx; break;
+        case 3: w = (int32_t)TcUsb.tx; break;
+        case 4: w = (int32_t)TcUsb.verloren; break;
+        default: w = 0; break;
+      }
+      TC_PUSH(vm, w);
+#else
+      TC_POP(vm);
+      TC_PUSH(vm, 0);
+#endif
+      break;
+    }
+
+    // Word for word like SYS_SPP_READ/WRITE: the VM stores ONE int32 per
+    // element, byte data included, so everything goes through a scratch
+    // buffer.
+    case SYS_USB_READ:
+    case SYS_USB_WRITE: {
+#ifdef USE_TINYC_USBSERIAL
+      int32_t n = TC_POP(vm);
+      int32_t ref = TC_POP(vm);
+      int32_t *buf = tc_resolve_ref(vm, ref);
+      if (!buf || n <= 0) { TC_PUSH(vm, (id == SYS_USB_READ) ? 0 : -1); break; }
+      int32_t kap = tc_ref_maxlen(vm, ref);
+      if (n > kap) { n = kap; }
+      TC_UBUF(tmp, 256);
+      int32_t gesamt = 0;
+      while (gesamt < n) {
+        int32_t teil = n - gesamt;
+        if (teil > (int32_t)sizeof(tmp)) { teil = sizeof(tmp); }
+        if (id == SYS_USB_READ) {
+          uint16_t got = TcUsbPull(tmp, (uint16_t)teil);
+          if (!got) { break; }                        // nichts mehr da — NICHT warten
+          for (uint16_t i = 0; i < got; i++) { buf[gesamt + i] = (int32_t)tmp[i]; }
+          gesamt += got;
+        } else {
+          for (int32_t i = 0; i < teil; i++) { tmp[i] = (uint8_t)(buf[gesamt + i] & 0xFF); }
+          if (TcUsbWrite(tmp, (uint16_t)teil) < 0) { gesamt = -1; break; }
+          gesamt += teil;
+        }
+      }
+      TC_PUSH(vm, gesamt);
+#else
+      TC_POP(vm); TC_POP(vm);
+      TC_PUSH(vm, (id == SYS_USB_READ) ? 0 : -1);
+#endif
+      break;
+    }
+
     case SYS_SPP_INIT:
     case SYS_SPP_STATE:
     case SYS_SPP_AVAILABLE:
@@ -12938,15 +13208,28 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: CSI capture timeout (slot %d)"), slot + 1);
             res = 0; break;
           }
+          // ⚠️⚠️ THE REALLOC MUST SIT INSIDE THE `writing` WINDOW.
+          // A larger frame frees the slot buffer and allocates a new one. That
+          // used to happen BEFORE writing=1, so a reader (the MJPEG stream, the
+          // motion detector, the person detector) could memcpy out of memory
+          // that had just been freed — and `len` still held the OLD length, so
+          // it copied the old number of bytes out of a buffer that no longer
+          // existed. Seen live on 16.09.2026 as "jpeg decode failed" on roughly
+          // every fourth person-detect run; the same hazard was there for the
+          // stream, only nobody decoded its output and noticed.
+          // Raising the flag first makes the existing copy-then-recheck pattern
+          // in the readers actually sound: if a realloc starts while they copy,
+          // they see writing=1 on the recheck and discard the frame.
+          tc_cam_slot[slot].writing = 1;
           if (tc_cam_slot[slot].buf && tc_cam_slot[slot].len < clen) {
             free(tc_cam_slot[slot].buf);
             tc_cam_slot[slot].buf = nullptr;
+            tc_cam_slot[slot].len = 0;   // never advertise a length we cannot serve
           }
           if (!tc_cam_slot[slot].buf) {
             tc_cam_slot[slot].buf = (uint8_t*)heap_caps_malloc(clen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
           }
           if (tc_cam_slot[slot].buf) {
-            tc_cam_slot[slot].writing = 1;
             memcpy(tc_cam_slot[slot].buf, cbuf, clen);
             tc_cam_slot[slot].len = clen;
             tc_cam_slot[slot].width = cw;
@@ -12955,6 +13238,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             res = (int32_t)clen;
           } else {
             tc_cam_slot[slot].len = 0;
+            tc_cam_slot[slot].writing = 0;
             res = -1;
             AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cam slot %d PSRAM alloc failed (%d bytes)"), slot + 1, clen);
           }
@@ -12965,15 +13249,28 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             res = 0; break;
           }
           // (Re)allocate PSRAM slot if needed
+          // ⚠️⚠️ THE REALLOC MUST SIT INSIDE THE `writing` WINDOW.
+          // A larger frame frees the slot buffer and allocates a new one. That
+          // used to happen BEFORE writing=1, so a reader (the MJPEG stream, the
+          // motion detector, the person detector) could memcpy out of memory
+          // that had just been freed — and `len` still held the OLD length, so
+          // it copied the old number of bytes out of a buffer that no longer
+          // existed. Seen live on 16.09.2026 as "jpeg decode failed" on roughly
+          // every fourth person-detect run; the same hazard was there for the
+          // stream, only nobody decoded its output and noticed.
+          // Raising the flag first makes the existing copy-then-recheck pattern
+          // in the readers actually sound: if a realloc starts while they copy,
+          // they see writing=1 on the recheck and discard the frame.
+          tc_cam_slot[slot].writing = 1;
           if (tc_cam_slot[slot].buf && tc_cam_slot[slot].len < fb->len) {
             free(tc_cam_slot[slot].buf);
             tc_cam_slot[slot].buf = nullptr;
+            tc_cam_slot[slot].len = 0;   // never advertise a length we cannot serve
           }
           if (!tc_cam_slot[slot].buf) {
             tc_cam_slot[slot].buf = (uint8_t*)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
           }
           if (tc_cam_slot[slot].buf) {
-            tc_cam_slot[slot].writing = 1;
             memcpy(tc_cam_slot[slot].buf, fb->buf, fb->len);
             tc_cam_slot[slot].len = fb->len;
             tc_cam_slot[slot].width = fb->width;
@@ -12982,6 +13279,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             res = (int32_t)fb->len;
           } else {
             tc_cam_slot[slot].len = 0;
+            tc_cam_slot[slot].writing = 0;
             res = -1;
             AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cam slot %d PSRAM alloc failed (%d bytes)"), slot + 1, fb->len);
           }
@@ -13131,6 +13429,23 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
 #endif
           break;
         }
+#ifdef USE_TINYC_ESPDL
+        case 21: {
+          // camControl(21, score_thr_x100, 0) — person detection on the
+          // current camera frame. Returns the number of hits, <0 on error.
+          // ⚠️ This takes roughly 470 ms (JPEG decode + network) and runs in
+          // the CALLING context — from a script call it in TaskLoop, never in
+          // EverySecond, or the main loop stalls for that long.
+          res = tc_dl_person_run(p1);
+          break;
+        }
+        case 22: {
+          // camControl(22, sel, 0) — read the result:
+          // 0=count 1=best score x100 2..5=box x,y,w,h 6=net ms 7=jpeg ms
+          res = tc_dl_person_get(p1);
+          break;
+        }
+#endif
 #endif // USE_WEBCAM || USE_TINYC_CAMERA
         default:
           AddLog(LOG_LEVEL_ERROR, PSTR("TCC: camControl unknown sel=%d"), sel);
@@ -15664,7 +15979,19 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!conn && r == 1) {
         Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 2;  // PEER_CLOSED
       }
-      TC_PUSH(vm, conn ? 1 : 0);
+      // ⚠️ WHAT COMES BACK IS THE ACTIVE CLIENT, not just the outgoing one.
+      // Reading, writing and tcpAvailable() have long fallen back on slot 0
+      // to the client accepted by the server (TC_TCP_ACTIVE_CLIENT);
+      // tcpConnected() was the only one that did not. A pure server script
+      // could therefore not find out whether anybody was attached — it read
+      // and wrote over the connection and still got 0 when it asked.
+      // Seen 2026-09-12 on the FTDI bridge: the status row reported
+      // "waiting on port 2000" while data was flowing.
+      //
+      // ⚠️ The reason bookkeeping above stays with the OUTGOING client: it
+      // belongs to `tcp_cli_reason[slot]`, and an accepted server client must
+      // not mask an outgoing slot's transition to PEER_CLOSED.
+      TC_PUSH(vm, TC_TCP_ACTIVE_CLIENT() != nullptr ? 1 : 0);
       break;
     }
     case SYS_TCP_SELECT: {  // tcpSelect(slot) — select outgoing TCP client slot
@@ -20994,6 +21321,7 @@ static void TinyCStopVM(TcSlot *s) {
       tc_udp_stop();
     }
   }
+  tc_tcp_server_stop_if_unused((void *)s);
   tc_spi_cleanup();
   tc_serial_close_all();
   tc_img_store_free();
