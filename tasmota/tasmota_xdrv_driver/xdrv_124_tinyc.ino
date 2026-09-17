@@ -433,6 +433,10 @@ static void TinyCSaveSettings(void) {
   }
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
+#ifdef ESP32
+  // And the malloc() PSRAM limit (TinyCPsram); 0 = framework default, not written.
+  if (Tinyc->psram_limit) f.printf("_psram,%d\n", Tinyc->psram_limit);
+#endif
   f.close();
   // Autoexec on again anywhere? Then the boot-loop explanation has served its purpose. Note this
   // runs on the load path too (stale entries), but there every autoexec is already 0 after a wipe.
@@ -714,6 +718,19 @@ static void TinyCLoadSettings(void) {
       Tinyc->show_info = (autoexec != 0);
       continue;
     }
+#ifdef ESP32
+    // _psram,<limit>: the malloc() PSRAM limit (TinyCPsram) -- applied right
+    // here, before any slot loads, so the slots' own allocations follow it too.
+    if (fname == "_psram") {
+      Tinyc->psram_limit = (uint16_t)((autoexec < 0) ? 0 : (autoexec > 65535 ? 65535 : autoexec));
+      if (Tinyc->psram_limit && UsePSRAM()) {
+        heap_caps_malloc_extmem_enable(Tinyc->psram_limit);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (TinyCPsram)"),
+               (unsigned)Tinyc->psram_limit);
+      }
+      continue;
+    }
+#endif
 
     if (slot >= TC_MAX_VMS) break;
 
@@ -1086,7 +1103,7 @@ void CmndMatterCryptoTest(void);
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
   "|Run|Stop|Reset|Exec|Info|Ide|Unload"
 #ifdef ESP32
-  "|Chkpt|Stack|HttpRx"
+  "|Chkpt|Stack|HttpRx|Heap|Psram"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
@@ -1103,7 +1120,7 @@ void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
   &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload
 #ifdef ESP32
-  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx
+  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
@@ -1511,10 +1528,16 @@ int32_t tc_dl_person_run(int32_t schwelle_x100) {
   } else {
     aus_b = breite / tc_dl_skala;
     aus_h = hoehe / tc_dl_skala;
-    esp_jpeg_image_scale_t sc = (2 == tc_dl_skala) ? JPG_SCALE_2X
-                              : (4 == tc_dl_skala) ? JPG_SCALE_4X : JPG_SCALE_8X;
     rgb = (uint8_t *)heap_caps_malloc(aus_b * aus_h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (rgb) { ok = jpg2rgb565(jpg, len, rgb, sc); }
+    // The scale enum is named differently by the two JPEG decoders Tasmota
+    // builds with (esp32-camera: esp_jpeg_image_scale_t, ESP32_JPDEC:
+    // jpg_scale_t); the JPG_SCALE_* constants exist in both, so pass them
+    // directly instead of naming the type.
+    if (rgb) {
+      if (2 == tc_dl_skala)      { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_2X); }
+      else if (4 == tc_dl_skala) { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_4X); }
+      else                       { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_8X); }
+    }
   }
   tc_dl_erg.ms_jpeg = millis() - t0;
   free(jpg);
@@ -2057,6 +2080,104 @@ void CmndTinyCInfo(void) {
   }
   ResponseCmndNumber(Tinyc->show_info ? 1 : 0);
 }
+
+#ifdef ESP32
+// ── Heap diagnostics: TinyCHeap ─────────────────────────────────────────────
+//
+// Free heap alone says nothing about fragmentation; the largest free block says
+// the effect but not the cause. This walks the INTERNAL heap (heap_caps_walk,
+// IDF 5.x) and bins every block by size, used and free separately, so the
+// shape of the damage becomes visible: hundreds of small used blocks with
+// small holes between them is a different disease from a few big transient
+// buffers punching through -- and the cure differs (see TinyCPsram).
+//
+// .102 (RA8876 dashboard, S3, 6 MB PSRAM): 198 kB free, largest block 31 kB,
+// frag 85 % after three days -- while 4.9 MB of PSRAM sat idle.
+struct TcHeapBins {
+  uint32_t used_n[7], used_b[7], free_n[7], free_b[7];
+  uint32_t used_total, free_total;
+};
+static const uint32_t tc_heap_bin_edges[6] = { 32, 128, 512, 2048, 8192, 32768 };
+static int tc_heap_bin(size_t sz) {
+  for (int i = 0; i < 6; i++) if (sz < tc_heap_bin_edges[i]) return i;
+  return 6;
+}
+static bool tc_heap_walker(walker_heap_into_t heap, walker_block_info_t blk, void *user) {
+  TcHeapBins *b = (TcHeapBins *)user;
+  int i = tc_heap_bin(blk.size);
+  if (blk.used) { b->used_n[i]++; b->used_b[i] += blk.size; b->used_total++; }
+  else          { b->free_n[i]++; b->free_b[i] += blk.size; b->free_total++; }
+  return true;
+}
+// Bin labels: <32, <128, <512, <2k, <8k, <32k, >=32k
+static void tc_heap_bins_json(const char *name, const uint32_t *n, const uint32_t *b) {
+  ResponseAppend_P(PSTR(",\"%s\":{\"n\":[%u,%u,%u,%u,%u,%u,%u],\"b\":[%u,%u,%u,%u,%u,%u,%u]}"), name,
+    n[0], n[1], n[2], n[3], n[4], n[5], n[6], b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+}
+void CmndTinyCHeap(void) {
+  multi_heap_info_t in;
+  heap_caps_get_info(&in, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  TcHeapBins bins; memset(&bins, 0, sizeof(bins));
+  heap_caps_walk(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, tc_heap_walker, &bins);
+  Response_P(PSTR("{\"TinyCHeap\":{\"internal\":{\"free\":%u,\"largest\":%u,\"min_free\":%u,"
+                  "\"alloc_blocks\":%u,\"free_blocks\":%u,\"frag\":%u"),
+    (unsigned)in.total_free_bytes, (unsigned)in.largest_free_block, (unsigned)in.minimum_free_bytes,
+    (unsigned)in.allocated_blocks, (unsigned)in.free_blocks,
+    (unsigned)(in.total_free_bytes ? 100 - (uint64_t)in.largest_free_block * 100 / in.total_free_bytes : 0));
+  tc_heap_bins_json("used", bins.used_n, bins.used_b);
+  tc_heap_bins_json("holes", bins.free_n, bins.free_b);
+  ResponseAppend_P(PSTR(",\"bins\":\"<32,<128,<512,<2k,<8k,<32k,>=32k\"}"));
+  if (UsePSRAM()) {
+    multi_heap_info_t ps;
+    heap_caps_get_info(&ps, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ResponseAppend_P(PSTR(",\"psram\":{\"free\":%u,\"largest\":%u,\"alloc_blocks\":%u,\"free_blocks\":%u}"),
+      (unsigned)ps.total_free_bytes, (unsigned)ps.largest_free_block,
+      (unsigned)ps.allocated_blocks, (unsigned)ps.free_blocks);
+  }
+  ResponseAppend_P(PSTR(",\"psram_limit\":%u}}"), (unsigned)(Tinyc ? Tinyc->psram_limit : 0));
+}
+
+// ── TinyCPsram <limit>: where malloc() goes ─────────────────────────────────
+//
+// The framework is built with CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096: every
+// malloc() BELOW 4 kB lands in internal DRAM, everything at or above goes to
+// PSRAM first. That constant is baked into the prebuilt heap component, but
+// the SAME limit is settable at run time: heap_caps_malloc_extmem_enable()
+// (psramInit() calls it once with the Kconfig value). Lowering it moves the
+// mid-sized churn -- Strings, JSON, web responses, TLS records -- out of the
+// internal heap, whose free space then stops being carved into 31 kB islands.
+//
+// What it does NOT touch: DMA buffers (asked for with MALLOC_CAP_DMA / _INTERNAL
+// explicitly), FreeRTOS task stacks (the kernel allocates them internal), and
+// anything below the limit. Flash writes from a PSRAM buffer are bounced by
+// esp_flash. Persisted in /tinyc.cfg as `_psram,<limit>`; 0 = framework default.
+// Applied at boot in TinyCLoadSettings() and immediately by the command.
+//
+// ottelo: the Kconfig constant only exists in framework builds WITH PSRAM
+// support. ESP32-C3/-C6 have no CONFIG_SPIRAM at all, so the reference below
+// did not compile there ("not declared in this scope"). UsePSRAM() is false on
+// those chips at run time anyway -- the fallback only has to satisfy the
+// compiler. 4096 is the framework's value (see the comment above).
+#ifndef CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
+#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096
+#endif
+void CmndTinyCPsram(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  if (XdrvMailbox.data_len > 0) {
+    int32_t v = XdrvMailbox.payload;
+    if (v < 0) v = 0;
+    if (v > 65535) v = 65535;
+    Tinyc->psram_limit = (uint16_t)v;
+    if (UsePSRAM()) {
+      heap_caps_malloc_extmem_enable(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+    }
+#ifdef USE_UFILESYS
+    TinyCSaveSettings();
+#endif
+  }
+  ResponseCmndNumber(Tinyc->psram_limit);
+}
+#endif // ESP32
 
 /*********************************************************************************************\
  * Tasmota: Web interface
@@ -3965,6 +4086,16 @@ static void HandleTinyCApi(void) {
       result += String(frag);
       result += F(",\"maxblk\":");               // absolute largest block; frag% is only maxblk/free, so this is what to watch
       result += String(maxblk);
+#ifdef ESP32
+      // Block counts of the INTERNAL heap: the shape of the fragmentation, not
+      // just its effect. TinyCHeap has the size histogram.
+      multi_heap_info_t in;
+      heap_caps_get_info(&in, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      result += F(",\"blocks\":");
+      result += String((unsigned)in.allocated_blocks);
+      result += F(",\"holes\":");
+      result += String((unsigned)in.free_blocks);
+#endif
     }
     result += '}';
     Webserver->send(200, F("application/json"), result);
