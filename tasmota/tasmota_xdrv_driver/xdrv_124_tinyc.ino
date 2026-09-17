@@ -723,11 +723,17 @@ static void TinyCLoadSettings(void) {
     // here, before any slot loads, so the slots' own allocations follow it too.
     if (fname == "_psram") {
       Tinyc->psram_limit = (uint16_t)((autoexec < 0) ? 0 : (autoexec > 65535 ? 65535 : autoexec));
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+      // ⚠️ Compile-time guard, not just UsePSRAM(): a build without PSRAM
+      // (C3, C6) has neither CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL nor the
+      // heap_caps_malloc_extmem_enable() body -- the first C3 build after
+      // this command went in broke on the missing name (Hans, 17.09.2026).
       if (Tinyc->psram_limit && UsePSRAM()) {
         heap_caps_malloc_extmem_enable(Tinyc->psram_limit);
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (TinyCPsram)"),
                (unsigned)Tinyc->psram_limit);
       }
+#endif
       continue;
     }
 #endif
@@ -2152,17 +2158,11 @@ void CmndTinyCHeap(void) {
 // anything below the limit. Flash writes from a PSRAM buffer are bounced by
 // esp_flash. Persisted in /tinyc.cfg as `_psram,<limit>`; 0 = framework default.
 // Applied at boot in TinyCLoadSettings() and immediately by the command.
-//
-// ottelo: the Kconfig constant only exists in framework builds WITH PSRAM
-// support. ESP32-C3/-C6 have no CONFIG_SPIRAM at all, so the reference below
-// did not compile there ("not declared in this scope"). UsePSRAM() is false on
-// those chips at run time anyway -- the fallback only has to satisfy the
-// compiler. 4096 is the framework's value (see the comment above).
-#ifndef CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
-#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096
-#endif
 void CmndTinyCPsram(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+  // Only a PSRAM-capable build has the framework limit and the setter (see
+  // the guard in TinyCLoadSettings); everywhere else the command says so.
   if (XdrvMailbox.data_len > 0) {
     int32_t v = XdrvMailbox.payload;
     if (v < 0) v = 0;
@@ -2176,6 +2176,9 @@ void CmndTinyCPsram(void) {
 #endif
   }
   ResponseCmndNumber(Tinyc->psram_limit);
+#else
+  ResponseCmndChar_P(PSTR("no PSRAM in this build"));
+#endif
 }
 #endif // ESP32
 
