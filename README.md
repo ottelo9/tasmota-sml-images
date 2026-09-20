@@ -3,7 +3,7 @@
 
 ## Tasmota Images (Firmware) mit SML/Script Support [by ottelo]
 Die fertigen Images findet ihr im Release Bereich. Einfach das korrekte Image für euren ESP herunterladen, entpacken und entweder über OTA oder über einen Flasher+Kabel übertragen.
-Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/). Welche Tasmota Features aktiviert/deaktiviert sind findet ihr im Release.  
+Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/) -> eine neue Kurzanleitung nur für TinyC findet ihr [hier](https://ottelo.jimdofree.com/tasmota-tinyc/) oder hier auf dieser Seite. Welche Tasmota Features aktiviert/deaktiviert sind findet ihr im Release.  
   
 [Download Statistik](https://tooomm.github.io/github-release-stats/?username=ottelo9&repository=tasmota-sml-images)  
 [ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
@@ -44,8 +44,8 @@ Den Sourcecode der Programme findet ihr [hier](https://github.com/ottelo9/tasmot
 [Kompatible Akku Liste](https://github.com/ottelo9/tasmota-sml-script/blob/main/README.md#pvakku-powermeter-emulator-esp32)  
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas findet ihr im [ESP8266 Ordner](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266/pvakku-powermeter-emulator/komprimiert)). Die Scripte findet ihr direkt auf euren ESP in Tasmota (DropDown) oder [hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
 
-## TinyC - Alternative zum Scripting/Berry (nur ESP32)
-**TinyC** von [gemu2015](https://github.com/gemu2015) — eine sehr gute und schnelle Alternative zum Scripting/Berry.  
+### TinyC (löst Script ab!)
+Ich habe fast alle meine Tasmota Scripte von inkl. den Ecotracker/Shelly Emulatoren auf TinyC konvertiert. Wenn ihr neu dabei seid, würde ich euch empfehlen direkt mit TinyC anzufangen statt Script.  
 
 **Image-Variante wählen:**  
 Es gibt pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wie bisher) oder `*_ottelo_tc` mit TinyC ohne Scripter. Beides gleichzeitig biete ich nicht an. ESP8266 gibt es nur als `_tas`.
