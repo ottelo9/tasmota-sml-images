@@ -3414,12 +3414,14 @@ nexit:
             }
           }
           skip:
+          JsonParserToken jtok = (*jpo)[vn];
           if (ja) {
             // json array
-            str_value = (*jpo)[vn].getArray()[aindex].getStr();
+            jtok = jtok.getArray()[aindex];
+            str_value = jtok.getStr();
           }
           if (str_value && *str_value) {
-            if ((*jpo)[vn].isStr()) {
+            if (jtok.isStr()) {
               if (!strncmp_XP(str_value, XPSTR("ON"), 2)) {
                 if (fp) *fp = 1;
                 goto nexit;
@@ -3434,6 +3436,12 @@ nexit:
                 return lp + len;
               }
 
+            } else if (jtok.isBool() || jtok.isNull()) {
+              // JSON literals true/false/null are unquoted and fell through to
+              // CharToFloat("false") == 0 before, so a boolean was always 0.
+              // Map true -> 1, false -> 0, null -> 0 (github discussion #25038).
+              if (fp) *fp = jtok.getBool();
+              goto nexit;
             } else {
               if (fp) {
                 if (!strncmp_XP(vn.c_str(), XPSTR("Epoch"), 5)) {
@@ -6906,7 +6914,10 @@ void tmod_directModeOutput(uint32_t pin);
               int32_t packetSize = glob_script_mem.Script_PortUdp_1->parsePacket();
               if (packetSize > 0) {
                 char packet[SCRIPT_MAX_SBSIZE];
-                int32_t len = glob_script_mem.Script_PortUdp_1->read(packet, SCRIPT_MAX_SBSIZE);
+                // one byte less than the buffer: the terminating 0 must fit too,
+                // and read() returns -1 on error (ottelo / next145)
+                int32_t len = glob_script_mem.Script_PortUdp_1->read(packet, SCRIPT_MAX_SBSIZE - 1);
+                if (len < 0) len = 0;
                 packet[len] = 0;
                 if (sp) strlcpy(sp, packet, glob_script_mem.max_ssize);
               } else {
@@ -8634,6 +8645,13 @@ int16_t Run_script_sub(const char *type, int8_t tlen, struct GVARS *gv) {
 
     TS_FLOAT fvar = 0, fvar1, sysvar, swvar;
     uint8_t section = 0, sysv_type = 0, swflg = 0;
+#ifdef SCRIPT_LOCAL_NVARS
+    // Index of an lnvX/lsvX assignment target. glob_script_mem.lvindex is
+    // shared: evaluating a right-hand side that also reads lnv/lsv overwrites
+    // it, so "lnv0=lnv1+1" wrote to lnv1. Latched right after the target
+    // is parsed and used for the write-back.
+    uint8_t lv_dest = 0;
+#endif
 
     char *lp;
     if (tlen == 0) {
@@ -9247,6 +9265,9 @@ chk_switch:
             } else {
               char *vnp = lp;
               lp = isvar(lp, &vtype, &ind, &sysvar, 0, gv);
+#ifdef SCRIPT_LOCAL_NVARS
+              lv_dest = glob_script_mem.lvindex;
+#endif
               if (vtype != VAR_NV) {
 #ifdef USE_SCRIPT_GLOBVARS
                   char varname[16];
@@ -9459,7 +9480,7 @@ chk_switch:
 
 #ifdef SCRIPT_LOCAL_NVARS
                           case SCRIPT_LOCVARS:
-                            glob_script_mem.locvars[glob_script_mem.lvindex] = *dfvar;
+                            glob_script_mem.locvars[lv_dest] = *dfvar;
                             break;
 #endif
 
@@ -9528,8 +9549,8 @@ chk_switch:
                       } else {
                         char *cp = glob_script_mem.glob_snp + (sindex * glob_script_mem.max_ssize);
 #ifdef SCRIPT_LOCAL_NVARS
-                        if ((sysv_type == SCRIPT_LOCSVARS) && glob_script_mem.locsvars[glob_script_mem.lvindex]) {
-                          cp = glob_script_mem.locsvars[glob_script_mem.lvindex];
+                        if ((sysv_type == SCRIPT_LOCSVARS) && glob_script_mem.locsvars[lv_dest]) {
+                          cp = glob_script_mem.locsvars[lv_dest];
                           sysv_type = 0;
                         }
 #endif
@@ -12687,8 +12708,14 @@ const char SML_SCRIPT_TEXT[] PROGMEM =
   "var selSM=eb('idSelSM');"
   "var text;"
   "selSM.onchange=function(){"
-  "var index=selSM.selectedIndex;"
+  // The stored value is the entry's KEY: its "id" if the JSON has one, else its position
+  // (ottelo, 2026-09-30: with positions a meter inserted in the middle of the list made
+  // every device after it show the wrong name). o.value stays the filename.
+  "var index=selSM.options[selSM.selectedIndex].dataset.k;"
   "pr(1);"
+  // An entry with "keep":1 and an empty filename is selectable but downloads nothing: only the
+  // key is stored (ottelo: "no list meter, I write /sml_meter.def myself")
+  "if(selSM.value==''&&index!==undefined){smlp(null,index);return;}"
   "var path='%s/'+selSM.value;"
   "text=fetch(path,{cache:'no-store'}).then(response=>response.text()).then(content=>{text=content;smlp(text,index)});"
   "};"
@@ -12696,15 +12723,18 @@ const char SML_SCRIPT_TEXT[] PROGMEM =
   "if(data && data.smartmeter && data.smartmeter.length){"
   "while(selSM.options.length>1){selSM.options.remove(1);}"
   "for(let n=0;n<data.smartmeter.length;n++){"
-  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;if(data.smartmeter[n].filename==''){o.disabled=true;};selSM.options.add(o);"
-  "if (n==%d) {o.setAttribute('selected', true);}"
+  "let e=data.smartmeter[n];let k=(e.id!==undefined)?e.id:n;"
+  "let o=document.createElement('option');o.value=e.filename;o.text=e.label;o.dataset.k=k;if(e.filename==''&&!e.keep){o.disabled=true;};selSM.options.add(o);"
+  "if (k==%d) {o.setAttribute('selected', true);}"
   "}}});"
   "function smlp(txt,index){"
+  "if(txt!==null){"
   "x=new XMLHttpRequest();"
   "x.open('POST', '/smld?smlsav=%s');"
   "x.setRequestHeader('Accept','application/text');"
   "x.setRequestHeader('Content-Type','application/text');"
   "x.send(txt);"
+  "}"
   "setTimeout(seva, 500, index, '%s');"
   "}"
   "</script>";
@@ -14814,6 +14844,9 @@ void script_add_subpage(uint8_t num) {
 }
 #endif // SCRIPT_FULL_WEBPAGE
 
+// Marstek CT002 one-time cloud registration page /ctreg (next145, ESP8266 only)
+#include "include/xdrv_10_ct002_registration.h"
+
 /*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
@@ -15024,6 +15057,9 @@ bool Xdrv10(uint32_t function) {
       break;
 
     case FUNC_EVERY_SECOND:
+#ifdef USE_SCRIPT_CT002_REGISTRATION
+      CtRegEverySecond();
+#endif
       ScriptEverySecond();
       break;
     case FUNC_COMMAND:
@@ -15066,6 +15102,15 @@ bool Xdrv10(uint32_t function) {
       }
       break;
 #ifdef USE_WEBSERVER
+#ifdef USE_SCRIPT_CT002_REGISTRATION
+    case FUNC_WEB_ADD_MANAGEMENT_BUTTON:
+      if (XdrvMailbox.index) {
+        XdrvMailbox.index++;
+      } else {
+        WSContentSend_P(HTTP_BTN_CT002_REG);
+      }
+      break;
+#endif
     case FUNC_WEB_ADD_CONSOLE_BUTTON:
       if (XdrvMailbox.index) {
         XdrvMailbox.index++;
@@ -15095,6 +15140,10 @@ bool Xdrv10(uint32_t function) {
       break;
 #endif // USE_SCRIPT_WEB_DISPLAY
     case FUNC_WEB_ADD_HANDLER:
+#ifdef USE_SCRIPT_CT002_REGISTRATION
+      Webserver->on("/ctreg", HTTP_GET, HandleCt002Registration);
+      Webserver->on("/ctreg", HTTP_POST, HandleCt002Registration);
+#endif
       Webserver->on("/" WEB_HANDLE_SCRIPT, HandleScriptConfiguration);
       Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration, HandleScriptUpload);
 #ifdef USE_SML_SCRIPT_CMD

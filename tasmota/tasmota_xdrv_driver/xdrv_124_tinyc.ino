@@ -125,6 +125,10 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 // the USE_MATTER_C block (with the port wiring) a harmless no-op.
 #ifdef USE_MATTER_C
   #include "matter_c.h"
+  #ifdef USE_BINPLUGINS
+    // built-in lib or the MATTERF plugin, chosen at the first matter_init()
+    #include "include/xdrv_124_matter_dispatch.h"
+  #endif
   // Lazy start: Matter is compiled in but stays completely off (no mDNS, no UDP
   // socket, no fabric load, no advertising) until a TinyC script first uses an
   // mtr* syscall — same "off until enabled" model as HomeKit's hkStart(). These
@@ -142,12 +146,41 @@ static void (*const TinyCWebOnHandlers[])(void) = {
   extern "C" void *matter_special_malloc(size_t n) { return special_malloc(n); }
 #endif
 
+#ifdef ESP32
+// Take a TinyC VM mutex. On the loop task with the Matter plugin hand-over
+// (MTRC_MARSHAL, boards with XIP from PSRAM) it waits in 5 ms steps and runs
+// the Matter call another task is waiting for: that task may be the one
+// holding this mutex (a script's main() in its VM task calling matterAdd()),
+// and it waits for the loop task. Everywhere else: a plain blocking take.
+static inline void tc_vm_lock(SemaphoreHandle_t m) {
+#ifdef MTRC_MARSHAL
+  if (xTaskGetCurrentTaskHandle() == loopTaskHandle) {
+    while (xSemaphoreTake(m, pdMS_TO_TICKS(5)) != pdTRUE) { mtrc_run_job(); }
+    return;
+  }
+#endif
+  xSemaphoreTake(m, portMAX_DELAY);
+}
+#endif
+
 // Fork-owned TinyC-controlled MIPI-CSI camera (ESP32-P4). Included BEFORE the VM
 // header so its WcCsiCaptureJpeg / tcam_init / tcam_deinit / tcam_sensor_pid are
 // visible to the camControl dispatch. Compiles to nothing unless
 // USE_TINYC_CAMERA && !USE_CSI_WEBCAM on P4 — so the upstream xdrv_81 webcam driver
 // stays untouched and Tasmota initializes the camera at no point.
 #include "include/xdrv_124_tinyc_camera.h"
+
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA)) && !defined(CONFIG_IDF_TARGET_ESP32P4)
+// ⚠️ ONE JPEG DECODE AT A TIME (gemu 03.10.2026, DFR1154). The motion detector decodes the slot in
+// the MAIN LOOP every 500 ms (TC_CamMotionDetect), the person detector decodes it in the VM task
+// (tc_dl_person_run, ~250 ms). Run together, jpg2rgb565() failed in the person check about every
+// second time: error -4, "person detect error -4" in the log. Measured with a script that did
+// nothing but camControl(21) in a loop: motion on 27 of 50 failed, motion off 0 of 50, and the
+// same check from the main loop (where it cannot overlap) 0 of 60. The two now take turns: the
+// person check waits (it runs in the VM task), the motion sample is skipped when the decoder is
+// busy (it runs in the main loop and must not block it for 250 ms).
+static SemaphoreHandle_t tc_jpg_mutex = xSemaphoreCreateMutex();
+#endif
 
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
 #ifdef USE_TINYC_ESPDL
@@ -264,7 +297,7 @@ extern "C" {
     TcSlot *s = Tinyc->slots[0];
     if (!s || !s->loaded) return;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -319,7 +352,7 @@ static void tc_all_callbacks_str(const char *name, const char *str) {
     TcSlot *s = Tinyc->slots[i];
     if (!s || !s->loaded) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -344,7 +377,7 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
     TcSlot *s = Tinyc->slots[i];
     if (!s || !s->loaded) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -434,8 +467,10 @@ static void TinyCSaveSettings(void) {
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
 #ifdef ESP32
-  // And the malloc() PSRAM limit (TinyCPsram); 0 = framework default, not written.
-  if (Tinyc->psram_limit) f.printf("_psram,%d\n", Tinyc->psram_limit);
+  // And the malloc() PSRAM limit (TinyCPsram) -- only when it differs from the
+  // build default; an explicit 0 (framework 4096) IS written, or the default
+  // would come back at the next boot.
+  if (Tinyc->psram_limit != TC_PSRAM_DEFAULT) f.printf("_psram,%d\n", Tinyc->psram_limit);
 #endif
   f.close();
   // Autoexec on again anywhere? Then the boot-loop explanation has served its purpose. Note this
@@ -728,10 +763,13 @@ static void TinyCLoadSettings(void) {
       // (C3, C6) has neither CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL nor the
       // heap_caps_malloc_extmem_enable() body -- the first C3 build after
       // this command went in broke on the missing name (Hans, 17.09.2026).
-      if (Tinyc->psram_limit && UsePSRAM()) {
-        heap_caps_malloc_extmem_enable(Tinyc->psram_limit);
-        AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (TinyCPsram)"),
-               (unsigned)Tinyc->psram_limit);
+      // An explicit `_psram,0` means "framework default" and must UNDO the
+      // TC_PSRAM_DEFAULT applied at init -- hence the fallback to the Kconfig
+      // value instead of skipping the call.
+      if (UsePSRAM()) {
+        heap_caps_malloc_extmem_enable(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (TinyCPsram, /tinyc.cfg)"),
+               (unsigned)(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL));
       }
 #endif
       continue;
@@ -851,7 +889,15 @@ static void TinyCStartAutoexec(void) {
         uint32_t t0 = millis();
         TcSlot *as = Tinyc->slots[i];
         while (as && !as->main_done && (millis() - t0) < TC_BOOT_MAIN_WAIT_MS) {
+#ifdef MTRC_MARSHAL
+          // main() may itself wait for the loop task (matterAdd() through the
+          // Matter plugin hand-over): run that call here, otherwise both wait
+          // TC_BOOT_MAIN_WAIT_MS and the call is lost (.39: 2x add_endpoint)
+          mtrc_run_job();
+          delay(2);
+#else
           delay(20);
+#endif
         }
 #endif
       }
@@ -910,6 +956,18 @@ static void TinyCInit(void) {
   if (!tc_file_handle_mutex) tc_file_handle_mutex = xSemaphoreCreateMutex();
   // Pick up the configured stack size BEFORE the first slot starts.
   TinyCLoadStackCfg();
+  // The malloc() PSRAM limit: TC_PSRAM_DEFAULT on every PSRAM build, applied
+  // before /tinyc.cfg is read so a `_psram,<n>` line there can still override
+  // it (see TinyCLoadSettings). Guarded like the command: a build without
+  // PSRAM has neither the setter nor the Kconfig name (C3/C6, Hans 17.09.).
+  Tinyc->psram_limit = TC_PSRAM_DEFAULT;
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+  if (Tinyc->psram_limit && UsePSRAM()) {
+    heap_caps_malloc_extmem_enable(Tinyc->psram_limit);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (default, TinyCPsram)"),
+           (unsigned)Tinyc->psram_limit);
+  }
+#endif
 #endif
   // calloc() zeroes memory but doesn't call C++ constructors for embedded objects.
   // WiFiUDP (NetworkUDP) needs proper construction or begin() crashes (NULL deref).
@@ -1099,6 +1157,8 @@ void CmndTinyCDlCam(void);
 void CmndTinyCHttpRx(void);
 #endif
 void CmndTinyCUnload(void);
+void CmndTinyCUdp(void);
+void CmndTinyCStrict(void);
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -1107,7 +1167,7 @@ void CmndMatterCryptoTest(void);
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info|Ide|Unload"
+  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp|Strict"
 #ifdef ESP32
   "|Chkpt|Stack|HttpRx|Heap|Psram"
 #endif
@@ -1124,7 +1184,8 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
-  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload, &CmndTinyCUdp,
+  &CmndTinyCStrict
 #ifdef ESP32
   , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
 #endif
@@ -1527,6 +1588,8 @@ int32_t tc_dl_person_run(int32_t schwelle_x100) {
   uint32_t aus_b = breite, aus_h = hoehe;
   uint8_t *rgb = nullptr;
   bool ok = false;
+  // take turns with the motion detector's decode (see tc_jpg_mutex)
+  bool jm = tc_jpg_mutex && (xSemaphoreTake(tc_jpg_mutex, pdMS_TO_TICKS(1500)) == pdTRUE);
   uint32_t t0 = millis();
   if (0 == tc_dl_skala) {
     rgb = (uint8_t *)heap_caps_malloc(breite * hoehe * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1546,6 +1609,7 @@ int32_t tc_dl_person_run(int32_t schwelle_x100) {
     }
   }
   tc_dl_erg.ms_jpeg = millis() - t0;
+  if (jm) { xSemaphoreGive(tc_jpg_mutex); }
   free(jpg);
   if (!rgb) { return -2; }
   if (!ok) { free(rgb); return -4; }
@@ -1898,7 +1962,17 @@ void CmndTinyC(void) {
       tc_error_str(s->vm.error),
       s->filename[0] ? s->filename : "");
   }
-  ResponseAppend_P(PSTR("]}}"));
+  ResponseAppend_P(PSTR("]"));
+#ifdef MTRC_MARSHAL
+  // Matter plugin hand-over (XIP from PSRAM): losses since boot. The log line
+  // scrolls out of the buffer under Matter traffic; this one stays queryable.
+  {
+    const char *tn = mtrc_job_timeout_name;
+    ResponseAppend_P(PSTR(",\"MtrHandover\":{\"DgramDrops\":%u,\"UpdateDrops\":%u,\"CallTimeouts\":%u,\"LastTimeout\":\"%s\"}"),
+      (unsigned)mtrc_hq_drops, (unsigned)mtrc_dq_drops, (unsigned)mtrc_job_timeouts, tn ? tn : "");
+  }
+#endif
+  ResponseAppend_P(PSTR("}}"));
 }
 
 // Parse optional slot number from command payload: "TinyCRun [slot] [/file]"
@@ -2068,6 +2142,85 @@ void CmndTinyCUnload(void) {
              slot_num, (unsigned)hatte, (unsigned)ESP_getMaxAllocHeap());
 }
 
+#include <lwip/netif.h>
+#include <lwip/igmp.h>       // igmp_lookfor_group() for TinyCUdp
+// TinyCUdp -- the UDP global table: every name a slot registered, its last
+// value, how many packets carried it (rx) and how many reached at least one VM
+// (inj); plus totals. Written for .118 (2026-09-23), where some values never
+// showed although the multicast group carried them several times a minute.
+// One log line per name (the list does not fit a command response).
+// TinyCStrict 0 / 1: a string that has to be cut (strcpy/strcat into a
+// too-small array, a syscall's fixed buffer) only logs a line (0, default)
+// or halts the script with "String truncated" (1). Not saved: a restart
+// switches it off again, so a forgotten development setting cannot stop a
+// running installation. Build default: -DTINYC_STRICT=1.
+void CmndTinyCStrict(void) {
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+    tc_strict = (XdrvMailbox.payload == 1);
+  }
+  ResponseCmndNumber(tc_strict ? 1 : 0);
+}
+
+void CmndTinyCUdp(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+#ifdef ESP32
+  // TinyCUdp 1 / 0: receive through NetworkUDP (the path before 2026-09-23) or
+  // the plain lwIP socket -- an A/B switch for the next time reception looks
+  // wrong. Counters restart, the socket is rebuilt on the next poll.
+  // TinyCUdp 2 / 3: keep receiving during a blocking TLS transaction (the
+  // behaviour before 2026-07-06, suspected to crash the Powerwall slot) / pause
+  // the receive socket again (default).
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 2 || XdrvMailbox.payload == 3)) {
+    tc_udp_nopause = (XdrvMailbox.payload == 2);
+  }
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+    tc_udp_legacy = (XdrvMailbox.payload == 1);
+    if (Tinyc->udp_connected) { Tinyc->udp.flush(); Tinyc->udp.stop(); tc_udp_rx_close(); Tinyc->udp_connected = false; }
+    Tinyc->udp_rx_total = Tinyc->udp_rx_unknown = Tinyc->udp_rx_skip = 0;
+    Tinyc->udp_polls = Tinyc->udp_pkts = Tinyc->udp_raw = 0;
+  }
+#endif
+  uint32_t n = 0;
+  if (Tinyc->udp_vars) {
+    for (int i = 0; i < TC_UDP_MAX_VARS; i++) {
+      TcUdpVar *v = &Tinyc->udp_vars[i];
+      if (!v->used) continue;
+      n++;
+      char val[24];
+      dtostrfd(v->value, 3, val);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP %-10s %14s  rx %5u  inj %5u"), v->name, val, v->rx, v->inj);
+    }
+  }
+  // Which interfaces are in the group? lwIP joins 239.255.255.250 on every
+  // IGMP-capable netif that exists AT JOIN TIME (INADDR_ANY). A device with
+  // Ethernet and WiFi on the same subnet may have joined on one only.
+  char nif[160]; nif[0] = 0;
+  {
+    ip4_addr_t grp; IP4_ADDR(&grp, 239, 255, 255, 250);
+    struct netif *ni;
+    NETIF_FOREACH(ni) {
+      char one[48];
+      snprintf_P(one, sizeof(one), PSTR("%s%c%c%d:%s/igmp%d/join%d"), nif[0] ? "," : "",
+                 ni->name[0], ni->name[1], ni->num, ip4addr_ntoa(netif_ip4_addr(ni)),
+                 (ni->flags & NETIF_FLAG_IGMP) ? 1 : 0, igmp_lookfor_group(ni, &grp) ? 1 : 0);
+      strlcat(nif, one, sizeof(nif));
+    }
+  }
+  int ethmc = 0;
+#if defined(ESP32) && defined(USE_ETHERNET)
+  ethmc = tc_udp_eth_mc;
+#endif
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Udp\":{\"Vars\":%u,\"Max\":%d,\"Rx\":%u,\"Unknown\":%u,\"SlotSkip\":%u,\"Connected\":%d,\"EthAllMc\":%d,\"Legacy\":%d,\"NoPause\":%d,\"Tx\":%u,\"TxDrop\":%u,\"Polls\":%u,\"Pkts\":%u,\"Raw\":%u,\"Uptime\":%u,\"Netif\":\"%s\"}}"),
+             (unsigned)n, TC_UDP_MAX_VARS, (unsigned)Tinyc->udp_rx_total, (unsigned)Tinyc->udp_rx_unknown,
+             (unsigned)Tinyc->udp_rx_skip, Tinyc->udp_connected ? 1 : 0, ethmc,
+#ifdef ESP32
+             tc_udp_legacy ? 1 : 0, tc_udp_nopause ? 1 : 0, (unsigned)tc_udp_tx_ok, (unsigned)tc_udp_tx_drop,
+#else
+             1, 0, 0u, 0u,
+#endif
+             (unsigned)Tinyc->udp_polls, (unsigned)Tinyc->udp_pkts, (unsigned)Tinyc->udp_raw, (unsigned)TasmotaGlobal.uptime, nif);
+}
+
 void CmndTinyCExec(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
   if (XdrvMailbox.payload > 0) {
@@ -2108,13 +2261,20 @@ static int tc_heap_bin(size_t sz) {
   for (int i = 0; i < 6; i++) if (sz < tc_heap_bin_edges[i]) return i;
   return 6;
 }
-static bool tc_heap_walker(walker_heap_into_t heap, walker_block_info_t blk, void *user) {
+// ⚠️ A LAMBDA, NOT A FUNCTION -- on purpose. PlatformIO's .ino converter
+// generates a prototype for every function it finds, ignoring #ifdef: on the
+// ESP8266 that prototype named walker_heap_into_t / walker_block_info_t,
+// which only exist in ESP-IDF, and the whole build died in tasmota.ino.cpp
+// (the release of 22.09.2026, first ESP8266 build since this walker arrived
+// on 18.09.). A variable holding a captureless lambda converts to the same
+// heap_caps_walker_cb_t and gets no prototype.
+static auto tc_heap_walker = [](walker_heap_into_t heap, walker_block_info_t blk, void *user) -> bool {
   TcHeapBins *b = (TcHeapBins *)user;
   int i = tc_heap_bin(blk.size);
   if (blk.used) { b->used_n[i]++; b->used_b[i] += blk.size; b->used_total++; }
   else          { b->free_n[i]++; b->free_b[i] += blk.size; b->free_total++; }
   return true;
-}
+};
 // Bin labels: <32, <128, <512, <2k, <8k, <32k, >=32k
 static void tc_heap_bins_json(const char *name, const uint32_t *n, const uint32_t *b) {
   ResponseAppend_P(PSTR(",\"%s\":{\"n\":[%u,%u,%u,%u,%u,%u,%u],\"b\":[%u,%u,%u,%u,%u,%u,%u]}"), name,
@@ -2156,8 +2316,9 @@ void CmndTinyCHeap(void) {
 // What it does NOT touch: DMA buffers (asked for with MALLOC_CAP_DMA / _INTERNAL
 // explicitly), FreeRTOS task stacks (the kernel allocates them internal), and
 // anything below the limit. Flash writes from a PSRAM buffer are bounced by
-// esp_flash. Persisted in /tinyc.cfg as `_psram,<limit>`; 0 = framework default.
-// Applied at boot in TinyCLoadSettings() and immediately by the command.
+// esp_flash. Since 18.09.2026 every PSRAM build starts with TC_PSRAM_DEFAULT
+// (512); /tinyc.cfg's `_psram,<limit>` overrides it, 0 = framework default.
+// Applied at init, at boot in TinyCLoadSettings() and immediately by the command.
 void CmndTinyCPsram(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
 #ifdef CONFIG_SPIRAM_USE_MALLOC
@@ -2381,11 +2542,19 @@ static bool tc_tcb_meta(FS *fs, const char *path,
 static void HandleTinyCPage(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
-  WSContentStart_P(PSTR("TinyC Console"));
-  WSContentSendStyle();
-
   // Handle button commands first (before displaying status)
   // Commands default to slot 0 unless otherwise specified
+  //
+  // ⚠️ The buttons are a GET form, so a click lands on /tc?slot=1&cmd=run and that
+  // address STAYS in the address bar and the history. Every reload of it ran the
+  // command again: a browser that reloads a background tab when it is switched to
+  // (Chrome's memory saver) restarted the slot on every window change, back/forward
+  // did it too (mi-hol, #123: weather.tcb on slot 1 restarted each time he came
+  // back to the console). So a command is answered with a redirect to a plain /tc
+  // (POST/redirect/GET); the page itself is only rendered after that. The command
+  // block therefore has to run BEFORE WSContentStart_P() -- the headers are gone
+  // once that is called -- and must not write any page content (it does not).
+  const bool tc_had_cmd = (Tinyc && Webserver->hasArg(F("cmd")));
   if (Tinyc && Webserver->hasArg(F("cmd"))) {
     String cmd = Webserver->arg(F("cmd"));
     uint8_t cmd_slot = 0;
@@ -2519,6 +2688,17 @@ static void HandleTinyCPage(void) {
 #endif
     }
   }
+
+  if (tc_had_cmd) {
+    // Location "/tc" is relative to the device root, so it also works behind a
+    // reverse proxy that keeps the path. `true` = replace, do not add a second one.
+    Webserver->sendHeader(F("Location"), F("/tc"), true);
+    Webserver->send(303);
+    return;
+  }
+
+  WSContentStart_P(PSTR("TinyC Console"));
+  WSContentSendStyle();
 
   // Custom styles for this page
   WSContentSend_P(PSTR(
@@ -4555,7 +4735,7 @@ static bool MatterC_DispatchInvoke(uint16_t ep, uint32_t cluster, uint32_t cmd) 
       if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) { has = true; break; }
     if (!has) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (s->vm.halted && s->vm.error == TC_OK) {
       tc_current_slot = s;
@@ -5005,8 +5185,17 @@ static void HandleMatterQR(void) {
     WSContentStop();
     return;
   }
-  if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
-  if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+  // ⚠️ Bind / Unbind are GET forms, so /mt?unbind=1 stayed in the address bar and
+  // every reload of it ran matter_factory_reset() again (same trap as /tc?cmd=,
+  // #123); /mt?bind=1 reopened the pairing window. Do the action, then redirect
+  // to a plain /mt (POST/redirect/GET) -- before any page content is started.
+  if (Webserver->hasArg(F("bind")) || Webserver->hasArg(F("unbind"))) {
+    if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
+    if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+    Webserver->sendHeader(F("Location"), F("/mt"), true);
+    Webserver->send(303);
+    return;
+  }
 
   bool open = mtrc_window_open();
   uint32_t left = mtrc_window_left_s();
@@ -5923,7 +6112,14 @@ static void HandleTinyCWebOn7(void) { HandleTinyCWebOn(7); }
 // memcpy an, ist die Kopie schon zerrissen. Dann lieber 503 und der Aufrufer
 // holt sich das naechste Bild -- ein Bild zu ueberspringen faellt bei 10 Bildern
 // je Sekunde niemandem auf, ein zerrissenes schon.
+//
+// ⚠️ NICHT SOFORT 503, WENN GERADE GESCHRIEBEN WIRD. Auf der klassischen ESP32-CAM (AI-Thinker,
+// VGA, ~8 Bilder/s) ist der Slot einen guten Teil der Zeit „writing"; Safari holt Einzelbilder und
+// wartete nach einem 503 eine volle Sekunde -- das waren die Aussetzer (gemu 02.10.2026,
+// Chrome mit dem Strom lief sauber). Der Schreiber braucht nur einige 10 ms: bis zu 100 ms
+// abwarten und dann liefern.
 static void TC_SendCamSlotAsJpeg(int idx) {
+  for (int w = 0; w < 20 && tc_cam_slot[idx].buf && tc_cam_slot[idx].writing; w++) { delay(5); }
   if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
     Webserver->send(503, "text/plain", "no image");
     return;
@@ -6006,7 +6202,9 @@ static void TC_CamStreamTask(void) {
     tc_cam_stream.client.flush();
     tc_cam_stream.client.setNoDelay(true);
     tc_cam_stream.client.setTimeout(1);
+    // CORS: the page (port 80) reads this stream with fetch() in Safari
     tc_cam_stream.client.print("HTTP/1.1 200 OK\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
       "Content-Type: multipart/x-mixed-replace;boundary=" TC_CAM_BOUNDARY "\r\n"
       "\r\n");
     tc_cam_stream.stream_active = 2;
@@ -6122,7 +6320,14 @@ static void TC_CamMotionDetect(void) {
   free(rgb);
   return;
 #else
-  if (!jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X)) {
+  // the person detector decodes too (VM task): skip this sample instead of waiting in the main loop
+  if (tc_jpg_mutex && xSemaphoreTake(tc_jpg_mutex, 0) != pdTRUE) {
+    free(rgb);
+    return;
+  }
+  bool dec_ok = jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X);
+  if (tc_jpg_mutex) { xSemaphoreGive(tc_jpg_mutex); }
+  if (!dec_ok) {
     free(rgb);
     return;
   }
@@ -7207,7 +7412,7 @@ static bool tc_mqtt_data_handler(void) {
       if (slot->vm.cb_index[TC_CB_ON_MQTT_DATA] < 0) continue;
       tc_current_slot = slot;
 #ifdef ESP32
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       // Re-check halted AFTER the lock (TOCTOU): the core-1 VM task can flip
       // halted=false between the pre-lock check above and here; running
       // OnMqttData on a non-halted VM corrupts its frame -> crash under MQTT
@@ -7420,7 +7625,7 @@ static void tc_spawn_task_body(void *param) {
 
     // Execute the user function under vm_mutex. The pattern follows TaskLoop:
     // release mutex during delay() so Tasmota callbacks can interleave.
-    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
     tc_current_slot = slot;
 
     uint8_t  saved_frame_count      = vm->frame_count;
@@ -7481,7 +7686,7 @@ static void tc_spawn_task_body(void *param) {
           remaining = (int32_t)(vm->delay_until - millis());
         }
         vm->delayed = false;
-        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
         vm->halted = false;
@@ -7496,7 +7701,7 @@ static void tc_spawn_task_body(void *param) {
       vm->halted = true; vm->running = false;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
       vTaskDelay(1);
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       tc_current_slot = slot;
       if (entry->stop_requested || !slot->loaded) break;
       vm->halted = false; vm->running = true;
@@ -7573,7 +7778,7 @@ static void tc_worker_vm_body(void *param) {
       break;
     }
 
-    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
     tc_current_slot = slot;
 
     // Fresh frame on the worker VM (frame_count starts at 0 — its own stack).
@@ -7618,7 +7823,7 @@ static void tc_worker_vm_body(void *param) {
           remaining = (int32_t)(vm->delay_until - millis());
         }
         vm->delayed = false;
-        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
         vm->halted = false; vm->running = true;
@@ -7630,7 +7835,7 @@ static void tc_worker_vm_body(void *param) {
       vm->halted = true; vm->running = false;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
       vTaskDelay(1);
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       tc_current_slot = slot;
       if (entry->stop_requested || !slot->loaded) break;
       vm->halted = false; vm->running = true;
@@ -7915,6 +8120,9 @@ bool Xdrv124(uint32_t function) {
   switch (function) {
     case FUNC_LOOP:
 #ifdef USE_MATTER_C
+#ifdef USE_BINPLUGINS
+      mtrc_main_pump();   // plugin: hand over datagrams/calls from other tasks first
+#endif
       matter_loop();   // process any queued Matter datagram (PASE responder)
       // Throttled aggregate log of UDP RX (every 5 s, only if traffic).
       // Runs on main task → safe stack for the format/log path.
@@ -7978,7 +8186,7 @@ bool Xdrv124(uint32_t function) {
           continue;
         }
 #ifdef ESP32
-        if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+        if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
         if (s->vm.halted && s->vm.error == TC_OK) {
           tc_current_slot = s;
@@ -8233,18 +8441,38 @@ bool Xdrv124(uint32_t function) {
         // geholt -- das nächste erst, wenn das vorige da ist -- statt mit
         // einem festen setInterval: bei einer langsamen Verbindung stapeln
         // sich sonst die Anfragen, und der ESP beantwortet sie alle.
+        // Safari liest den Strom selbst (fetch + Bild je Frame): EINE Verbindung, die volle
+        // Bildrate, kein Einzelbild-Anfragen je Bild (3,4-4,4 B/s, Aussetzer -- gemu 02.10.2026).
+        // Scheitert das dreimal hintereinander, faellt es auf die verketteten Einzelbilder zurueck.
         WSContentSend_P(PSTR("<p></p><center>"
           "<img id='tccam' alt='TinyC Camera' style='width:99%%;'>"
           "</center><p></p>"
           "<script>window.addEventListener('load',function(){"
           "var c=document.getElementById('tccam');"
+          "var P=function(){var e=0,n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
+          "c.onload=function(){e=0;setTimeout(n,20);};"
+          "c.onerror=function(){e++;setTimeout(n,e<4?150:1000);};n();};"
           "if(/^((?!chrome|android).)*safari/i.test(navigator.userAgent)){"
-          "var n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
-          "c.onload=function(){setTimeout(n,80);};"
-          "c.onerror=function(){setTimeout(n,1000);};n();"
+          "if(!window.fetch||!window.ReadableStream){P();return;}"
+          "var u=null,f=0,go=function(){"
+          "fetch('http://%_I:%d/stream').then(function(r){"
+          "var rd=r.body.getReader(),b=new Uint8Array(0);"
+          "var pump=function(){return rd.read().then(function(x){"
+          "if(x.done)throw 0;"
+          "var nb=new Uint8Array(b.length+x.value.length);nb.set(b);nb.set(x.value,b.length);b=nb;"
+          "var last=null;"
+          "for(;;){var s='',i=0,k=Math.min(b.length,160);for(;i<k;i++)s+=String.fromCharCode(b[i]);"
+          "var m=/Content-Length: (\\d+)\\r\\n\\r\\n/.exec(s);if(!m){if(b.length>300000)b=new Uint8Array(0);break;}"
+          "var st=m.index+m[0].length,l=+m[1];if(b.length<st+l)break;"
+          "last=b.slice(st,st+l);b=b.slice(st+l);}"
+          "if(last){var o=URL.createObjectURL(new Blob([last],{type:'image/jpeg'})),old=u;"
+          "u=o;c.src=o;f=0;if(old)setTimeout(function(){URL.revokeObjectURL(old);},500);}"
+          "return pump();});};return pump();"
+          "}).catch(function(){if(++f>2){P();}else{setTimeout(go,1000);}});};go();"
           "}else{"
           "c.onerror=function(){setTimeout(function(){c.src='http://%_I:%d/stream';},2000);};"
           "c.src='http://%_I:%d/stream';}});</script>"),
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
       }

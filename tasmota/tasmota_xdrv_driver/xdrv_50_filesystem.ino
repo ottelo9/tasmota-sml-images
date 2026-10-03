@@ -1735,6 +1735,14 @@ uint8_t UfsDownloadFile(char *file) {
     }
     delay(0);
     OsWatchLoop();
+#ifdef ESP32
+    // Same trap as the upload (UfsUploadFileWrite): this loop streams the whole
+    // file without returning to loop(), and delay(0)/OsWatchLoop() do not reset
+    // the 5 s loop Task-WDT. A 1.2 MB file right after an upload took ~10 s and
+    // reset the chip 3 of 3 times (.39, ESP32-S3, 2026-09-24), crash context =
+    // the IDLE task. Feed per block, like the upload does.
+    feedLoopWDT();
+#endif
   }
   download_file.close();
   download_Client.stop();
@@ -1842,6 +1850,18 @@ bool UfsUploadFileOpen(const char* upload_filename) {
 }
 
 bool UfsUploadFileWrite(uint8_t *upload_buf, size_t current_size) {
+#ifdef ESP32
+  // The multipart body is parsed in ONE go inside Webserver->handleClient(),
+  // calling this once per ~1.4 KB block with no delay()/yield() in between, so
+  // loop() is not re-entered and nothing feeds the 5 s loop Task-WDT. An upload
+  // that takes longer (a few hundred KB into LittleFS, or a slow client) reset
+  // the chip: "Software reset CPU", crash context = the IDLE task. Measured on
+  // an ESP32-S3 (.39, 2026-09-24): random 400 KB files crashed after ~10 s,
+  // others passed in ~6 s -- the duration varies with flash erase/GC. Feeding
+  // per block keeps the WDT quiet while data is flowing; a genuine stall still
+  // trips it.
+  feedLoopWDT();
+#endif
   if (ufs_upload_file) {
     // On a FULL filesystem write() returns short (or 0). The old code ignored the
     // return and then reported HTTP 200 over a silently truncated file (Andreas:

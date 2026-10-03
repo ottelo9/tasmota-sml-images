@@ -85,18 +85,14 @@ create_zip_optional() {
 # ESP8266 Bundle — alle ESP8266-Builds gesammelt in einem ZIP
 #   1M Flash: nur Scripter (UFILESYS fehlt → kein TinyC)
 #   4M Flash: nur Scripter (kein TinyC — kein I2C fuer BinPlugin-Loader)
-#   Jeweils .bin (USB-Flash) UND .bin.gz (OTA "Use file upload").
+#   Nur .bin.gz (OTA "Use file upload"), keine .bin.
 # =============================================================================
 create_zip_optional "tasmota8266_bundle_ottelo.zip" \
-    tasmota-minimal.bin \
     tasmota-minimal.bin.gz \
-    tasmota1m_ottelo_tas.bin \
     tasmota1m_ottelo_tas.bin.gz \
-    tasmota1m_energy_ottelo_tas.bin \
     tasmota1m_energy_ottelo_tas.bin.gz \
-    tasmota1m_shelly_ottelo_tas.bin \
     tasmota1m_shelly_ottelo_tas.bin.gz \
-    tasmota4m_ottelo_tas.bin \
+    tasmota1m_ct002_ottelo_tas.bin.gz \
     tasmota4m_ottelo_tas.bin.gz || true
 
 # =============================================================================
@@ -112,11 +108,22 @@ ESP32_BOARDS=(
     "tasmota32p4_ottelo"        # ESP32-P4
 )
 
+# safeboot: Tasmota baut eine pro Chip (tasmota32c3-safeboot.bin, ...). Sie wird
+# je Variante unter dem Namen des Images abgelegt, z.B.
+# tasmota32_ottelo_tc-safeboot.bin, und kommt mit ins ZIP. Fehlt sie, wird das
+# ZIP ohne sie erstellt.
 for board in "${ESP32_BOARDS[@]}"; do
+    sb_src="${board%_ottelo}-safeboot.bin"
     for variant in tas tc; do
-        create_zip "${board}_${variant}.zip" \
-            "${board}_${variant}.bin" \
-            "${board}_${variant}.factory.bin" || true
+        files=("${board}_${variant}.bin" "${board}_${variant}.factory.bin")
+        sb="${board}_${variant}-safeboot.bin"
+        if [ -f "$sb_src" ]; then
+            cp -f "$sb_src" "$sb"
+            files+=("$sb")
+        else
+            echo "HINWEIS: $sb_src fehlt - ${board}_${variant}.zip ohne safeboot"
+        fi
+        create_zip "${board}_${variant}.zip" "${files[@]}" || true
     done
 done
 

@@ -41,6 +41,13 @@ enum {iD_TEMPERATURE,iD_PRESSURE,iD_HUMIDITY,iD_ABSOLUTE_HUMIDITY,iD_DISTANCE};
 // collide with future additions there.
 #define pFUNC_GET_TINYC_EXPORTS 1000
 
+// RAM a module allocated itself beyond MODULE_MEMORY (heap blocks, contexts),
+// in bytes. The module directory (mdir, web) adds it to mem_size, which only
+// counts MODULE_MEMORY. Modules without it return 0 like for any unknown
+// selector. (MATTERF: MODULE_MEMORY is three pointers, the real ~80 KB are
+// its heap block and the matter context.)
+#define pFUNC_GET_RAM 1001
+
 // ── TinyC-callable export ABI ────────────────────────────────────
 // A binary library (xblib_*) exposes a list of named native functions.
 // TinyC scripts (and, eventually, other plugins) invoke them via a

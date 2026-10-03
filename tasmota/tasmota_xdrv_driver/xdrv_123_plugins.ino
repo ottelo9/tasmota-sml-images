@@ -53,6 +53,9 @@ extern "C" {
 // for `struct linger` / SOL_SOCKET / SO_LINGER used by jt[171] op 103
 // (client_setLinger). ESP8266 path doesn't expose setSocketOption().
 #include <lwip/sockets.h>
+#ifdef ESP32
+#include "esp_mmu_map.h"      // esp_mmu_map(): the P4 fallback in Setplugins()
+#endif
 #endif
 
 // minimal plugin rev
@@ -967,12 +970,214 @@ static_assert(sizeof(MODULE_JUMPTABLE) / sizeof(MODULE_JUMPTABLE[0]) == 220,
 // special_malloc is a C++-mangled .ino symbol not directly callable from a .c TU;
 // without routing through it the arena went to the ~200 KB internal heap and
 // picotts_init() failed with "insufficient memory" on a 4 MB ESP32-S3.
-extern "C" void *pico_arena_malloc(size_t size) { return special_malloc(size); }
+// The engine reads memory it never wrote (host test 02.10.2026: with the arena filled with 0xA5 the
+// rendered length changes), so the arena must start zeroed - PSRAM is not.
+extern "C" void *pico_arena_malloc(size_t size) {
+  void *p = special_malloc(size);
+  if (p) { memset(p, 0, size); }
+  return p;
+}
+#endif
+
+
+#if defined(ESP32) && !defined(USE_PICOTTS) && defined(USE_BINPLUGINS)
+// ---------------------------------------------------------------------------------------------
+// PicoTTS from the PICOTTS BinPlugin (BLIB), for firmware built WITHOUT the engine (no -DTINYC_TTS).
+// The plugin holds only the synthesis steps (picotts_open/put/get/close, see
+// tasmota/Plugins/xblib_04_picotts.cpp). The task, the text queue, the arena and the callbacks live
+// here and mirror lib/libesp32_div/pico/esp_picotts.c, so the I2SAUDIO plugin keeps using the very
+// same jump table entries (209..214) whichever way the engine is provided.
+// ---------------------------------------------------------------------------------------------
+extern "C" TC_BLIB_REG_ENTRY *tc_blib_lookup(const char *name);
+
+static int32_t (*ptb_open)(void *, uint32_t, const void *, const void *) = nullptr;
+static int32_t (*ptb_put)(const uint8_t *, int32_t, int32_t *) = nullptr;
+static int32_t (*ptb_get)(int16_t *, int32_t, int32_t *) = nullptr;
+static int32_t (*ptb_close)(void) = nullptr;
+static void (*ptb_out)(int16_t *, unsigned) = nullptr;
+static void (*ptb_idle)(void) = nullptr;
+static void (*ptb_err)(void) = nullptr;
+static const void *ptb_ta = nullptr;
+static const void *ptb_sg = nullptr;
+static void *ptb_arena = nullptr;
+static QueueHandle_t ptb_q = nullptr;
+static TaskHandle_t ptb_task = nullptr;
+static SemaphoreHandle_t ptb_exit = nullptr;
+static volatile bool ptb_stop = false;
+
+#define PTB_ARENA_SIZE   1100000     // same as PICO_MEM_SIZE in esp_picotts.c
+#define PTB_QUEUE_SIZE   1024
+#define PTB_IDLE_WAIT    5           // x100 ms of silence before the idle callback
+#define PTB_STEP_IDLE    200
+#define PTB_STEP_BUSY    201
+
+static bool ptb_resolve(void) {
+  if (ptb_open) { return true; }
+  TC_BLIB_REG_ENTRY *o = tc_blib_lookup("picotts_open");
+  TC_BLIB_REG_ENTRY *p = tc_blib_lookup("picotts_put");
+  TC_BLIB_REG_ENTRY *g = tc_blib_lookup("picotts_get");
+  TC_BLIB_REG_ENTRY *c = tc_blib_lookup("picotts_close");
+  if (!o || !p || !g || !c) { return false; }
+  ptb_put = (int32_t (*)(const uint8_t *, int32_t, int32_t *))p->fn;
+  ptb_get = (int32_t (*)(int16_t *, int32_t, int32_t *))g->fn;
+  ptb_close = (int32_t (*)(void))c->fn;
+  ptb_open = (int32_t (*)(void *, uint32_t, const void *, const void *))o->fn;
+  TC_BLIB_REG_ENTRY *pr = tc_blib_lookup("picotts_probe");
+  if (pr) {
+    int32_t bad = ((int32_t (*)(void))pr->fn)();
+    AddLog(bad ? LOG_LEVEL_ERROR : LOG_LEVEL_INFO, PSTR("PTT: plugin self check %s (mask %d)"), bad ? "FAILED" : "ok", bad);
+  }
+  return true;
+}
+
+static void ptb_task_fn(void *) {
+  AddLog(LOG_LEVEL_DEBUG, PSTR("PTT: engine task started (plugin)"));
+  bool error = false;
+  bool waiting_output = false;
+  unsigned idles = 0;
+  uint32_t n_samples = 0;                  // per utterance: length and level, logged when it ends
+  uint64_t sumsq = 0;
+  int32_t peak = 0;
+  uint32_t us_engine = 0, us_output = 0;   // time inside the engine / inside the output callback
+  uint32_t n_put = 0, n_get = 0, n_in = 0; // calls into the engine, bytes accepted
+  while (!error && !ptb_stop) {
+    uint8_t c;
+    while (xQueuePeek(ptb_q, &c, 0) == pdPASS) {
+      int32_t used = 0;
+      int32_t ret = ptb_put(&c, 1, &used);
+      n_put++; n_in += used;
+      if (ret) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("PTT: put text failed (%d), stopping TTS"), ret);
+        error = true;
+        break;
+      }
+      if (used) {
+        xQueueReceive(ptb_q, &c, 0);
+        waiting_output = true;
+      }
+    }
+    if (!waiting_output) {
+      if (idles < PTB_IDLE_WAIT) {
+        if (++idles == PTB_IDLE_WAIT && ptb_idle) { ptb_idle(); }
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    } else {
+      int32_t status;
+      do {
+        int16_t outbuf[128];
+        int32_t bytes = 0;
+        uint32_t t0 = micros();
+        status = ptb_get(outbuf, sizeof(outbuf), &bytes);
+        us_engine += micros() - t0;
+        n_get++;
+        if (bytes > 0) {
+          for (int32_t i = 0; i < bytes / 2; i++) {
+            int32_t v = outbuf[i];
+            sumsq += (uint64_t)(v * v);
+            if (v < 0) { v = -v; }
+            if (v > peak) { peak = v; }
+          }
+          n_samples += (uint32_t)(bytes / 2);
+          t0 = micros();
+          if (ptb_out) { ptb_out(outbuf, (unsigned)(bytes / 2)); }
+          us_output += micros() - t0;
+        }
+      } while (status == PTB_STEP_BUSY && !ptb_stop);
+      if (status != PTB_STEP_IDLE && status != PTB_STEP_BUSY && !ptb_stop) {
+        AddLog(LOG_LEVEL_ERROR, PSTR("PTT: get data failed (%d), stopping TTS"), status);
+        error = true;
+      } else if (status == PTB_STEP_IDLE) {
+        waiting_output = false;
+        idles = 0;
+        if (n_samples) {
+          AddLog(LOG_LEVEL_INFO, PSTR("PTT: utterance %u samples, peak %d, rms %u; engine %u ms, output callback %u ms; put %u (%u B) get %u (plugin engine)"),
+                 n_samples, peak, (unsigned)sqrtf((float)sumsq / (float)n_samples), us_engine / 1000, us_output / 1000, n_put, n_in, n_get);
+        }
+        n_samples = 0; sumsq = 0; peak = 0; us_engine = 0; us_output = 0; n_put = 0; n_get = 0; n_in = 0;
+      }
+    }
+  }
+  AddLog(LOG_LEVEL_DEBUG, PSTR("PTT: engine task exiting (plugin)"));
+  xSemaphoreGive(ptb_exit);
+  if (error && ptb_err) { ptb_err(); }
+  vTaskDelete(NULL);
+}
+
+static void ptb_cleanup(void) {
+  if (ptb_task) {
+    ptb_stop = true;
+    if (ptb_exit) { xSemaphoreTake(ptb_exit, pdMS_TO_TICKS(3000)); }
+    ptb_task = nullptr;
+  }
+  if (ptb_close) { ptb_close(); }
+  if (ptb_arena) { free(ptb_arena); ptb_arena = nullptr; }
+  if (ptb_q) { vQueueDelete(ptb_q); ptb_q = nullptr; }
+  ptb_out = nullptr; ptb_idle = nullptr; ptb_err = nullptr;
+  ptb_open = nullptr;                      // re-resolve next time: the plugin may have been reloaded
+}
+
+static bool ptb_init(unsigned prio, void (*cb)(int16_t *samples, unsigned count), int core) {
+  if (!ptb_resolve()) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("PTT: no PICOTTS plugin and no built-in engine"));
+    return false;
+  }
+  if (!ptb_exit) { ptb_exit = xSemaphoreCreateBinary(); }
+  if (ptb_arena) { AddLog(LOG_LEVEL_ERROR, PSTR("PTT: already initialized")); return false; }
+  if (!ptb_ta || !ptb_sg) { AddLog(LOG_LEVEL_ERROR, PSTR("PTT: voice resources not set")); return false; }
+  ptb_out = cb;
+  ptb_stop = false;
+  ptb_arena = special_malloc(PTB_ARENA_SIZE);
+  if (!ptb_arena) { AddLog(LOG_LEVEL_ERROR, PSTR("PTT: insufficient memory for the engine arena")); return false; }
+  memset(ptb_arena, 0, PTB_ARENA_SIZE);    // see pico_arena_malloc: the engine reads uninitialised memory
+  int32_t ret = ptb_open(ptb_arena, PTB_ARENA_SIZE, ptb_ta, ptb_sg);
+  if (ret) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("PTT: engine open failed (%d)"), ret);
+    ptb_cleanup();
+    return false;
+  }
+  ptb_q = xQueueCreate(PTB_QUEUE_SIZE, sizeof(char));
+  if (!ptb_q || xTaskCreatePinnedToCore(ptb_task_fn, "picotts", 8192, NULL, prio, &ptb_task,
+                                        core == -1 ? tskNO_AFFINITY : core) != pdPASS) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("PTT: cannot create the engine task"));
+    ptb_task = nullptr;
+    ptb_cleanup();
+    return false;
+  }
+  return true;
+}
+
+static void ptb_add(const char *text, unsigned len) {
+  if (!ptb_q) { return; }
+  while (len--) { xQueueSendToBack(ptb_q, text++, portMAX_DELAY); }
+}
+#endif  // ESP32 && !USE_PICOTTS && USE_BINPLUGINS
+
+#if defined(PICOTTS_AB_TEST) && defined(USE_PICOTTS) && defined(ESP32)
+// A/B test against the plugin engine: count what the built-in engine delivers
+static void (*abt_cb)(int16_t *, unsigned) = nullptr;
+static void (*abt_idle)(void) = nullptr;
+static uint32_t abt_n = 0; static uint64_t abt_sq = 0; static int32_t abt_peak = 0;
+static void abt_out(int16_t *s, unsigned n) {
+  for (unsigned i = 0; i < n; i++) { int32_t v = s[i]; abt_sq += (uint64_t)(v * v); if (v < 0) { v = -v; } if (v > abt_peak) { abt_peak = v; } }
+  abt_n += n;
+  if (abt_cb) { abt_cb(s, n); }
+}
+static void abt_idle_cb(void) {
+  if (abt_n) { AddLog(LOG_LEVEL_INFO, PSTR("PTT: utterance %u samples, peak %d, rms %u (BUILT-IN engine)"), abt_n, abt_peak, (unsigned)sqrtf((float)abt_sq / (float)abt_n)); }
+  abt_n = 0; abt_sq = 0; abt_peak = 0;
+  if (abt_idle) { abt_idle(); }
+}
 #endif
 
 bool tmod_picotts_init(unsigned prio, void (*cb)(int16_t *samples, unsigned count), int core) {
-#if defined(USE_PICOTTS) && defined(ESP32)
+#if defined(PICOTTS_AB_TEST) && defined(USE_PICOTTS) && defined(ESP32)
+  abt_cb = cb;
+  picotts_set_idle_notify(abt_idle_cb);
+  return picotts_init(prio, abt_out, core);
+#elif defined(USE_PICOTTS) && defined(ESP32)
   return picotts_init(prio, cb, core);
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  return ptb_init(prio, cb, core);
 #else
   (void)prio; (void)cb; (void)core;
   return false;
@@ -982,6 +1187,8 @@ bool tmod_picotts_init(unsigned prio, void (*cb)(int16_t *samples, unsigned coun
 void tmod_picotts_add(const char *text, unsigned len) {
 #if defined(USE_PICOTTS) && defined(ESP32)
   picotts_add(text, len);
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  ptb_add(text, len);
 #else
   (void)text; (void)len;
 #endif
@@ -990,12 +1197,20 @@ void tmod_picotts_add(const char *text, unsigned len) {
 void tmod_picotts_shutdown(void) {
 #if defined(USE_PICOTTS) && defined(ESP32)
   picotts_shutdown();
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  ptb_cleanup();
 #endif
 }
 
 void tmod_picotts_set_idle_notify(void (*cb)(void)) {
 #if defined(USE_PICOTTS) && defined(ESP32)
+#if defined(PICOTTS_AB_TEST)
+  abt_idle = cb;
+#else
   picotts_set_idle_notify(cb);
+#endif
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  ptb_idle = cb;
 #else
   (void)cb;
 #endif
@@ -1004,6 +1219,8 @@ void tmod_picotts_set_idle_notify(void (*cb)(void)) {
 void tmod_picotts_set_error_notify(void (*cb)(void)) {
 #if defined(USE_PICOTTS) && defined(ESP32)
   picotts_set_error_notify(cb);
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  ptb_err = cb;
 #else
   (void)cb;
 #endif
@@ -1012,6 +1229,8 @@ void tmod_picotts_set_error_notify(void (*cb)(void)) {
 void tmod_picotts_set_resources(const void *ta_ptr, const void *sg_ptr) {
 #if defined(USE_PICOTTS) && defined(ESP32)
   picotts_set_resources(ta_ptr, sg_ptr);
+#elif defined(ESP32) && defined(USE_BINPLUGINS)
+  ptb_ta = ta_ptr; ptb_sg = sg_ptr;
 #else
   (void)ta_ptr; (void)sg_ptr;
 #endif
@@ -3154,6 +3373,18 @@ MODULES_TABLE modules[MAX_PLUGINS];
 
 #define MOD_EXEC(A)  fm->mod_func_execute(A)
 
+// RAM of a module for the directory: MODULE_MEMORY (mem_size) plus what an
+// initialized module reports for pFUNC_GET_RAM (heap it allocated itself).
+static uint32_t Get_mod_ram(uint32_t idx) {
+  uint32_t ram = modules[idx].mem_size;
+  if (modules[idx].mod_addr && modules[idx].flags.initialized) {
+    const FLASH_MODULE *fm = (FLASH_MODULE*)modules[idx].mod_addr;
+    int32_t extra = MOD_EXEC(pFUNC_GET_RAM);
+    if (extra > 0) { ram += (uint32_t)extra; }
+  }
+  return ram;
+}
+
 
 #define ESP32_PLUGIN_HSIZE SPI_FLASH_SEC_SIZE
 
@@ -3174,13 +3405,84 @@ void Setplugins(void) {
   plugins.pagesize = SPI_FLASH_SEC_SIZE;
   plugins.flash_pptr = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_TEST, "custom");
   if (plugins.flash_pptr) {
-    const void *out_ptr;
+    const void *out_ptr = nullptr;
     //esp_err_t err = esp_partition_mmap(plugins.flash_pptr, 0, plugins.flash_pptr->size, SPI_FLASH_MMAP_DATA, &out_ptr, &plugins.map_handle);
 #if ESP_IDF_VERSION_MAJOR < 5 
     esp_err_t err = esp_partition_mmap(plugins.flash_pptr, 0, plugins.flash_pptr->size, SPI_FLASH_MMAP_INST, &out_ptr, &plugins.map_handle);
 #else
     esp_err_t err = esp_partition_mmap(plugins.flash_pptr, 0, plugins.flash_pptr->size, ESP_PARTITION_MMAP_INST, &out_ptr, &plugins.map_handle);
 #endif
+    // ⚠️ CHECK THE RESULT. Until 2026-09-18 `err` was ignored: when the mmap
+    // failed, `out_ptr` was whatever the stack held, AddModules() then read
+    // FLASH_MODULE headers from a random address, and the device crashed --
+    // or not, depending on where the garbage pointed. .164 (ESP32-P4, first
+    // build on IDF 5.5.4 / Core 3.3.8) logged "Plugins-> start: 40067d86", an
+    // address in the middle of the firmware's own code, and died with "Load
+    // access fault" on most boots. On IDF 5.3 the same mapping had worked.
+    // An instruction mapping that fails gets one more try as a data mapping
+    // (the P4 has one unified cache region for both); if that fails too,
+    // the plugin system stays OFF and says so, instead of scanning garbage.
+#if ESP_IDF_VERSION_MAJOR >= 5
+    if (err != ESP_OK) {
+      AddLog(LOG_LEVEL_INFO, PSTR("Plugins: INST mmap failed (err %d) -- trying DATA mapping"), (int)err);
+      err = esp_partition_mmap(plugins.flash_pptr, 0, plugins.flash_pptr->size, ESP_PARTITION_MMAP_DATA, &out_ptr, &plugins.map_handle);
+    }
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32P4
+    // ⚠️ THE 16 MB GUARD. Since IDF 5.5, spi_flash_mmap() refuses any flash
+    // address at or beyond 16 MB with ESP_ERR_INVALID_ARG ("out of range for
+    // 24bit flash mapping") unless CONFIG_BOOTLOADER_CACHE_32BIT_ADDR_* is
+    // set -- and the plugin partition of the 32 MB P4 boards sits at
+    // 0x1FC0000. The P4's cache does map 32-bit addresses
+    // (SOC_SPI_MEM_SUPPORT_CACHE_32BIT_ADDR_MAP), and IDF 5.3 ran plugins
+    // from this very partition for months. esp_mmu_map() is what
+    // spi_flash_mmap() calls after the guard, so map one level lower.
+    // Nothing unmaps this later (map_handle was never used for that), so a
+    // zero handle is fine.
+    if (err == ESP_ERR_INVALID_ARG && plugins.flash_pptr->address >= 0x1000000) {
+      void *p = nullptr;
+      err = esp_mmu_map(plugins.flash_pptr->address, plugins.flash_pptr->size, MMU_TARGET_FLASH0,
+                        (mmu_mem_caps_t)(MMU_MEM_CAP_EXEC | MMU_MEM_CAP_32BIT), ESP_MMU_MMAP_FLAG_PADDR_SHARED, &p);
+      out_ptr = p;
+      plugins.map_handle = 0;
+      AddLog(LOG_LEVEL_INFO, PSTR("Plugins: partition beyond 16 MB -- esp_mmu_map (err %d, %p)"), (int)err, p);
+      // ⚠️ IS THE CACHE HONEST UP THERE? If the cache fetches with 24-bit
+      // addresses, the mapping silently ALIASES to 16 MB lower -- into the
+      // file system -- and the scan may find a plugin .bin lying there as a
+      // file, relink it, and execute file bytes ("Illegal instruction").
+      // So compare the first bytes as the cache shows them with what the SPI
+      // driver (32-bit addressing) reads from the real partition. Any
+      // difference: plugins OFF, and say so.
+      if (err == ESP_OK && p) {
+        uint32_t spi[16];
+        if (esp_partition_read(plugins.flash_pptr, 0, spi, sizeof(spi)) == ESP_OK) {
+          if (memcmp(spi, p, sizeof(spi)) != 0) {
+            // Which word differs, and does the cache image equal what lies
+            // 16 MB LOWER in flash (the 24-bit alias)? That settles it.
+            int first = -1;
+            for (int i = 0; i < 16; i++) { if (spi[i] != ((uint32_t*)p)[i]) { first = i; break; } }
+            uint32_t lower[16]; bool alias = false;
+            if (esp_flash_read(NULL, lower, plugins.flash_pptr->address - 0x1000000, sizeof(lower)) == ESP_OK) {
+              alias = (memcmp(lower, p, sizeof(lower)) == 0);
+            }
+            AddLog(LOG_LEVEL_ERROR, PSTR("Plugins: cache image differs from flash at word %d (cache %08x, flash %08x, 16MB-lower %08x) -- alias:%d, plugins disabled"),
+                   first, (unsigned)((uint32_t*)p)[first < 0 ? 0 : first], (unsigned)spi[first < 0 ? 0 : first],
+                   (unsigned)lower[first < 0 ? 0 : first], alias ? 1 : 0);
+            err = ESP_ERR_INVALID_STATE;
+          } else {
+            AddLog(LOG_LEVEL_INFO, PSTR("Plugins: cache image matches flash beyond 16 MB"));
+          }
+        }
+      }
+    }
+#endif
+    if (err != ESP_OK || !out_ptr) {
+      plugins.ready = false;
+      plugins.free_flash_start = 0;
+      plugins.free_flash_end = 0;
+      AddLog(LOG_LEVEL_ERROR, PSTR("Plugins: partition mmap FAILED (err %d) -- plugins disabled"), (int)err);
+      return;
+    }
     plugins.free_flash_start = (uint32_t)out_ptr;
     plugins.free_flash_end = plugins.free_flash_start + plugins.flash_pptr->size;
     plugins.flashbase = 0;
@@ -3355,7 +3657,9 @@ uint32_t eeprom_block;
         blocksize *= SPI_FLASH_SEC_SIZE;
       } else {
         // free module block, check required size
-        uint32_t blocks = (size / SPI_FLASH_SEC_SIZE) + 1;   // was uint8_t: truncates for >=255-sector modules
+        // `size` arrives already rounded up to whole sectors (Module_upload_write): round up, do not add a sector
+        // again, or a plugin never fits a hole of exactly its own size (02.10.2026: replacing PICOTTS failed)
+        uint32_t blocks = (size + SPI_FLASH_SEC_SIZE - 1) / SPI_FLASH_SEC_SIZE;   // was uint8_t: truncates for >=255-sector modules
         //AddLog(LOG_LEVEL_INFO, PSTR("needed blocks: %d"), blocks);
         uint32_t *bp = lp;
         uint8_t free = 1;
@@ -3468,6 +3772,45 @@ uint32_t Store_Module_Block(uint8_t *fdesc, uint8_t index) {
   return new_pc;;
 }
 
+// ⚠️ PLUGIN AUTOSTART IS SAVED IN /plugins.auto. The checkbox on the plugin
+// page used to flip TasmotaGlobal.gpio_optiona.shelly_pro (Option A7) - a
+// runtime copy that is rebuilt from the GPIO configuration at every boot, so
+// the tick was gone after the next restart and only a GPIO set to "Option A 7"
+// kept it (found 2026-09-29 writing the Matter plugin guide). The file decides
+// when it exists; without it Option A7 still works as before. Option A7 itself
+// is left alone: Tasmota also reads it as "this is a Shelly Pro".
+// Autostart matters most for MATTERF: started at boot it gets its ~71 KB while
+// the heap is still in one piece.
+#define PLUGIN_AUTO_FILE "/plugins.auto"
+static int8_t plugin_autostart = -1;          // -1 = not read yet
+
+static bool Plugin_Autostart(void) {
+  if (plugin_autostart < 0) {
+    plugin_autostart = TasmotaGlobal.gpio_optiona.shelly_pro ? 1 : 0;
+    if (ffsp && ffsp->exists(PLUGIN_AUTO_FILE)) {
+      File f = ffsp->open(PLUGIN_AUTO_FILE, "r");
+      if (f) {
+        int c = f.read();
+        f.close();
+        if (c == '0' || c == '1') { plugin_autostart = c - '0'; }
+      }
+    }
+  }
+  return plugin_autostart > 0;
+}
+
+static void Plugin_SetAutostart(bool on) {
+  plugin_autostart = on ? 1 : 0;
+  if (ffsp) {
+    File f = ffsp->open(PLUGIN_AUTO_FILE, "w");
+    if (f) {
+      f.print(on ? "1\n" : "0\n");
+      f.close();
+    }
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("Plugins: autostart %s (saved in " PLUGIN_AUTO_FILE ")"), on ? "on" : "off");
+}
+
 void AddModules(void) {
   uint16_t module = 0;
   uint32_t *lp = (uint32_t*) ( plugins.flashbase + plugins.free_flash_start );
@@ -3478,11 +3821,25 @@ void AddModules(void) {
       // add module
       modules[module].mod_addr = (FLASH_MODULE*)lp;
       modules[module].jt = MODULE_JUMPTABLE;
+      // ⚠️ NEVER hand fm->name to a printf directly. The partition is mapped
+      // through the INSTRUCTION bus (ESP_PARTITION_MMAP_INST); on Xtensa
+      // (ESP32/S3) a byte load from that region is a LoadStoreError, and
+      // strlen() inside vfprintf reads bytes. Exactly that killed every S3
+      // with a plugin in its partition on 2026-09-18 (.124: ten crashes at
+      // boot, then safeboot) -- the line above had been added the day before
+      // for the P4, whose RISC-V core tolerates byte loads there. Copy the
+      // header word-wise first, as the module directory below does.
+      uint32_t hdr[sizeof(FLASH_MODULE) / 4];
+      for (uint16_t w = 0; w < sizeof(FLASH_MODULE) / 4; w++) { hdr[w] = lp[w]; }
+      char name[17];
+      memcpy(name, ((FLASH_MODULE*)hdr)->name, 16);
+      name[16] = 0;
+      AddLog(LOG_LEVEL_INFO, PSTR("Plugins: module %d '%s' at %08x"), module + 1, name, (unsigned)addr);
       //modules[module].execution_offset = fm->execution_offset;
       //modules[module].mod_size = fm->size;
       //modules[module].settings = Settings;
       modules[module].flags.data = 0;
-      if (TasmotaGlobal.gpio_optiona.shelly_pro) {
+      if (Plugin_Autostart()) {
         Init_module(module);
       }
       // add addr according to module size, currently assume module < SPI_FLASH_SEC_SIZE
@@ -3527,7 +3884,7 @@ void Module_mdir(void) {
         ResponseAppend_P(PSTR(","));
       }
       ResponseAppend_P(PSTR("\"MOD #%d\":{\"name\":\"%s\",\"addr\":\"%08x\",\"ex-offs\":\"%08x\", \"size\":%d,\"type\":\"%s\",\"rev\":%d.%d,\"mem\":%d,\"init\":%d}"),cnt + 1, name, modules[cnt].mod_addr, fm->execution_offset,
-       Get_mod_size, type, (rev>>16),(rev&0xff), modules[cnt].mem_size, modules[cnt].flags.initialized);
+       Get_mod_size, type, (rev>>16),(rev&0xff), Get_mod_ram(cnt), modules[cnt].flags.initialized);
        index++;
     }
   }
@@ -3547,7 +3904,7 @@ void Module_mdir(void) {
       char type[6];
       GetTextIndexed(type, sizeof(type), mtype, mod_types );
       AddLog(LOG_LEVEL_INFO, PSTR("| %2d | %-15s| %08x | %4d | %4s | %04x | %4d |  %1d   |"), cnt + 1, name, modules[cnt].mod_addr,
-       modules[cnt].mod_size,  type, rev, modules[cnt].mem_size, modules[cnt].flags.initialized);
+       modules[cnt].mod_size,  type, rev, Get_mod_ram(cnt), modules[cnt].flags.initialized);
       // AddLog(LOG_LEVEL_INFO, PSTR("| %2d | %-16s| %08x | %4d | %4s | %04x | %4d | %1d | %08x"), cnt + 1, fm->name, modules[cnt].mod_addr,
       //  modules[cnt].mod_size,  type, fm->revision, modules[cnt].mem_size, modules[cnt].flags.initialized, fm->execution_offset);
 
@@ -4305,7 +4662,7 @@ bool scan_ptable(uint8_t *mp, uint32_t num) {
   return ret;
 }
 
-// show or add(aX) or remove(r) custom partition (X 1..4, optional size extender time 64k)
+// show or add(aX) or remove(r) custom partition (X 1..8, optional size extender time 64k)
 // pack(p) shrinks app0 to 1856k and expands spiffs, preserving custom partition
 // we steel the size from the spiffs partition
 void Check_partition(void) {
@@ -4327,8 +4684,8 @@ void Check_partition(void) {
       add = 1;
       cp++;
       uint32_t fac = strtol(cp, &cp, 10);
-      if (fac > 4) {
-        fac = 4;
+      if (fac > 8) {          // was 4 (256 KB); 8 = 512 KB leaves room for I2SAUDIO + a TTS BLIB + Matter
+        fac = 8;
       }
       if (!fac) {
         fac = 1;
@@ -4638,9 +4995,18 @@ typedef struct {
   uint8_t result[16];
   md5.getBytes(result);
   uint8_t *end_offset = mp + (num_partitions * sizeof(esp_partition_info_t));
+  // ⚠️ Everything behind the last entry back to the erased state first. A
+  // removed partition (chkpt r, chkpt d) shortens the table by one entry, so
+  // the new MD5 entry lands where the last partition was -- and the OLD MD5
+  // entry stayed right behind it. The bootloader rejects a table with two
+  // ("Only one MD5 checksum is allowed"), finds no app and resets forever:
+  // that bricked two ESP32-C3 on 2026-09-27 (.172, .154; rescued by writing a
+  // valid partitions.bin to 0x8000). MD5 entry as gen_esp32part writes it:
+  // EB EB, 14 x FF, the digest.
+  memset(end_offset, 0xff, SPI_FLASH_SEC_SIZE - (end_offset - mp));
   end_offset[0] = 0xeb;
   end_offset[1] = 0xeb;
-  memmove(end_offset + 16, result, 16);
+  memcpy(end_offset + 16, result, 16);
 
 #if 0
   File wf = ufsp->open("/partition.bin", FS_FILE_WRITE);
@@ -4794,11 +5160,10 @@ void Modul_Check_HTML_Setvars(void) {
       }
     }
     else if (!strncmp(cp, "auto", 4)) {
-      // autostart checkbox in the plugin-menu header: flip the Option_A7 flag
-      // (gpio_optiona.shelly_pro) only — nothing else.
+      // autostart checkbox in the plugin-menu header, saved (see Plugin_Autostart)
       cp += 4;
       if (*cp == '_') { cp++; }
-      TasmotaGlobal.gpio_optiona.shelly_pro = strtol(cp, &cp, 10) ? 1 : 0;
+      Plugin_SetAutostart(strtol(cp, &cp, 10) != 0);
     }
   }
 
@@ -4831,9 +5196,9 @@ void Module_upload() {
 
   WSContentSend_P(MOD_FORM_FILE_UPGc, WebColor(COL_TEXT), MAX_PLUGINS, MOD_FreeSlots(),color,GetTextIndexed(type, sizeof(type), plugins.upload_error, MOD_UPL_ERRMSG));
 
-  // Autostart-at-boot toggle (Option_A7 / gpio_optiona.shelly_pro) — moved into the plugin menu.
+  // Autostart-at-boot toggle, saved in /plugins.auto (see Plugin_Autostart).
   WSContentSend_P(PSTR("<p style='text-align:left'><label><input type='checkbox' onclick='seva(this.checked?1:0,\"auto\")'%s>&nbsp;Autostart plugins at boot</label></p>"),
-    TasmotaGlobal.gpio_optiona.shelly_pro ? " checked" : "");
+    Plugin_Autostart() ? " checked" : "");
 
 #ifdef EXECUTE_FROM_BINARY
   WSContentSend_P(MOD_FORM_FILE_UPG, PSTR("Plugin upload disabled"));
@@ -4878,7 +5243,7 @@ void Module_upload() {
       char srev[8];
       float frev = (float)(rev >> 16) + (float)(rev & 0xffff)/100;
       dtostrf(frev, 1, 2, srev);
-      WSContentSend_P(HTTP_MODULES_COMMONa, "808080", cnt + 1, name, type, srev, Get_mod_size, modules[cnt].mem_size);
+      WSContentSend_P(HTTP_MODULES_COMMONa, "808080", cnt + 1, name, type, srev, Get_mod_size, Get_mod_ram(cnt));
 
       WSContentSend_P(PSTR("<td>"));
       uint32_t num = fm->arch & 0xff000000;

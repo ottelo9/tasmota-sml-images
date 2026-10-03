@@ -46,6 +46,40 @@ IDE. ESP8266 builds are `_tas` only.
 
    A wrong entry makes the next diff silently miss or repeat files.
 
+4. **Platform:** this repo builds with platform `2026.05.50` like gemu
+   (Arduino 3.3.8 / IDF 5.5.4). Going back to `2026.02.30` (IDF 5.3.4, the
+   fallback for the WT32-ETH01 reboots of issue #53) breaks the build of every
+   env with Ethernet: `ETH_CMD_S_ALL_MULTICAST` in `xdrv_124_tinyc_vm.h`
+   needs IDF 5.5 and would have to go behind an `ESP_IDF_VERSION` check.
+
+## Local patches on gemu files
+
+Re-apply after copying a gemu file, until gemu has them (diff against the fork):
+
+- `tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino`: four hooks for the
+  Marstek CT002 registration page `/ctreg` (include of
+  `include/xdrv_10_ct002_registration.h`, `CtRegEverySecond()` in
+  `FUNC_EVERY_SECOND`, management button, two `Webserver->on("/ctreg")`),
+  all behind `USE_SCRIPT_CT002_REGISTRATION`. Only the image
+  `tasmota1m_ct002_ottelo_tas` sets it. Code by next145.
+
+## Backports from official Tasmota (not from gemu)
+
+- `tasmota/tasmota_xdrv_driver/xdrv_82_esp32_ethernet.ino`: the 15.5.0 file
+  plus Tasmota PR #25051 (WT32-ETH01 init: `eth_type` read before the module
+  defaults were set, issue #25043). Drop this overlay when the Tasmota base is
+  a release that contains the PR — it would otherwise replace a newer driver.
+
+## Marsrelay (own driver, not from gemu)
+
+`tasmota_xdrv_driver/xdrv_100_marsrelay.ino` + `include/xdrv_100_marsrelay*.h`:
+port of github.com/tomquist/marsrelay (Marstek battery without cloud: DNS, TLS
+MQTT broker 8883, HTTPS 443, clock endpoint on port 80, UDP proxy). Built only by
+the envs `tasmota32s3_marsrelay` / `tasmota32s3opi_marsrelay` (`MARSRELAY_BUILD`).
+The TLS server needs `lib/lib_ssl/bearssl-esp8266/src/ssl/ssl_server_min.c` —
+keep that overlay. Cert/key arrays in `_certs.h` are generated from marsrelay's
+PEMs (DER + RSA CRT components).
+
 ## TinyC compatibility
 
 `TC_RELEASE` and `TC_SYSCALL_ABI` live in `tasmota/include/xdrv_124_tinyc_vm.h`.

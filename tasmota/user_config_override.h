@@ -247,10 +247,15 @@
   //-- Scripter + Charts + Web-Display
   #define USE_SCRIPT             //(+36k code, +1k mem)
   #undef USE_RULES               //USE_SCRIPT & USE_RULES can't both be used at the same time
-  #define USE_GOOGLE_CHARTS
-  #define LARGE_ARRAYS
+  //-- Diagramme und große Arrays nicht im CT002-Image (das Script nutzt keins davon)
+  #ifndef TASMOTA1M_CT002_OTTELO
+    #define USE_GOOGLE_CHARTS
+    #define LARGE_ARRAYS
+  #endif
   #define USE_SCRIPT_WEB_DISPLAY
-  #define USE_CW_CALC            //Kalenderwochen via Variable cw
+  #ifndef TASMOTA1M_CT002_OTTELO
+    #define USE_CW_CALC          //Kalenderwochen via Variable cw
+  #endif
   #define USE_HTML_CALLBACK      //für Smartmeter Descriptor dropdown list smlpd()
 
   #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_SHELLY_OTTELO) )
@@ -267,8 +272,15 @@
   #endif
 
   //-- shellypro3em emulieren (z.B. für Marstek Venus E) — braucht mDNS
-  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) )
+  //-- nicht im CT002-Image: der CT002-Emulator braucht kein mDNS
+  #if ( !defined(TASMOTA1M_OTTELO) && !defined(TASMOTA1M_ENERGY_OTTELO) && !defined(TASMOTA1M_CT002_OTTELO) )
     #define USE_SCRIPT_MDNS      //14KB
+  #endif
+
+  //-- Marstek CT002: Seite /ctreg zur einmaligen Cloud-Anmeldung (nur Image tasmota1m_ct002,
+  //-- das sonst dem tasmota1m_shelly entspricht). Code: include/xdrv_10_ct002_registration.h
+  #ifdef TASMOTA1M_CT002_OTTELO
+    #define USE_SCRIPT_CT002_REGISTRATION
   #endif
 
   //-- globale Variablen + >J Sektion
@@ -294,6 +306,11 @@
   // gibt's Linker-Error "undefined reference to StartMdns()" beim Matter-Init.
   // Tasmota's my_user_config.h hat USE_DISCOVERY per Default auskommentiert.
   #define USE_MATTER_C
+  //-- Matter nur als Plugin (MATTERF, ab TinyC 1.6.70): die eingebaute Engine
+  //-- kostet auf jedem Gerät ~33 KB RAM, auch ohne Matter. Wer Matter will,
+  //-- lädt das Plugin: tasmota/tinyc/docs/MATTER_PLUGIN_DE.md im gemu2015-Repo.
+  //-- Braucht USE_BINPLUGINS (unten).
+  #define USE_MATTER_C_PLUGIN_ONLY
   #define USE_DISCOVERY        //+8KB Flash, +0.3KB RAM — mDNS, von Matter benötigt
   #define WEBSERVER_ADVERTISE  //<Hostname>.local/ — Standard zusammen mit mDNS
   //-- BinPlugin-Loader: ermöglicht das Nachladen relocatabler Plugin-.bin
@@ -394,6 +411,16 @@
   #define OTA_URL "Upgrade nur via minimal.bin moeglich!"
 #elif defined(TASMOTA4M_OTTELO)
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota4m_ottelo" _OTTELO_SFX ".bin.gz"
+#endif
+
+//-- Marsrelay: Marstek-Akku ohne Cloud (Env tasmota32s3_marsrelay / tasmota32s3opi_marsrelay)
+//-- Treiber: tasmota_xdrv_driver/xdrv_100_marsrelay.ino, Doku im Dateikopf.
+#ifdef MARSRELAY_BUILD
+  #define USE_MARSRELAY
+  #define USE_WIFI_RANGE_EXTENDER   // AP fuer den Akku neben dem Heim-WLAN (Rgx...-Befehle)
+  // bewusst ohne USE_WIFI_RANGE_EXTENDER_NAPT: der Akku soll keinen Internetzugang haben
+  #undef OTA_URL                    // nie auf das S3-TC-Image ohne Marsrelay updaten
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_marsrelay.bin"
 #endif
 
 #endif // TASMOTA OTTELO

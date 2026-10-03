@@ -27,6 +27,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | tasmota4m_ottelo_tas         | ESP mit 4M+ Flash. Nur Scripter (kein _tc — ESP8266 4M hat kein I2C für den BinPlugin-Loader, und TinyC lohnt bei dem RAM kaum). Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter) und für Steckdosen mit Energiemessung (mit 4M Speicher). |
 | tasmota1m_energy_ottelo_tas  | ESP mit 1M Flash für Steckdosen mit Energiemessung z.B. Nous A1T, Sonoff Pow R2, Gosund EP2. Nur Scripter. Web-Upgrade nur über tasmota-minimal! |
 | tasmota1m_shelly_ottelo_tas  | ESP mit 1M Flash. Mit Shelly Pro 3EM / EcoTracker Emulation (+mDNS) als Meter für smarte Akkus (z.B. Marstek Venus / Jupiter). Nur Scripter. Der Scriptspeicher ist auf 4096 Zeichen begrenzt (statt 8192). Für Scripte siehe, [ESP8266 Scripte - Ordner komprimiert](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266). HomeAssistant/MQTT aber weiterhin möglich. Web-Upgrade nur über tasmota-minimal! |
+| tasmota1m_ct002_ottelo_tas   | Wie tasmota1m_shelly, aber ohne mDNS (keine Shelly/EcoTracker-Emulation), dafür mit der Seite **Marstek CT002** (`/ctreg`, unter Werkzeuge) zur einmaligen Anmeldung des CT002-Emulators in der Marstek-Cloud. Für das [CT002-Emulator-Script](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266/pvakku-powermeter-emulator) (bis zu 4 Marstek-Akkus). Web-Upgrade nur über tasmota-minimal! |
 | tasmota-minimal              | Minimalimage, siehe Beschreibung unten oder tasmota_energy_ottelo |
 
 Die Images sind alle gezippt. Im ZIP-Archiv befindet sich für den ESP32 immer auch das factory Image. Das wird beim erstmaligen Flashen auf einen leeren ESP32 benötigt bzw. wenn vorher noch kein Tasmota drauf war. Im ZIP-Archiv für den ESP8266 befinden sich alle Varianten gesammelt im bin.gz Format. Das .bin.gz muss immer für das Firmware-Upgrade via "Use file upload" über den Webbrowser verwendet werden, da das nicht komprimierte .bin Image sonst nicht übertragen werden kann (zu wenig Flash-Speicher). Falls es mal doch nicht passenden sollte (Fehlermeldung), dann muss vorher einmal das tasmota-minimal.bin.gz Image übertragen werden. Anschließend kann das .bin.gz Image übertragen werden. Zum erstmaligen Flashen via USB-Flasher muss die .gz entpackt werden.  
@@ -40,9 +41,19 @@ I.d.R. haben die ESP Boards eine USB-Buchse, die am PC einen COM-Port zur Verfü
 Die wählt ihr direkt auf eurem ESP in Tasmota aus: Tools > Edit Script oder Tools > TinyC Console > Repo  
 Den Sourcecode der Programme findet ihr [hier](https://github.com/ottelo9/tasmota-sml-script).  
 
+### Projekte, die diese Images nutzen
+Diese Projekte von mir laufen auf den Images hier:
+
+| Projekt | Beschreibung | Image |
+| ------------- | ------------- | ------------- |
+| [tasmota-sml-script](https://github.com/ottelo9/tasmota-sml-script) | Stromzähler auslesen (SML) mit Charts, Shelly / EcoTracker / CT002 Emulation für smarte Akkus | `_tas` (Scripte) oder `_tc` (TinyC Programme) |
+| [syrup](https://github.com/ottelo9/syrup) | SYR Safe-T+ Connect Leckageschutz ohne Cloud auslesen. Das TinyC Programm hört passiv am RS-485 Servicebus des Geräts mit | `_tc` (ESP32) |
+| [Shimano-Steps-Simulator-BT-E6000](https://github.com/ottelo9/Shimano-Steps-Simulator-BT-E6000) | Shimano Steps Akku BT-E6000: Akku oder Motor simulieren, Akku ohne Original-Ladegerät laden, Protokoll mitschneiden | `_tc` (ESP32) |
+
 ### Shelly / Marstek CT002 / EcoTracker Emulation für smarte Akkus (wie z.B. Marstek Venus C,E, Jupiter, Hoymiles, Growatt NOAH 2000)
 [Kompatible Akku Liste](https://github.com/ottelo9/tasmota-sml-script/blob/main/README.md#pvakku-powermeter-emulator-esp32)  
 Ab V15.0.1 habe ich den Support für die Emulation des Shelly/EcoTracker inkludiert. Die Emulation ist in allen ESP32 Images inkludiert. Für den ESP8266 habe ich eine abgespeckte Firmware erstellt (tasmota1m_shelly), dort funktionieren nur die kleinen Basisscripte (_Simple.tas findet ihr im [ESP8266 Ordner](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266/pvakku-powermeter-emulator/komprimiert)). Die Scripte findet ihr direkt auf euren ESP in Tasmota (DropDown) oder [hier](https://github.com/ottelo9/tasmota-sml-script/tree/main/pvakku-powermeter-emulator). Eine [Anleitung](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/#13a) habe ich auf meinem Blog veröffentlicht.  
+Für den Marstek CT002 Emulator auf dem ESP8266 (Script `2_CT002_Emulator.tas` von next145, bis zu 4 Marstek-Akkus) gibt es das eigene Image **tasmota1m_ct002**. Es hat zusätzlich die Seite **Marstek CT002** (`/ctreg`, unter Werkzeuge), über die der CT002 einmalig in der Marstek-Cloud angemeldet wird.  
 
 ### TinyC (löst Script ab!)
 Ich habe fast alle meine Tasmota Scripte von inkl. den Ecotracker/Shelly Emulatoren auf TinyC konvertiert. Wenn ihr neu dabei seid, würde ich euch empfehlen direkt mit TinyC anzufangen statt Script.  
@@ -163,6 +174,7 @@ ESP8266:
 `pio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
 `pio run -e tasmota1m_energy_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für SonOff POW (R2) / Gosund EP2 / SonOff Dual R3 v2 / Nous A1T)  
 `pio run -e tasmota1m_shelly_ottelo_tas` ( = 1M Flash, nur Scripter. Update nur über minimal Image. Für Shelly/EcoTracker Emu Scripte für smarte Akkus wie z.B. Marstek (Venus, Jupiter, B2500) oder Hoymiles (MS-A2))  
+`pio run -e tasmota1m_ct002_ottelo_tas` ( = wie tasmota1m_shelly ohne mDNS, plus /ctreg zur Marstek-Anmeldung für den CT002-Emulator)  
 `pio run -e tasmota4m_ottelo_tas`        (>= 4M Flash, nur Scripter — kein _tc, ESP8266 4M hat kein I2C für den BinPlugin-Loader)  
 
 Um alle gleichzeitig zu erstellen (Bash + jq):  
@@ -393,14 +405,14 @@ USE_SCRIPT
 USE_SCRIPT_FATFS_EXT (ESP32, ESP8266 4M+)
 USE_EEPROM (ESP8266 1M)
 EEP_SCRIPT_SIZE 8192 (ESP8266 1M / 1M Energy)
-EEP_SCRIPT_SIZE 4096 (ESP8266 1M Shelly)
-USE_GOOGLE_CHARTS
+EEP_SCRIPT_SIZE 4096 (ESP8266 1M Shelly / 1M CT002)
+USE_GOOGLE_CHARTS (nicht ESP8266 1M CT002)
 USE_SCRIPT_WEB_DISPLAY
 USE_HTML_CALLBACK
-LARGE_ARRAYS
+LARGE_ARRAYS (nicht ESP8266 1M CT002)
 SCRIPT_LARGE_VNBUFF (ESP32)
 MAX_ARRAY_SIZE 2000 (ESP32)
-USE_CW_CALC
+USE_CW_CALC (nicht ESP8266 1M CT002)
 USE_ANGLE_FUNC (ESP32, ESP8266 +4M)
 USE_FEXTRACT (ESP32, ESP8266 +4M)
 USE_SCRIPT_SERIAL (nur ESP32)
@@ -408,6 +420,7 @@ SCRIPT_FULL_WEBPAGE (nur ESP32)
 USE_SCRIPT_TCP_SERVER (nur ESP32)
 USE_SCRIPT_TASK (nur ESP32)
 USE_SCRIPT_MDNS (ESP32, ESP8266 1M Shelly)
+USE_SCRIPT_CT002_REGISTRATION (ESP8266 1M CT002, Seite /ctreg)
 USE_SCRIPT_GLOBVARS
 USE_SCRIPT_JSON_EXPORT
 ------------------
