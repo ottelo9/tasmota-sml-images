@@ -352,7 +352,7 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
 // The IDE banner takes TC_RELEASE automatically (idesrc/bundle.py fills
 // __TC_RELEASE__ in index.html) -- rebundle the IDE after a bump.
-#define TC_RELEASE         "1.6.71"     // release notes: tasmota/tinyc/CHANGELOG.md
+#define TC_RELEASE         "1.6.72"     // release notes: tasmota/tinyc/CHANGELOG.md
 
 // Default malloc() PSRAM limit on every PSRAM build (TinyCPsram). The framework
 // bakes CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096 into its heap: every malloc()
@@ -4461,6 +4461,38 @@ static void tc_udp_poll(void) {
 #define TC_DEFER_MAX_WAIT_MS 400
 #endif
 
+// Run a Tasmota command and return its JSON answer.
+//
+// ⚠️ ResponseData() IS EMPTY AFTER ExecuteCommand() (found 03.10.2026): the core's
+// XdrvRulesProcess(bool) ends with ResponseClear() ("Free heap space"), and every command
+// goes through it, so tasmCmd() returned 0 bytes for every command. Tasmota's own /cm
+// handler reads the answer back from the LOG BUFFER instead: raise the temporary log level
+// so the "RSL: RESULT = {...}" line is kept, run the command, take the JSON from the lines
+// logged since. Same here, same merge rule as /cm (several answers become one object).
+static String tc_command_response(const char *cmd) {
+  String out;
+  uint32_t curridx = TasmotaGlobal.log_buffer_pointer;
+  TasmotaGlobal.templog_level = LOG_LEVEL_INFO;
+  ExecuteCommand((char*)cmd, SRC_TCL);
+  uint32_t index = curridx;
+  char *line;
+  size_t len;
+  int parts = 0;
+  while (GetLog(TasmotaGlobal.templog_level, &index, &line, &len)) {
+    // [14:49:36.123 MQT: stat/x/RESULT = {"POWER":"OFF"}] -> {"POWER":"OFF"} (as in HandleHttpCommand)
+    char *json = (char*)memchr(line, '{', len);
+    if (!json) continue;
+    int32_t jlen = (int32_t)(len - (json - line)) - 3;
+    for (++json; jlen > 0 && json[jlen] != '}'; jlen--) { }
+    if (jlen < 0) jlen = 0;
+    out += (parts++) ? "," : "{";
+    out.concat(json, (unsigned int)jlen);
+  }
+  TasmotaGlobal.templog_level = 0;
+  if (parts) out += "}";
+  return out;
+}
+
 static void tc_defer_command(const char *cmd) {
   if (!Tinyc || Tinyc->deferred_pending) return;  // drop if one is already pending
   strlcpy(Tinyc->deferred_cmd, cmd, sizeof(Tinyc->deferred_cmd));
@@ -7957,10 +7989,10 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t maxLen = tc_ref_maxlen(vm, buf_ref) - 1;
       if (maxLen <= 0) { TC_PUSH(vm, 0); break; }
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: tasmCmd(\"%s\")"), cmd);
-      // Execute Tasmota command — response goes to global buffer
-      ExecuteCommand((char*)cmd, SRC_TCL);
-      // Capture response immediately before it's overwritten
-      const char *resp = ResponseData();
+      // Execute the command and take its answer from the log buffer (ResponseData() is
+      // cleared by the core after every command, see tc_command_response)
+      String respStr = tc_command_response(cmd);
+      const char *resp = respStr.c_str();
       int32_t rlen = strlen(resp);
       // Byte-aware, same reason as httpGet/smlGetStr: maxLen is a BYTE count
       // for a packed byte[] while a bare buf[i] writes int32 slots.
@@ -7983,25 +8015,29 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
         TC_PUSH(vm, -1);
         break;
       }
-      // Extract command string from VM int32 array
-      int32_t cmdMax = tc_ref_maxlen(vm, cmd_ref);
-      TC_BUF(cmdbuf, 128);
-      int32_t ci = 0;
-      while (cmd_arr[ci] != 0 && ci < cmdMax && ci < (int32_t)sizeof(cmdbuf) - 1) {
-        cmdbuf[ci] = (char)(cmd_arr[ci] & 0xFF); ci++;
-      }
-      cmdbuf[ci] = '\0';
+      // ⚠️ The command comes from a char[] OR a packed byte[] and is built at run time.
+      // Two defects until 03.10.2026 (ottelo): a 128-byte buffer cut every command at 127
+      // characters, and the command was read as int32 slots even from a byte[] — four
+      // characters per "char", i.e. garbage. tc_ref_to_cstr() is byte-aware and logs a cut.
+#ifdef ESP8266
+      TC_BUF(cmdbuf, 256);
+#else
+      TC_BUF(cmdbuf, 512);
+#endif
+      tc_ref_to_cstr(vm, cmd_ref, cmdbuf, sizeof(cmdbuf));
       int32_t maxLen = tc_ref_maxlen(vm, buf_ref) - 1;
       if (maxLen <= 0) { TC_PUSH(vm, 0); break; }
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: tasmCmd(\"%s\")"), cmdbuf);
-      ExecuteCommand(cmdbuf, SRC_TCL);
-      const char *resp = ResponseData();
+      String respStr = tc_command_response(cmdbuf);
+      const char *resp = respStr.c_str();
       int32_t rlen = strlen(resp);
       if (rlen > maxLen) rlen = maxLen;
+      // the answer goes into a char[] or a byte[] (same rule as tasmCmd with a literal)
+      const bool out_bytes = tc_ref_is_bytes(buf_ref);
       for (int32_t i = 0; i < rlen; i++) {
-        buf[i] = (int32_t)(uint8_t)resp[i];
+        tc_chr_put(buf, out_bytes, i, (int32_t)(uint8_t)resp[i]);
       }
-      buf[rlen] = 0;
+      tc_chr_put(buf, out_bytes, rlen, 0);
       TC_PUSH(vm, rlen);
       break;
     }
@@ -8013,13 +8049,8 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t cmd_ref = TC_POP(vm);
       int32_t *cmd_arr = tc_resolve_ref(vm, cmd_ref);
       if (!cmd_arr) break;
-      int32_t cmdMax = tc_ref_maxlen(vm, cmd_ref);
-      TC_BUF(cmdbuf, 256);
-      int32_t ci = 0;
-      while (ci < cmdMax && ci < (int32_t)sizeof(cmdbuf) - 1 && cmd_arr[ci] != 0) {
-        cmdbuf[ci] = (char)(cmd_arr[ci] & 0xFF); ci++;
-      }
-      cmdbuf[ci] = '\0';
+      TC_BUF(cmdbuf, 256);          // = sizeof(Tinyc->deferred_cmd)
+      tc_ref_to_cstr(vm, cmd_ref, cmdbuf, sizeof(cmdbuf));   // byte-aware for byte[], logs a cut
       AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: tasmDefer('%s')"), cmdbuf);
       tc_defer_command(cmdbuf);
       break;

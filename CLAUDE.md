@@ -52,16 +52,21 @@ IDE. ESP8266 builds are `_tas` only.
    env with Ethernet: `ETH_CMD_S_ALL_MULTICAST` in `xdrv_124_tinyc_vm.h`
    needs IDF 5.5 and would have to go behind an `ESP_IDF_VERSION` check.
 
-## Local patches on gemu files
+## CT002 registration page (ESP8266, Scripter)
 
-Re-apply after copying a gemu file, until gemu has them (diff against the fork):
+`include/xdrv_10_ct002_registration.h` + four hooks in `xdrv_10_scripter.ino`
+(page `/ctreg`), behind `USE_SCRIPT_CT002_REGISTRATION`; only the image
+`tasmota1m_ct002_ottelo_tas` sets it. Code by next145, in gemu's fork since
+`67c8e784e` — no local patch any more, both files are plain gemu copies.
 
-- `tasmota/tasmota_xdrv_driver/xdrv_10_scripter.ino`: four hooks for the
-  Marstek CT002 registration page `/ctreg` (include of
-  `include/xdrv_10_ct002_registration.h`, `CtRegEverySecond()` in
-  `FUNC_EVERY_SECOND`, management button, two `Webserver->on("/ctreg")`),
-  all behind `USE_SCRIPT_CT002_REGISTRATION`. Only the image
-  `tasmota1m_ct002_ottelo_tas` sets it. Code by next145.
+## Matter: plugin only
+
+All `_tc` envs set `USE_MATTER_C_PLUGIN_ONLY`; Matter comes as gemu's ready-made
+`MATTERF_32r.bin` from his release (never built here). So
+`lib/libesp32_div/matter_c/` carries only `include/`, `library.json` and the
+two build-hook scripts `test/prebuild_creds.py` + `test/gen_csa_creds.py`
+(`library.json` calls them; without them the build stops). No `src/` — do
+not copy gemu's `src/` or the other `test/` files on an adoption.
 
 ## Backports from official Tasmota (not from gemu)
 

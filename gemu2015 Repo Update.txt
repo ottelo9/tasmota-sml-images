@@ -1,2 +1,2 @@
-03.10.2026 08:55
-https://github.com/gemu2015/Sonoff-Tasmota/commit/7a32bda439597aad61304fb46333afbd2a13e6e7
+04.10.2026 12:34
+https://github.com/gemu2015/Sonoff-Tasmota/commit/ad83d9e25b6ba72c4aea109fbd37a62aaaf34896
