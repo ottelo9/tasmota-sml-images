@@ -194,6 +194,14 @@ static SemaphoreHandle_t tc_jpg_mutex = xSemaphoreCreateMutex();
 int32_t tc_dl_person_run(int32_t schwelle_x100);
 int32_t tc_dl_person_get(int32_t sel);
 #endif
+// /tcrepo ("Run IDE from repo": the full IDE pulled from the repository into the browser, nothing but a ~6 KB
+// page on the device) is ON by default in every TinyC build -- the "Run IDE from repo" button of the console page
+// and the way to use TinyC without the 265 KB IDE file on the device. Before 1.6.73 it needed -DUSE_TINYC_REPO_IDE,
+// which only some of our own environments set (in a git-ignored platformio_override.ini), so a build from the
+// repository did not have it. -DTINYC_NO_REPO_IDE leaves it out (about 6 KB of flash).
+#if !defined(USE_TINYC_REPO_IDE) && !defined(TINYC_NO_REPO_IDE)
+#define USE_TINYC_REPO_IDE
+#endif
 #include "include/xdrv_124_tinyc_vm.h"
 #include "include/xdrv_124_tinyc_repoide.h"   // /tcrepo page (USE_TINYC_REPO_IDE)
 
@@ -2711,6 +2719,7 @@ static void HandleTinyCPage(void) {
     "select{min-width:0}"
     ".tc-run{color:#0a0}.tc-load{color:#fa0}.tc-empty{color:var(--c_txt);opacity:.5}"
     ".tc-err{color:#f44}"
+    ".tc-up{width:auto;padding:0 6px;margin-left:6px;line-height:1.4rem;font-size:.85em;background:#fa0;color:#000}"
     ".tc-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #333}"
     ".tc-row:last-child{border-bottom:none}"
     ".tc-info{flex:1;font-size:.9em}"
@@ -2743,14 +2752,28 @@ static void HandleTinyCPage(void) {
       // Determine filename: from loaded slot or from config
       const char *fname = (s && s->filename[0]) ? s->filename : Tinyc->slot_config[si].filename;
 
-      // Compact row: [dot status] filename (size) | buttons
+      // ottelo (own patch): the plain name out of the .tcb header instead of the file
+      // name - with build.html it carries the version, "SML Chart [12.10.26]". The file
+      // name moves into the tooltip, the state word into the dot's tooltip (the colour
+      // already says it), the size is whole kB. data-f/data-n let the page script mark
+      // a newer version in the repository and offer the update (tcUp/tcUpd).
+      char mname[52] = { 0 };
+#ifdef USE_UFILESYS
+      if (fname && fname[0]) {
+        if (!tc_tcb_meta(ufsp, fname, mname, sizeof(mname), nullptr, 0) && ffsp && ffsp != ufsp) {
+          tc_tcb_meta(ffsp, fname, mname, sizeof(mname), nullptr, 0);
+        }
+      }
+#endif
+      const char *fbase = (fname && fname[0] == '/') ? fname + 1 : fname;
+      String mesc = HtmlEscape(String(mname));
       WSContentSend_P(PSTR(
-        "<div class='tc-row'>"
-        "<span class='%s'>&#x25cf;</span>"
-        "<span class='tc-info'><b>%d</b> %s %s (%dB)"),
-        sc, si, state,
-        fname,
-        s ? s->program_size : 0);
+        "<div class='tc-row' data-f='%s' data-n='%s' data-s='%d'>"
+        "<span class='%s' title='%s'>&#x25cf;</span>"
+        "<span class='tc-info' title='%s'><b>%d</b> %s (%dkB)"),
+        fbase, mesc.c_str(), si, sc, state, fname, si,
+        mname[0] ? mesc.c_str() : fname,
+        s ? (int)((s->program_size + 512) / 1024) : 0);
 
       if (s && s->vm.error != 0) {
         WSContentSend_P(PSTR(" <span class='tc-err'>%s</span>"), tc_error_str(s->vm.error));
@@ -2981,8 +3004,16 @@ static void HandleTinyCPage(void) {
             // build.html keeps writing), new firmware against an old repo falls
             // back here. Entries are {file,name,info}; anything missing degrades
             // to exactly the old behaviour, the bare filename.
-            "function tcOpt(s,f,n,u){var o=document.createElement('option');"
-            "o.value=f;o.textContent=n?n+' ('+f+')':f;if(u)o.dataset.u=u;s.appendChild(o)}"
+            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): „Name (datei)" OHNE
+            // „.tcb", und die Liste nach DIESEM Etikett sortiert — nicht nach Dateiname, sonst steht
+            // „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den e-Dateien. Die IDE-Liste
+            // „Repo Examples" bildet dasselbe Etikett aus index.json.
+            "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
+            // ottelo (own patch): only the name when there is one - his names carry the date.
+            "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n:f}"
+            "function tcOpt(s,f,n,u){var o=document.createElement('option'),"
+            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f;"
+            "o.value=f;o.textContent=n?n:b;if(u)o.dataset.u=u;s.appendChild(o)}"
             "function tcrU(){var s=document.getElementById('tcrf');"
             "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
             "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
@@ -3015,7 +3046,8 @@ static void HandleTinyCPage(void) {
             "function tcTxt(s,f){return fetch(tcB()+'/index.txt',{cache:f?'reload':'default'})"
             ".then(function(r){if(!r.ok)throw r.status;return r.text()}).then(function(t){"
             "var ls=t.split(String.fromCharCode(10)).map(function(x){return x.trim()})"
-            ".filter(function(x){return x.slice(-4)=='.tcb'});s.innerHTML='';"
+            ".filter(function(x){return x.slice(-4)=='.tcb'})"
+            ".sort(function(a,b){a=a.toLowerCase();b=b.toLowerCase();return a<b?-1:a>b?1:0});s.innerHTML='';"
             "if(!ls.length){s.innerHTML='<option>(empty)</option>';return}"
             "ls.forEach(function(n){tcOpt(s,n,'','')})})}"
             // ⚠️ DIE ALTE MELDUNG ZUERST WEG. Sie wird nur im Fehlerfall
@@ -3025,14 +3057,37 @@ static void HandleTinyCPage(void) {
             // und zurueck, und dann steht "Repo list fetch failed: 404" neben
             // einer Liste, die einwandfrei geladen hat. Am Geraet nachgemessen
             // (.186, 2026-09-14).
+            // ottelo (own patch): a slot whose program has a newer date in this
+            // repository's index.json ("Name [dd.MM.yy]", same file) gets a button
+            // "🔄 [date]": it loads that file into the same slot, the way
+            // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and
+            // saved by the firmware before the upload replaces the program.
+            "function tcD(x){var p=x.split('.');return p.length==3?p[2]+p[1]+p[0]:''}"
+            "function tcUp(ls){document.querySelectorAll('.tc-row[data-f]').forEach(function(r){"
+            "var o=r.querySelector('.tc-up');if(o)o.remove();"
+            "var e=ls.filter(function(x){return (x.file||x.f)==r.dataset.f})[0];if(!e)return;"
+            "var m=(e.name||e.n||'').match(/\\[([0-9.]+)\\]$/),k=(r.dataset.n||'').match(/\\[([0-9.]+)\\]$/);"
+            "if(!m||(k&&tcD(m[1])<=tcD(k[1])))return;"
+            "var s=document.createElement('button');s.type='button';s.className='button tc-up';"
+            "s.title='Update';s.innerHTML='&#x1F504; ['+m[1]+']';"
+            "s.onclick=function(){tcUpd(r.dataset.f,r.dataset.s,e.name||e.n||r.dataset.f)};"
+            "r.querySelector('.tc-info').appendChild(s)})}"
+            "function tcUpd(f,sl,n){var a=document.getElementById('tcrf'),b=document.getElementById('tcrs');"
+            "a.value=f;b.value=sl;if(a.value!=f||b.value!=sl)return;"
+            "if(!confirm('Update: '+n+' -> Slot '+sl+'?'))return;tcDl()}"
             "function tcFill(f){var s=document.getElementById('tcrf');"
             "var m0=document.getElementById('tcrmsg');if(m0)m0.textContent='';"
             "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
             "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
-            "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';s.innerHTML='';"
-            "ls.forEach(function(e){var u=e.info||'';"
+            "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';"
+            // ottelo (own patch): "ordered":true in index.json keeps the repository's own order.
+            "if(!j.ordered)ls=ls.slice().sort(function(a,b){return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
+            "s.innerHTML='';"
+            // ottelo (own patch): {"sep":1} is a separator line, not a program.
+            "ls.forEach(function(e){if(e.sep){var q=document.createElement('option');"
+            "q.disabled=1;q.textContent=Array(21).join('\\u2500');s.appendChild(q);return}var u=e.info||'';"
             "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
-            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL()})"
+            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL();tcUp(ls)})"
             ".catch(function(){return tcTxt(s,f).then(tcrL)}).catch(function(e){"
             "s.innerHTML='<option>(list failed)</option>';tcrS();"
             "document.getElementById('tcrmsg').textContent='Repo list fetch failed: '+e})}"
@@ -4999,8 +5054,10 @@ extern "C" {
                                           uint64_t *out) {
     (void)ctx;
     // Only endpoint 1 (the plug) mirrors relay 1; other endpoints (e.g. an RGB
-    // light) keep their own OnOff in the data-model registry.
-    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000) {
+    // light) keep their own OnOff in the data-model registry. A script can make endpoint 1 something else (the bridge
+    // script's colour light): then the script owns OnOff too, not the relay of this device.
+    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000 &&
+        (mtrc_ep_dt[1] == 0 || mtrc_ep_dt[1] == 0x010A)) {
       *out = bitRead(TasmotaGlobal.power, 0) ? 1 : 0;
       return MATTER_OK;
     }
@@ -7846,11 +7903,23 @@ static void tc_worker_vm_body(void *param) {
     }
     vm->halted = true; vm->running = false;
     tc_output_flush();
+    // Unlink from the primary's heap while still holding vm_mutex: the primary
+    // writes into this VM when its heap grows (tc_heap_alloc), which must not
+    // race the free below.
+    tc_worker_heap_unlink(vm);
     tc_current_slot = nullptr;
     if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
   } while (0);
 
-  // Tear down the worker VM (private stack/frames/heap only; aliased arrays untouched).
+  // The early exits above (main never halted, function gone, no stack) leave
+  // without the mutex and still linked.
+  if (vm->heap_shared) {
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
+    tc_worker_heap_unlink(vm);
+    if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+  }
+
+  // Tear down the worker VM (private stack/frames only; aliased globals/heap untouched).
   slot->has_worker_vm = false;
   tc_free_worker_vm(vm);
   entry->worker_vm = nullptr;

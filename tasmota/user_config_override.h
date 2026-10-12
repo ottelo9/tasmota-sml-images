@@ -423,6 +423,19 @@
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_marsrelay.bin"
 #endif
 
+//-- DFRobot DFR1154 AI CAM (Env tasmota32s3_dfr1154): Kamera, Personenerkennung (ESP-DL,
+//-- -DUSE_TINYC_ESPDL in der Env) und Sprachausgabe (PicoTTS, -DUSE_PICOTTS in der Env).
+//-- Audio laeuft ueber gemus Plugin I2SAUDIO_32.bin (USE_BINPLUGINS ist im TC-Block an).
+#ifdef DFR1154_BUILD
+  #define USE_TINYC_CAMERA
+  #define USE_SPI                   // die SD-Karte der Kamera haengt am SPI (GPIO 10-13 in gemus Vorlage)
+  #define USE_SDCARD                // Personenerkennung laedt ihr Modell von /sd/ped.espdl
+  #undef USE_ETHERNET               // die Kamera hat kein LAN
+  #undef USE_WT32_ETH01
+  #undef OTA_URL                    // nie auf das S3-TC-Image ohne Kamera updaten
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32s3_dfr1154.bin"
+#endif
+
 #endif // TASMOTA OTTELO
 
 

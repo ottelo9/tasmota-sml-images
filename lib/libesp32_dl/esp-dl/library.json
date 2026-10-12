@@ -1,0 +1,23 @@
+{
+  "name": "esp-dl-core",
+  "version": "3.3.11",
+  "description": "ESP-DL Rechenkern + vision/detect (Pico) und vision/image — NUR ESP32-S3. Ohne dl_image_jpeg.cpp: das JPEG entpackt fmt2rgb888 aus esp32-camera, das schon im Bau ist.",
+  "license": "MIT",
+  "platforms": "espressif32",
+  "frameworks": "arduino",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "-<*>",
+      "+<dl/>",
+      "+<fbs_loader/src/>",
+      "+<vision/detect/>",
+      "+<vision/image/>"
+    ],
+    "flags": [
+      "-Wno-error",
+      "-Wno-unused-variable"
+    ],
+    "libArchive": false
+  }
+}

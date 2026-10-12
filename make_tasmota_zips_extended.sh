@@ -127,5 +127,18 @@ for board in "${ESP32_BOARDS[@]}"; do
     done
 done
 
+# =============================================================================
+# DFR1154-Kamera (Env tasmota32s3_dfr1154) — eigenes ZIP, safeboot vom S3.
+# Ihre OTA_URL zeigt auf ota_firmware/ESP32/tasmota32s3_dfr1154.bin.
+# =============================================================================
+files=("tasmota32s3_dfr1154.bin" "tasmota32s3_dfr1154.factory.bin")
+if [ -f "tasmota32s3-safeboot.bin" ]; then
+    cp -f "tasmota32s3-safeboot.bin" "tasmota32s3_dfr1154-safeboot.bin"
+    files+=("tasmota32s3_dfr1154-safeboot.bin")
+else
+    echo "HINWEIS: tasmota32s3-safeboot.bin fehlt - tasmota32s3_dfr1154.zip ohne safeboot"
+fi
+create_zip "tasmota32s3_dfr1154.zip" "${files[@]}" || true
+
 echo ""
 echo "Fertig! ZIP-Dateien (falls erfolgreich) liegen im Ordner: $OUTPUT_DIR"

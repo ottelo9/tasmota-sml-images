@@ -352,7 +352,7 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
 // The IDE banner takes TC_RELEASE automatically (idesrc/bundle.py fills
 // __TC_RELEASE__ in index.html) -- rebundle the IDE after a bump.
-#define TC_RELEASE         "1.6.72"     // release notes: tasmota/tinyc/CHANGELOG.md
+#define TC_RELEASE         "1.6.73"     // release notes: tasmota/tinyc/CHANGELOG.md
 
 // Default malloc() PSRAM limit on every PSRAM build (TinyCPsram). The framework
 // bakes CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096 into its heap: every malloc()
@@ -1757,6 +1757,13 @@ typedef struct {
   int16_t       cb_arg_handle2;  // 2nd reserved handle for 2-arg callbacks, e.g. OnMqttData
   uint16_t      heap_used_peak;  // high-water heap_used in the current window (idle-shrink)
   uint16_t      heap_maint_ticks;// seconds since the last idle-shrink window boundary
+  // spawnTask worker on its own VM (USE_TINYC_WORKER_VM): it works on the
+  // primary's heap, because every array > 16 elements -- locals included --
+  // is compiled into the slot's heap. heap_shared (worker): never allocate or
+  // free it. heap_peer (TcVM*): the other VM; the primary updates the worker's
+  // view when its heap grows (realloc may move it).
+  bool          heap_shared;
+  void         *heap_peer;
   // Callback function table (V3)
   TcCallback    callbacks[TC_MAX_CALLBACKS];
   uint8_t       callback_count;
@@ -2158,6 +2165,13 @@ static uint8_t hk_var_count = 0;
 // come from matter_c.h, which xdrv_124_tinyc.ino includes ahead of this header
 // when USE_MATTER_C is set — so the handlers call them directly, no local
 // forward declarations needed (avoids a matter_err_t-vs-int return mismatch).
+#ifdef USE_MATTER_C
+// Device type a SCRIPT gave to each endpoint (matterAdd), 0 = not declared by a script (the default plug the engine
+// seeds at init). The firmware mirrors relay 1 into OnOff of endpoint 1 only while that endpoint is a plug (see
+// mtrc_p_on_attr_read): a script that makes endpoint 1 a LIGHT owns its OnOff, otherwise Home showed the state of the
+// relay of the bridge instead of the state of the lamp (.122, 05.10.2026).
+static uint16_t mtrc_ep_dt[34];
+#endif
 
 // WebChart state (reset at start of each WebPage callback)
 // mqttPublish(topic_ref, payload_ref, lvl): the VM copies both out of their
@@ -4705,7 +4719,7 @@ static void tc_heap_coalesce(TcVM *vm) {
 }
 
 // Allocate a heap block, returns handle index or -1 on failure
-static int tc_heap_alloc(TcVM *vm, uint16_t size) {
+static int tc_heap_alloc_raw(TcVM *vm, uint16_t size) {
   // Lazy-allocate heap buffer
   if (!vm->heap_data) {
     uint16_t init_cap = size > 256 ? size : 256;  // start small
@@ -4813,6 +4827,24 @@ static void tc_heap_free_handle(TcVM *vm, int handle) {
 }
 
 // Free entire heap buffer (call on VM stop/reset/reload)
+// A worker sharing the primary's heap never allocates in it. When the primary
+// allocates, its heap may have grown and moved: the worker follows. Both run
+// bytecode only under vm_mutex, and blocking syscalls copy their arguments out
+// before they release it, so the worker never holds a stale pointer.
+static int tc_heap_alloc(TcVM *vm, uint16_t size) {
+  if (vm->heap_shared) return -1;
+  int h = tc_heap_alloc_raw(vm, size);
+  TcVM *w = (TcVM *)vm->heap_peer;
+  if (w) {
+    w->heap_data = vm->heap_data;
+    w->heap_capacity = vm->heap_capacity;
+    w->heap_handles = vm->heap_handles;
+    w->heap_used = vm->heap_used;
+    w->heap_handle_count = vm->heap_handle_count;
+  }
+  return h;
+}
+
 static void tc_heap_free_all(TcVM *vm) {
   if (vm->heap_data) {
     free(vm->heap_data);
@@ -4841,9 +4873,10 @@ static void tc_heap_free_all(TcVM *vm) {
  * on the primary VM (during the worker's vm_mutex-release window) can no longer stack a
  * frame onto the worker's parked frame — which was the PC=0 corruption. vm_mutex still
  * serialises bytecode execution between the two; globals_mux guards the raw globals[]
- * writes against the async UDP-RX apply. Cross-context data must travel through scalar
- * globals / the share-store — NOT heap objects (each VM has its own heap; a heap handle
- * is meaningless in the other VM).
+ * writes against the async UDP-RX apply. The worker also works on the primary's HEAP:
+ * the compiler puts every array > 16 elements -- locals included -- into the slot's heap
+ * at load time, so a private heap made each such array a BOUNDS error in the worker
+ * (ottelo, 12.10.2026: char cfg[240] in a spawnTask FTP backup). See heap_shared.
 \*********************************************************************************************/
 
 // Allocate + initialise a worker VM for slot `s`. Returns nullptr on OOM (caller then
@@ -4868,6 +4901,12 @@ static TcVM *tc_alloc_worker_vm(TcSlot *s, int cb_idx) {
   memcpy(w->cb_index, p->cb_index, sizeof(w->cb_index));
   memcpy(w->watch_indices, p->watch_indices, sizeof(w->watch_indices));
   w->watch_count = p->watch_count;
+  w->heap_data = p->heap_data; w->heap_capacity = p->heap_capacity;   // SHARED HEAP
+  w->heap_handles = p->heap_handles; w->heap_used = p->heap_used;
+  w->heap_handle_count = p->heap_handle_count;
+  w->heap_shared = true;
+  w->heap_peer = p;
+  p->heap_peer = w;
   // --- PRIVATE execution state (calloc already zeroed frames[]/timers/flags) ---
   w->pc = 0; w->sp = 0; w->fp = 0; w->frame_count = 0;
   w->halted = true; w->running = false; w->error = TC_OK; w->delayed = false;
@@ -4884,8 +4923,18 @@ static TcVM *tc_alloc_worker_vm(TcSlot *s, int cb_idx) {
 // Free ONLY the worker's private state. Aliased globals/constants/code belong to the
 // primary VM and are left untouched. globals_mux is shared and intentionally kept for the
 // primary VM's lifetime (TODO: free on slot destroy).
+static void tc_worker_heap_unlink(TcVM *w) {
+  if (!w || !w->heap_shared) return;
+  TcVM *p = (TcVM *)w->heap_peer;
+  if (p && p->heap_peer == w) p->heap_peer = nullptr;
+  w->heap_data = nullptr; w->heap_handles = nullptr;   // the primary's - never freed here
+  w->heap_used = 0; w->heap_capacity = 0; w->heap_handle_count = 0;
+  w->heap_peer = nullptr; w->heap_shared = false;
+}
+
 static void tc_free_worker_vm(TcVM *w) {
   if (!w) return;
+  tc_worker_heap_unlink(w);   // before tc_heap_free_all below
   tc_close_vm_files(w);    // close any files THIS worker left open (owner-keyed, no leak)
   tc_free_all_frames(w);   // frame locals (private)
   // ⚠️ MUST follow free_all_frames, which parks the buffers in the cache rather
@@ -7380,7 +7429,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_MTR_ADD: {                          // matterAdd(deviceType) -> ep
       int32_t dt = TC_POP(vm);
       if (!mtrc_ensure_inited()) { TC_PUSH(vm, -1); break; }   // lazy core init
-      TC_PUSH(vm, matter_add_endpoint((uint32_t)dt));
+      int mep = matter_add_endpoint((uint32_t)dt);
+      if (mep > 0 && mep < 34) { mtrc_ep_dt[mep] = (uint16_t)dt; }
+      TC_PUSH(vm, mep);
       break;
     }
     case SYS_MTR_CLUSTER: {                      // matterCluster(ep, clusterId)
@@ -7438,6 +7489,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       TC_PUSH(vm, (int32_t)mtrc_request_start());
       break;
     case SYS_MTR_RESET:                          // matterReset()
+      memset(mtrc_ep_dt, 0, sizeof(mtrc_ep_dt));
       if (mtrc_ensure_inited()) matter_reset_model();
       break;
 #else

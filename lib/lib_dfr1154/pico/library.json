@@ -1,0 +1,27 @@
+{
+  "name": "picotts",
+  "version": "0.1.0",
+  "description": "SVOX PicoTTS engine for ESP32 — Tasmota PoC port. Wrapped from DiUS/esp-picotts; SVOX engine sources under Apache 2.0.",
+  "keywords": "tts, speech, esp32",
+  "frameworks": "arduino, espidf",
+  "platforms": "espressif32",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "+<*>",
+      "+<lib/*>",
+      "-<lib/picorsrc.c>"
+    ],
+    "includeDir": ".",
+    "flags": [
+      "-I lib",
+      "-Wno-implicit-fallthrough",
+      "-Wno-unused-but-set-variable",
+      "-Wno-unused-function",
+      "-Wno-stringop-overflow",
+      "-Wno-stringop-truncation",
+      "-Wno-discarded-qualifiers",
+      "-Wno-incompatible-pointer-types"
+    ]
+  }
+}
