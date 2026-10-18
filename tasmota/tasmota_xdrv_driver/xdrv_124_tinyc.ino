@@ -3067,9 +3067,11 @@ static void HandleTinyCPage(void) {
             // e-Dateien. Die IDE-Liste „Repo Examples" bildet dasselbe Etikett aus index.json.
             "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
             "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n:f}"
-            "function tcOpt(s,f,n,u){var o=document.createElement('option'),"
-            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f;"
-            "o.value=f;o.textContent=n?n:b;if(u)o.dataset.u=u;s.appendChild(o)}"
+            // ottelo (own patch, 18.10.2026, asked gemu): the version's date after the name, "SML Chart · 14.10.26"
+            // - only the date, the time would cut the closed select on a phone; the slot row shows the full version.
+            "function tcOpt(s,f,n,u,v){var o=document.createElement('option'),"
+            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f,m=/^\\d\\d(\\d\\d)(\\d\\d)(\\d\\d)_\\d{4}$/.exec(v||'');"
+            "o.value=f;o.textContent=(n?n:b)+(m?' \\u00b7 '+m[3]+'.'+m[2]+'.'+m[1]:'');if(u)o.dataset.u=u;s.appendChild(o)}"
             // A slot whose program has a NEWER version in this repository's index.json ("version":"YYYYMMDD_HHMM",
             // same file) gets a button "🔄 17.10.26 14:30": it loads that file into the same slot, the way
             // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and saved by the firmware before
@@ -3148,7 +3150,7 @@ static void HandleTinyCPage(void) {
             "q.disabled=1;q.textContent=Array(21).join('\\u2500');s.appendChild(q);return}"
             "var u=e.info||'';"
             "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
-            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL();tcUp(ls)})"
+            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u,e.version)});tcrL();tcUp(ls)})"
             ".catch(function(){return tcTxt(s,f).then(tcrL)}).catch(function(e){"
             "s.innerHTML='<option>(list failed)</option>';tcrS();"
             "document.getElementById('tcrmsg').textContent='Repo list fetch failed: '+e})}"
