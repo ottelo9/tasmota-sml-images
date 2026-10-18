@@ -821,7 +821,7 @@ struct SML_GLOBS {
   uint8_t sml_100ms_cnt;
   uint8_t sml_desc_cnt;
   uint8_t meters_used;
-  uint8_t maxvars;
+  uint16_t maxvars;   // 12.10.2026: uint8_t -> uint16_t (vorher max. 255 Werte, 256 lief auf 0 -> "sml memory error")
   uint8_t *meter_p;
   double *meter_vars;
   uint8_t *dvalid;
@@ -2636,7 +2636,8 @@ void SML_Decode(uint8_t index) {
   const char *mp = (const char*)sml_globs.meter_p;
   int8_t mindex;
   uint8_t *cp;
-  uint8_t dindex = 0, vindex = 0;
+  uint8_t dindex = 0;
+  uint16_t vindex = 0;   // 12.10.2026: Wert-Index > 255
   delay(0);
 
   if (!sml_globs.ready) {
@@ -2695,7 +2696,7 @@ void SML_Decode(uint8_t index) {
         // 1. index
         double dvar;
         uint8_t opr;
-        uint8_t mind;
+        uint16_t mind;          // 12.10.2026: Wert-Index > 255
         int32_t ind;
         // FRESHNESS GATE (see SML_OPTIONS_MATH_NOWAIT). A `=m` line computes only once every
         // operand it reads has been updated since this line last computed. Without it the result
@@ -2705,7 +2706,7 @@ void SML_Decode(uint8_t index) {
         // An operand the meter has never sent (dvalid still 0) is NOT required to be fresh, so a
         // descriptor referencing an unused register keeps computing exactly as before.
         uint8_t fresh_ok = 1;
-        uint8_t used[SML_MATH_OPERANDS];   // first operand + up to 8 more
+        uint16_t used[SML_MATH_OPERANDS];  // first operand + up to 8 more (12.10.2026: uint16_t)
         uint8_t used_cnt = 0;
         uint8_t gate = sml_globs.mgen && sml_globs.mseen && !(sml_globs.sml_options & SML_OPTIONS_MATH_NOWAIT);
         // This line's own record of what it last consumed. The operands parse in a fixed order, so
@@ -2791,7 +2792,7 @@ void SML_Decode(uint8_t index) {
           // only n indexes
           mp++;
           while (*mp == ' ') mp++;
-          uint8_t ind = atoi(mp);
+          uint16_t ind = atoi(mp);   // 12.10.2026: Wert-Index > 255
           while (*mp >= '0' && *mp <= '9') mp++;
           if (ind < 1 || ind > sml_globs.maxvars) ind = 1;
           uint32_t delay = atoi(mp) * 1000;
@@ -3082,7 +3083,7 @@ void SML_Decode(uint8_t index) {
               mp += 8;
               cp += 4;
             } else if (!strncmp_P(mp, PSTR("FFFFFFFF"), 8)) {
-              uint32_t val = (cp[0]<<0) | (cp[1]<<0) | (cp[2]<<16) | (cp[3]<<24);
+              uint32_t val = (cp[0]<<0) | (cp[1]<<8) | (cp[2]<<16) | (cp[3]<<24);
               float *fp = (float*)&val;
               ebus_dval = *fp;
               mbus_dval = *fp;
@@ -3483,7 +3484,7 @@ nextsect:
 }
 
 //"1-0:1.8.0*255(@1," D_TPWRIN ",kWh," DJ_TPWRIN ",4|"
-void SML_Immediate_MQTT(const char *mp,uint8_t index,uint8_t mindex) {
+void SML_Immediate_MQTT(const char *mp,uint16_t index,uint8_t mindex) {
   // NOTE: SML_Immediate_MQTT is by definition called immediately after a
   // fresh value has just been parsed and stored in meter_vars[index].
   // The "dvalid" flag is for the *periodic* TelePeriod path (SML_Show)
@@ -5241,7 +5242,7 @@ uint32_t SML_Read(int32_t meter, char *str, uint32_t slen) {
 uint32_t sml_getv(uint32_t sel) {
   if (sml_globs.ready == false) return 0;
   if (!sel) {
-    for (uint8_t cnt = 0; cnt < sml_globs.maxvars; cnt++) {
+    for (uint16_t cnt = 0; cnt < sml_globs.maxvars; cnt++) {   // 12.10.2026: sonst Endlosschleife ab 256 Werten
       sml_globs.dvalid[cnt] = 0;
     }
     sel = 0;

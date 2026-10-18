@@ -72,8 +72,16 @@
 // so a freshly flashed image already has it; if /tinyc_repos.cfg exists on the
 // filesystem it REPLACES this list (Hans, 2026-09-14: having to upload a file
 // after flashing defeats the purpose).
+//
+// The default offers BOTH repositories: ours and ottelo's SmartMeter/PV/Emulator programs. Ottelo's images define the
+// same two entries in their user_config_override.h, so a device that switches between his image and ours keeps the
+// same choice -- with one entry only the page shows no source drop-down, and mi-hol (gemu2015/Sonoff-Tasmota#131,
+// 17.10.2026) found the "Repo selection box" gone after the switch. The entry whose <base>/bytecode equals
+// TINYC_DEFAULT_REPO is preselected, so our default stays ours.
 #ifndef TINYC_REPO_LIST
-#define TINYC_REPO_LIST "TinyC (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc"
+#define TINYC_REPO_LIST \
+  "TinyC Examples (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc\n" \
+  "SmartMeter/PV/Emulator (ottelo)|https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc"
 #endif
 
 // Cap for the list, whether compiled in or read from the file. Four entries of
@@ -787,6 +795,14 @@ static void TinyCLoadSettings(void) {
     if (slot >= TC_MAX_VMS) break;
 
     fname.trim();
+    if (fname.length() >= TC_FILENAME_MAX) {
+      // An entry from before the buffers were 64 bytes cannot exist (it was cut when it was written); anything
+      // else is a hand-edited file. A name that does not fit would be cut and no longer match its file.
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: file name too long (%d characters) — entry dropped"), slot, (int)fname.length());
+      cfg_stale = true;
+      slot++;
+      continue;
+    }
     if (fname.length() > 0) {
       // A slot whose file is gone keeps NOTHING. Deleting a .tcb (over /ufsd,
       // or after TinyCUnload) left the name standing in /tinyc.cfg, so the
@@ -2396,6 +2412,12 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   if (!Tinyc) return false;
   if (slot_num >= TC_MAX_VMS) return false;
 
+  // A path that does not fit the slot's name buffer would be cut in the slot and in /tinyc.cfg and then no longer
+  // match the file (and its persist file). Refuse it instead of loading under a wrong name.
+  if (strlen(path) >= TC_FILENAME_MAX) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load %s refused: file name too long (at most %d characters)"), path, TC_FILENAME_MAX - 1);
+    return false;
+  }
   // Allocate slot if needed
   if (!Tinyc->slots[slot_num]) {
     Tinyc->slots[slot_num] = tc_slot_alloc();
@@ -2484,7 +2506,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
 #endif
 
 #ifdef USE_UFILESYS
-// Read the optional plain name / info URL out of a .tcb header WITHOUT loading
+// Read the optional plain name / info URL / version out of a .tcb header WITHOUT loading
 // the program. Both are TLV records behind the fixed 40-byte V6 header; the
 // header is self-describing (header_size in B20-21), so this is just "read the
 // first header_size bytes and walk the records past byte 40".
@@ -2494,12 +2516,14 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
 // in the loop task -- the mistake that made the repository box block the whole
 // device before it moved into the browser (see the Repository section below).
 //
-// Returns true if at least one field was found. Both buffers are always
-// NUL-terminated, empty when the field is absent.
+// Returns true if at least one field was found. The buffers are always
+// NUL-terminated, empty when the field is absent (ver, info: optional).
 static bool tc_tcb_meta(FS *fs, const char *path,
-                        char *name, size_t nsz, char *info, size_t isz) {
+                        char *name, size_t nsz, char *info, size_t isz,
+                        char *ver = nullptr, size_t vsz = 0) {
   if (name && nsz) name[0] = 0;
   if (info && isz) info[0] = 0;
+  if (ver && vsz) ver[0] = 0;
   if (!fs) return false;
   File f = fs->open(path, "r");
   if (!f) return false;
@@ -2523,6 +2547,7 @@ static bool tc_tcb_meta(FS *fs, const char *path,
           char *dst = nullptr; size_t dsz = 0;
           if      (tag == 1) { dst = name; dsz = nsz; }
           else if (tag == 2) { dst = info; dsz = isz; }
+          else if (tag == 3) { dst = ver;  dsz = vsz; }      // `// @version: YYYYMMDD_HHMM`
           if (dst && dsz) {
             size_t n = (len < dsz - 1) ? len : dsz - 1;
             memcpy(dst, meta + i + 2, n);
@@ -2546,6 +2571,25 @@ static bool tc_tcb_meta(FS *fs, const char *path,
   return ok;
 }
 #endif  // USE_UFILESYS
+
+// The index file next to a data file: "<path without extension>.ind". The extension is looked for only behind the LAST
+// slash (a dot in a folder name, /sd/v1.2/log, made it "/sd/v1.ind"), and the ".ind" is appended with strlcat, never
+// strcat (a path without a dot and 124+ characters overflowed the 128-byte buffer). Andreas, 17.10.2026.
+static void tc_ind_path(const char *path, char *out, size_t osz) {
+  strlcpy(out, path, osz);
+  char *slash = strrchr(out, '/');
+  char *dot = strrchr(slash ? slash : out, '.');
+  if (dot) *dot = 0;
+  strlcat(out, ".ind", osz);
+}
+
+// "20261017_1430" -> "17.10.26 14:30" for the slot row. Anything that is not in that form is shown as it is.
+static void tc_version_display(const char *v, char *out, size_t osz) {
+  bool form = strlen(v) == 13 && v[8] == '_';
+  for (int i = 0; form && i < 13; i++) { if (i != 8 && !isdigit((unsigned char)v[i])) form = false; }
+  if (form) snprintf_P(out, osz, PSTR("%c%c.%c%c.%c%c %c%c:%c%c"), v[6], v[7], v[4], v[5], v[2], v[3], v[9], v[10], v[11], v[12]);
+  else strlcpy(out, v, osz);
+}
 
 static void HandleTinyCPage(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
@@ -2644,7 +2688,14 @@ static void HandleTinyCPage(void) {
         if (!fss[fi]) continue;
         File dir = fss[fi]->open("/", "r");
         if (!dir) continue;
-        char names[16][40];
+        dir.close();
+        // At most 16 names are collected per pass (RAM), so repeat until a pass finds nothing: with more than 16
+        // programs the rest used to stay without a word (Andreas, 17.10.2026). The directory is reopened each pass
+        // because removing files while it is open can skip entries.
+        for (int pass = 0; pass < 64; pass++) {
+        dir = fss[fi]->open("/", "r");
+        if (!dir) break;
+        char names[16][TC_FILENAME_MAX];   // as long as a slot name can be (was 40: a longer file was "removed" under a cut name, i.e. not at all)
         int count = 0;
         dir.rewindDirectory();
         while (count < 16) {
@@ -2656,7 +2707,7 @@ static void HandleTinyCPage(void) {
             char *lcp = strrchr(ep, '/');
             if (lcp) ep = lcp + 1;
             uint16_t nlen = strlen(ep);
-            if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
+            if (nlen > 4 && nlen + 1 < sizeof(names[0]) && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
               snprintf(names[count], sizeof(names[0]), "/%s", ep);
               count++;
             }
@@ -2664,10 +2715,13 @@ static void HandleTinyCPage(void) {
           entry.close();
         }
         dir.close();
+        int removed = 0;
         for (int i = 0; i < count; i++) {
-          fss[fi]->remove(names[i]);
+          if (fss[fi]->remove(names[i])) removed++;
         }
-        total += count;
+        total += removed;
+        if (removed == 0) break;        // nothing left (or nothing that can be removed: do not spin)
+        }
       }
       // The slot list must go with them. Deleting the files left every slot
       // still listed at the top of the page, because /tinyc.cfg was untouched:
@@ -2752,28 +2806,30 @@ static void HandleTinyCPage(void) {
       // Determine filename: from loaded slot or from config
       const char *fname = (s && s->filename[0]) ? s->filename : Tinyc->slot_config[si].filename;
 
-      // ottelo (own patch): the plain name out of the .tcb header instead of the file
-      // name - with build.html it carries the version, "SML Chart [12.10.26]". The file
-      // name moves into the tooltip, the state word into the dot's tooltip (the colour
-      // already says it), the size is whole kB. data-f/data-n let the page script mark
-      // a newer version in the repository and offer the update (tcUp/tcUpd).
-      char mname[52] = { 0 };
+      // Slot row: the plain name out of the .tcb header instead of the file name (the name already says what
+      // it is, and "name (file)" plus version and size is too long on a phone). The file name moves into
+      // the tooltip, the state word into the dot's tooltip (the colour already says it), the size is whole kB.
+      // The version (`// @version: YYYYMMDD_HHMM`, header TLV 3) follows the name as "17.10.26 14:30".
+      // data-f / data-v / data-s let the page script offer an update when the repository's index.json has a
+      // newer version of the same file (tcUp/tcUpd). Idea and name-only row: ottelo (12.10.2026).
+      char mname[52] = { 0 }, mver[28] = { 0 }, vshow[28] = { 0 };
 #ifdef USE_UFILESYS
       if (fname && fname[0]) {
-        if (!tc_tcb_meta(ufsp, fname, mname, sizeof(mname), nullptr, 0) && ffsp && ffsp != ufsp) {
-          tc_tcb_meta(ffsp, fname, mname, sizeof(mname), nullptr, 0);
+        if (!tc_tcb_meta(ufsp, fname, mname, sizeof(mname), nullptr, 0, mver, sizeof(mver)) && ffsp && ffsp != ufsp) {
+          tc_tcb_meta(ffsp, fname, mname, sizeof(mname), nullptr, 0, mver, sizeof(mver));
         }
       }
 #endif
+      tc_version_display(mver, vshow, sizeof(vshow));
       const char *fbase = (fname && fname[0] == '/') ? fname + 1 : fname;
-      String mesc = HtmlEscape(String(mname));
       WSContentSend_P(PSTR(
-        "<div class='tc-row' data-f='%s' data-n='%s' data-s='%d'>"
+        "<div class='tc-row' data-f='%s' data-v='%s' data-s='%d'>"
         "<span class='%s' title='%s'>&#x25cf;</span>"
-        "<span class='tc-info' title='%s'><b>%d</b> %s (%dkB)"),
-        fbase, mesc.c_str(), si, sc, state, fname, si,
-        mname[0] ? mesc.c_str() : fname,
-        s ? (int)((s->program_size + 512) / 1024) : 0);
+        "<span class='tc-info' title='%s'><b>%d</b> %s"),
+        fbase, HtmlEscape(String(mver)).c_str(), si, sc, state, fname, si,
+        mname[0] ? HtmlEscape(String(mname)).c_str() : fname);
+      if (mver[0]) { WSContentSend_P(PSTR(" <small style='opacity:.7'>%s</small>"), HtmlEscape(String(vshow)).c_str()); }
+      WSContentSend_P(PSTR(" (%dkB)"), s ? (int)((s->program_size + 512) / 1024) : 0);
 
       if (s && s->vm.error != 0) {
         WSContentSend_P(PSTR(" <span class='tc-err'>%s</span>"), tc_error_str(s->vm.error));
@@ -2827,7 +2883,7 @@ static void HandleTinyCPage(void) {
           if (lcp) ep = lcp + 1;
           uint16_t nlen = strlen(ep);
           if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
-            char fpath[40];
+            char fpath[TC_FILENAME_MAX];
             snprintf(fpath, sizeof(fpath), "/%s", ep);
             // Plain name and info link out of the .tcb header, if the program
             // carries them (`// @name:` / `// @info:` in the .tc). Without them
@@ -3004,17 +3060,37 @@ static void HandleTinyCPage(void) {
             // build.html keeps writing), new firmware against an old repo falls
             // back here. Entries are {file,name,info}; anything missing degrades
             // to exactly the old behaviour, the bare filename.
-            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): „Name (datei)" OHNE
-            // „.tcb", und die Liste nach DIESEM Etikett sortiert — nicht nach Dateiname, sonst steht
-            // „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den e-Dateien. Die IDE-Liste
-            // „Repo Examples" bildet dasselbe Etikett aus index.json.
+            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): nur der NAME (seit 17.10.2026,
+            // Absprache mit ottelo: der Name sagt, was es ist, der Dateiname dahinter ist ueberfluessig; die Version
+            // steht in der Slot-Zeile; ohne Namen der Dateiname ohne „.tcb"), und die Liste nach DIESEM Etikett
+            // sortiert — nicht nach Dateiname, sonst steht „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den
+            // e-Dateien. Die IDE-Liste „Repo Examples" bildet dasselbe Etikett aus index.json.
             "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
-            // ottelo (own patch): only the name when there is one - his names carry the date.
             "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n:f}"
             "function tcOpt(s,f,n,u){var o=document.createElement('option'),"
             "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f;"
             "o.value=f;o.textContent=n?n:b;if(u)o.dataset.u=u;s.appendChild(o)}"
-            "function tcrU(){var s=document.getElementById('tcrf');"
+            // A slot whose program has a NEWER version in this repository's index.json ("version":"YYYYMMDD_HHMM",
+            // same file) gets a button "🔄 17.10.26 14:30": it loads that file into the same slot, the way
+            // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and saved by the firmware before
+            // the upload replaces the program. "Newer" is a plain string compare; when one of the two versions is
+            // not in that form (or the slot has none) it is "different" instead. No version in the repository: no
+            // button. Rule and format agreed with ottelo, 17.10.2026.
+            "function tcV(x){var m=x.match(/^(\\d\\d)(\\d\\d)(\\d\\d)(\\d\\d)_(\\d\\d)(\\d\\d)$/);"
+            "return m?m[4]+'.'+m[3]+'.'+m[2]+' '+m[5]+':'+m[6]:x}"
+            "function tcUp(ls){document.querySelectorAll('.tc-row[data-f]').forEach(function(r){"
+            "var o=r.querySelector('.tc-up');if(o)o.remove();"
+            "var e=ls.filter(function(x){return (x.file||x.f)==r.dataset.f})[0];if(!e||!e.version)return;"
+            "var nv=e.version,ov=r.dataset.v||'',re=/^\\d{8}_\\d{4}$/;"
+            "if(nv==ov||(re.test(nv)&&re.test(ov)&&nv<ov))return;"
+            "var s=document.createElement('button');s.type='button';s.className='button tc-up';"
+            "s.title='Update';s.innerHTML='&#x1F504; '+tcV(nv);"
+            "s.onclick=function(){tcUpd(r.dataset.f,r.dataset.s,e.name||e.n||r.dataset.f)};"
+            "r.querySelector('.tc-info').appendChild(s)})}"
+            "function tcUpd(f,sl,n){var a=document.getElementById('tcrf'),b=document.getElementById('tcrs');"
+            "a.value=f;b.value=sl;if(a.value!=f||b.value!=sl)return;"
+            "if(!confirm('Update: '+n+' -> Slot '+sl+'?'))return;tcDl()}"
+"function tcrU(){var s=document.getElementById('tcrf');"
             "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
             "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
             // ⚠️ DIE AUSWAHL UEBERLEBT DAS NEULADEN SONST NICHT. Chromes eigene
@@ -3057,35 +3133,20 @@ static void HandleTinyCPage(void) {
             // und zurueck, und dann steht "Repo list fetch failed: 404" neben
             // einer Liste, die einwandfrei geladen hat. Am Geraet nachgemessen
             // (.186, 2026-09-14).
-            // ottelo (own patch): a slot whose program has a newer date in this
-            // repository's index.json ("Name [dd.MM.yy]", same file) gets a button
-            // "🔄 [date]": it loads that file into the same slot, the way
-            // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and
-            // saved by the firmware before the upload replaces the program.
-            "function tcD(x){var p=x.split('.');return p.length==3?p[2]+p[1]+p[0]:''}"
-            "function tcUp(ls){document.querySelectorAll('.tc-row[data-f]').forEach(function(r){"
-            "var o=r.querySelector('.tc-up');if(o)o.remove();"
-            "var e=ls.filter(function(x){return (x.file||x.f)==r.dataset.f})[0];if(!e)return;"
-            "var m=(e.name||e.n||'').match(/\\[([0-9.]+)\\]$/),k=(r.dataset.n||'').match(/\\[([0-9.]+)\\]$/);"
-            "if(!m||(k&&tcD(m[1])<=tcD(k[1])))return;"
-            "var s=document.createElement('button');s.type='button';s.className='button tc-up';"
-            "s.title='Update';s.innerHTML='&#x1F504; ['+m[1]+']';"
-            "s.onclick=function(){tcUpd(r.dataset.f,r.dataset.s,e.name||e.n||r.dataset.f)};"
-            "r.querySelector('.tc-info').appendChild(s)})}"
-            "function tcUpd(f,sl,n){var a=document.getElementById('tcrf'),b=document.getElementById('tcrs');"
-            "a.value=f;b.value=sl;if(a.value!=f||b.value!=sl)return;"
-            "if(!confirm('Update: '+n+' -> Slot '+sl+'?'))return;tcDl()}"
             "function tcFill(f){var s=document.getElementById('tcrf');"
             "var m0=document.getElementById('tcrmsg');if(m0)m0.textContent='';"
             "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
             "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
             "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';"
-            // ottelo (own patch): "ordered":true in index.json keeps the repository's own order.
-            "if(!j.ordered)ls=ls.slice().sort(function(a,b){return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
+            // "ordered":true in index.json keeps the repository's OWN order (ottelo, 12.10.2026: his list
+            // follows `// @order: N`); {"sep":1} is a disabled separator line. Without "ordered" the list
+            // is sorted by its label as before and the separators are dropped (they have no label).
+            "if(!j.ordered)ls=ls.filter(function(e){return !e.sep}).sort(function(a,b){"
+            "return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
             "s.innerHTML='';"
-            // ottelo (own patch): {"sep":1} is a separator line, not a program.
             "ls.forEach(function(e){if(e.sep){var q=document.createElement('option');"
-            "q.disabled=1;q.textContent=Array(21).join('\\u2500');s.appendChild(q);return}var u=e.info||'';"
+            "q.disabled=1;q.textContent=Array(21).join('\\u2500');s.appendChild(q);return}"
+            "var u=e.info||'';"
             "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
             "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL();tcUp(ls)})"
             ".catch(function(){return tcTxt(s,f).then(tcrL)}).catch(function(e){"
@@ -3293,6 +3354,9 @@ static void HandleTinyCPage(void) {
   WSContentEnd();
 }
 
+// Set by HandleTinyCUpload when the file name is longer than a slot can carry; HandleTinyCUploadDone then says why.
+static bool tc_upload_name_error = false;
+
 static void HandleTinyCUploadDone(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
@@ -3310,6 +3374,13 @@ static void HandleTinyCUploadDone(void) {
     // authoritative signal for this request.
     TCSendCORS("POST, OPTIONS");
     if (Web.upload_error || !s || !s->loaded) {
+      if (tc_upload_name_error) {
+        char json[160];
+        snprintf_P(json, sizeof(json), PSTR("{\"ok\":false,\"error\":\"file name too long (at most %u characters including .tcb)\"}"),
+                   (unsigned)(TC_FILENAME_MAX - 2));
+        WSSendJSON(400, json);
+        return;
+      }
       WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"upload failed\"}"));
       return;
     }
@@ -3341,6 +3412,10 @@ static void HandleTinyCUploadDone(void) {
       "<fieldset><legend><b> Upload Result </b></legend>"
       "<p style='text-align:center;color:#f44'><b>&#x2718; Upload failed</b></p>"
       "</fieldset>"));
+    if (tc_upload_name_error) {
+      WSContentSend_P(PSTR("<p style='text-align:center'>File name too long: at most %d characters including .tcb.</p>"),
+                      (int)(TC_FILENAME_MAX - 2));
+    }
   }
   WSContentSend_P(HTTP_FORM_BUTTON, PSTR("tc"), PSTR("Back to TinyC"));
 
@@ -3914,6 +3989,18 @@ static void HandleTinyCUpload(void) {
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload start: %s (slot %d)"), upload.filename.c_str(), slot_num);
 
+    // A name that does not fit is REFUSED, before anything is touched (the slot keeps its program): cutting it
+    // dropped the extension, two long names with the same start landed in the same file, and the persist file
+    // could collide with the program. The client gets a clear 400 with the limit.
+    tc_upload_name_error = false;
+    if (strlen(upload.filename.c_str()) + 1 >= sizeof(Tinyc->upload_filename)) {
+      Web.upload_error = 1;
+      tc_upload_name_error = true;
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload refused: file name %s is too long (%u characters, at most %u including the .tcb)"),
+             upload.filename.c_str(), (unsigned)strlen(upload.filename.c_str()), (unsigned)(sizeof(Tinyc->upload_filename) - 2));
+      return;
+    }
+
     // ⚠️ Web.upload_error is a GLOBAL and nobody clears it for us. One failed
     // upload (a malloc that could not be served, an oversize file) therefore
     // made every later upload answer 400 — with no log line of its own, because
@@ -4475,13 +4562,7 @@ static void HandleTinyCApi(void) {
       uint32_t seek_pos = 0;
       {
         char indpath[128];
-        strlcpy(indpath, pathbuf, sizeof(indpath));
-        char *dot = strrchr(indpath, '.');
-        if (dot) {
-          strcpy(dot, ".ind");
-        } else {
-          strcat(indpath, ".ind");
-        }
+        tc_ind_path(pathbuf, indpath, sizeof(indpath));
         File ind = ufsp->open(indpath, "r");
         if (ind) {
           // Skip index header line
@@ -6805,10 +6886,7 @@ static void tc_download_task(void *param) {
       uint32_t seek_pos = 0;
       {
         char indpath[128];
-        strlcpy(indpath, path, sizeof(indpath));
-        char *dot = strrchr(indpath, '.');
-        if (dot) strcpy(dot, ".ind");
-        else strcat(indpath, ".ind");
+        tc_ind_path(path, indpath, sizeof(indpath));
 
         File ind = fsp->open(indpath, "r");   // same FS as the data file
         if (ind) {
@@ -7903,16 +7981,15 @@ static void tc_worker_vm_body(void *param) {
     }
     vm->halted = true; vm->running = false;
     tc_output_flush();
-    // Unlink from the primary's heap while still holding vm_mutex: the primary
-    // writes into this VM when its heap grows (tc_heap_alloc), which must not
-    // race the free below.
+    // Unlink from the primary's heap while still holding vm_mutex: the primary writes into this VM
+    // when its heap grows (tc_heap_alloc), which must not race the free below (ottelo, 12.10.2026).
     tc_worker_heap_unlink(vm);
     tc_current_slot = nullptr;
     if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
   } while (0);
 
-  // The early exits above (main never halted, function gone, no stack) leave
-  // without the mutex and still linked.
+  // The early exits above (main never halted, function gone, no stack) leave without the mutex and
+  // still linked.
   if (vm->heap_shared) {
     if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
     tc_worker_heap_unlink(vm);

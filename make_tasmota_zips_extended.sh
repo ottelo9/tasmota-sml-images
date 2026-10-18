@@ -106,6 +106,7 @@ ESP32_BOARDS=(
     "tasmota32s3_ottelo"        # ESP32-S3
     "tasmota32solo1_ottelo"     # ESP32-SOLO1
     "tasmota32p4_ottelo"        # ESP32-P4
+    "tasmota32p4r3_ottelo"      # ESP32-P4 Rev.3
 )
 
 # safeboot: Tasmota baut eine pro Chip (tasmota32c3-safeboot.bin, ...). Sie wird

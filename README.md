@@ -18,7 +18,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | ------------- | ------------- |
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
 | tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
-| tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4 (solo1, s3 mit Ethernet Support) |
+| tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4, p4r3 (solo1, s3, p4, p4r3 mit Ethernet Support) |
 | tasmota32x_ottelo-safeboot       |  |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
@@ -63,6 +63,7 @@ Es gibt pro ESP32-Plattform getrennte Images — `*_ottelo_tas` mit Scripter (wi
 
 **Fertige TinyC Programme laden**  
 Unter Tools > TinyC Console > Repository findet ihr eine Liste mit meinen TinyC Programmen (wie Scripte). Einfach auswählen und "Download & Load" Slot 0 wählen. Ist bereits ein Programm im Slot 0, wird es entladen und das neue geladen. Wenn zuwenig RAM frei ist schlägt das fehl und man muss 1x neustarten und dann das Programm nochmal laden.  
+In der Slot-Liste steht hinter dem Programmnamen seine Version (Datum und Uhrzeit). Gibt es im Repository eine neuere, erscheint daneben ein 🔄-Knopf mit dem neuen Datum: ein Klick lädt sie in denselben Slot, eure Einstellungen und Daten bleiben erhalten.  
 
 **Eigene Programme schreiben**  
 Ihr könnt eure Programme direkt auf dem ESP in Tasmota schreiben und ausführen, in einer webbasierten TinyC-IDE. In der IDE sind sehr viele Beispiele (von gemu) im DropDown Menü wählbar. Der Sourcecode und auch das kompilierte Programm wird im Dateisystem von Tasmota gespeichert. Es können sogar mehrere Programme parallel ausgeführt werden (Slots). Und ihr könnt einfach alles in C-Code schreiben, statt kompliziertes Script.  
@@ -80,6 +81,7 @@ Deswegen nutzen die `_tc`-Images auf 4 MB-Boards das Layout [`esp32_partition_ap
 | `tasmota32_ottelo_tc`, `tasmota32c3_ottelo_tc`, `tasmota32c6_ottelo_tc`, `tasmota32s2_ottelo_tc`, `tasmota32solo1_ottelo_tc` | `app1856k_fs1344k` (1024 KB mehr FS) |
 | `tasmota32s3_ottelo_tc` | Default (16 MB Flash: `app3904k_fs11584k`) |
 | `tasmota32p4_ottelo_tc` | Default (boardabhängig) |
+| `tasmota32p4r3_ottelo_tc` | Default (16 MB Flash: `app3904k_fs11584k`) |
 | alle `_tas` | Default belassen |
 
 #### Partitionen ohne Factory-Flash umstellen — `chkpt`
@@ -148,7 +150,7 @@ Zum Kompilieren unter VSC den passenden Befehl in die Console eingeben:
 Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `pio run -e tasmota32-safeboot`.  
 
 Um alle gleichzeitig zu erstellen:  
-`pio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot`
+`pio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot -e tasmota32p4r3-safeboot`
 
 Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
 
@@ -160,6 +162,7 @@ ESP32 (Scripter-Variante `_tas`):
 `pio run -e tasmota32c6_ottelo_tas`  
 `pio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 `pio run -e tasmota32p4_ottelo_tas`  
+`pio run -e tasmota32p4r3_ottelo_tas`   (ESP32-P4 ab Revision 3)  
 
 ESP32 (TinyC-Variante `_tc`):  
 `pio run -e tasmota32_ottelo_tc`  
@@ -169,6 +172,7 @@ ESP32 (TinyC-Variante `_tc`):
 `pio run -e tasmota32c6_ottelo_tc`  
 `pio run -e tasmota32solo1_ottelo_tc`  
 `pio run -e tasmota32p4_ottelo_tc`  
+`pio run -e tasmota32p4r3_ottelo_tc`  
 
 ESP8266:  
 `pio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  
@@ -449,7 +453,7 @@ SML aktivieren im TC-Programm:
 ```
 
 **(5) Features für ESP32-Module mit LAN-Port (Ethernet/LAN):**
-Nur in `tasmota32_ottelo_*`, `tasmota32solo1_ottelo_*`, `tasmota32s3_ottelo_*` und `tasmota32p4_ottelo_*` aktiviert!
+Nur in `tasmota32_ottelo_*`, `tasmota32solo1_ottelo_*`, `tasmota32s3_ottelo_*`, `tasmota32p4_ottelo_*` und `tasmota32p4r3_ottelo_*` aktiviert!
 
 ```
 USE_ETHERNET

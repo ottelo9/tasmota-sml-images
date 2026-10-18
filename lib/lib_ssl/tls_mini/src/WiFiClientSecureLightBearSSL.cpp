@@ -942,7 +942,7 @@ extern "C" {
   static const uint16_t suites_RSA_ONLY[] = {
     BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
   };
-#if defined(USE_EEBUS_GUARD)
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
   // Cipher-Reihenfolge fuer SHIP: ECDSA zuerst. 0xC02F (RSA) ist kein SHIP-Cipher, bleibt aber am
   // Ende der Liste — diese Lib bedient auch HTTPS/MQTT zu RSA-Servern.
   static const uint16_t suites_eebus[] = {
@@ -965,7 +965,7 @@ extern "C" {
     br_ssl_engine_add_flags(&cc->eng, BR_OPT_NO_RENEGOTIATION);
 
     br_ssl_engine_set_versions(&cc->eng, BR_TLS12, BR_TLS12);
-#if defined(USE_EEBUS_GUARD)
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
     // EEBUS-Build: die SHIP-taugliche Liste verwenden (s. suites_eebus oben).
     // ABER _rsa_only MUSS weiter greifen: wer RSA erzwingt, tut das, um einen RSA-Fingerabdruck
     // pruefen zu koennen. Bekaeme er zusaetzlich ECDSA-Suiten angeboten, koennte der Server ECDSA
@@ -996,7 +996,7 @@ extern "C" {
     br_ssl_engine_set_gcm(&cc->eng, &br_sslrec_in_gcm_vtable, &br_sslrec_out_gcm_vtable);
     br_ssl_engine_set_aes_ctr(&cc->eng, &br_aes_small_ctr_vtable);
     br_ssl_engine_set_ghash(&cc->eng, &br_ghash_ctmul32);
-#if defined(USE_EEBUS_GUARD)
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
     // CBC-Engine registrieren: SHIP 9.1 fuehrt 0xC023 als Pflicht-Cipher, 0xC02B (GCM) nur als
     // Option. Rein additiv — GCM bleibt registriert, HTTPS/MQTT zu RSA-Servern unberuehrt.
     br_ssl_engine_set_cbc(&cc->eng, &br_sslrec_in_cbc_vtable, &br_sslrec_out_cbc_vtable);
@@ -1056,7 +1056,7 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
     _eng = &_sc->eng; // Allocation/deallocation taken care of by the _sc shared_ptr
 
     br_ssl_client_base_init(_sc.get(), _rsa_only);
-#if defined(USE_EEBUS_GUARD)
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
     // Suite-Liste NACH der Basis-Initialisierung ueberschreiben, nur fuer markierte Clients —
     // andere TLS-Nutzer bleiben unberuehrt.
     if (_ship_ciphers) {

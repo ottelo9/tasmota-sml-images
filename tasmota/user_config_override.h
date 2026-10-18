@@ -76,8 +76,8 @@
 
 //siehe platformio_tasmota_cenv.ini
 #if ( defined(TASMOTA32C3_OTTELO) || defined(TASMOTA32C6_OTTELO)      || defined(TASMOTA32S2_OTTELO)      || defined(TASMOTA32S3_OTTELO) || \
-      defined(TASMOTA32_OTTELO)   || defined(TASMOTA32SOLO1_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || \
-      defined(TASMOTA1M_OTTELO)   || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
+      defined(TASMOTA32_OTTELO)   || defined(TASMOTA32SOLO1_OTTELO)   || defined(TASMOTA32P4_OTTELO)      || defined(TASMOTA32P4R3_OTTELO) || \
+      defined(TASMOTA1M_OTTELO)  || defined(TASMOTA1M_SHELLY_OTTELO) || defined(TASMOTA1M_ENERGY_OTTELO) || defined(TASMOTA4M_OTTELO) )
 
 // (1) Folgende unnötige Features (siehe my_user_config.h) habe ich deaktiviert, um Tasmota schlank zu halten. Der ESP8266 z.B. hat wenig RAM,
 //     dort müssen mindestens 12k RAM für einen stabilen Betrieb frei sein (inkl. Script).
@@ -208,7 +208,7 @@
 #endif
 
 //-- Ethernet (WT32-ETH01) - gemeinsam
-#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32P4_OTTELO) )
+#if ( defined(TASMOTA32_OTTELO) || defined(TASMOTA32SOLO1_OTTELO) || defined(TASMOTA32S3_OTTELO) || defined(TASMOTA32P4_OTTELO) || defined(TASMOTA32P4R3_OTTELO) )
   #define USE_ETHERNET          //Add support for ethernet (+20k code)
   #define USE_WT32_ETH01
   #define ETH_TYPE          0
@@ -403,6 +403,8 @@
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32solo1_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA32P4_OTTELO)
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4_ottelo" _OTTELO_SFX ".bin"
+#elif defined(TASMOTA32P4R3_OTTELO)
+  #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP32/tasmota32p4r3_ottelo" _OTTELO_SFX ".bin"
 #elif defined(TASMOTA1M_OTTELO)
   #define OTA_URL "https://raw.githubusercontent.com/ottelo9/tasmota-sml-images/main/ota_firmware/ESP8266/tasmota1m_ottelo_tas.bin.gz"
 #elif defined(TASMOTA1M_SHELLY_OTTELO)

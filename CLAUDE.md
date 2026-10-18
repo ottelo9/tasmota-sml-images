@@ -87,32 +87,22 @@ PEMs (DER + RSA CRT components).
 
 ## Own patches in gemu's overlays
 
-Copying gemu's `xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` over the overlay
-drops these — check whether gemu has taken them, else re-apply:
+None since the adoption of `5651c41b3` (18.10.2026): `xdrv_124_tinyc_vm.h` /
+`xdrv_124_tinyc.ino` are plain gemu copies. He took over everything that was
+ours: the `spawnTask` worker sharing the primary's heap, `"ordered"`/`{"sep":1}`
+in index.json, the name-only repository list, and the slot row with name,
+version (`// @version: YYYYMMDD_HHMM`, .tcb header TLV 3, `"version"` in
+index.json) and the 🔄 update button. tasmota-sml-script's build.html derives
+the version from `sml_vers`.
 
-- **Worker VM shares the primary's heap** (12.10.2026, reported to gemu).
-  Every array > 16 elements, locals included, lives in the slot's heap; the
-  `spawnTask` worker VM had an empty private heap, so any such array was a
-  BOUNDS error there (`ftp_backup.tc`). `TcVM.heap_shared`/`heap_peer`,
-  `tc_heap_alloc` wrapper around `tc_heap_alloc_raw`, `tc_worker_heap_unlink`
-  (vm.h, in `tc_free_worker_vm`; .ino, under `vm_mutex` before teardown in
-  `tc_worker_vm_body`).
+## ESP32-P4 Rev.3 (`tasmota32p4r3_ottelo_*`)
 
-- **Repository list shows the name only** (12.10.2026, not reported - gemu
-  chose "Name (file)" on purpose, #128). `tcLb`/`tcOpt` in the `/tc` page
-  script of `xdrv_124_tinyc.ino`: `n?n:f` instead of `n+' ('+f+')'`. The
-  names in tasmota-sml-script's `index.json` carry the date
-  (`SML Chart [12.10.26]`, built from `sml_vers` by build.html).
-  `tcFill` sorts only when index.json lacks `"ordered":true` - his list
-  keeps its `// @order: N` order; `{"sep":1}` entries become a disabled
-  separator line.
-- **Slot rows show name and version** (12.10.2026). In `HandleTinyCPage`:
-  the plain name from the .tcb header (`tc_tcb_meta`, TLV 1 - build.html now
-  writes the dated name there too) instead of the file name (tooltip), state
-  word only as the dot's tooltip, size in whole kB. Page script `tcUp()`
-  (called from `tcFill`) marks "🔄 [date]" when the repository's index.json
-  has a newer date for the same file - as a button: `tcUpd()` puts file and
-  slot into the repository box and runs its `tcDl()` (Download & Load).
+Official board `esp32p4r3` (16 MB, also fine on 32 MB boards), safeboot from
+the official env `tasmota32p4r3-safeboot`. Own define `TASMOTA32P4R3_OTTELO`
+(same feature set and Ethernet as P4) only for its OTA URL - the P4 image does
+not run on Rev.3. `BOARD_SDMMC_POWER_CHANNEL=4` (SD power LDO of Espressif's
+P4 reference boards). From a user's package (18.10.2026); `_tc` ran on his
+board, `_tas` untested.
 
 ## DFR1154 camera image (`tasmota32s3_dfr1154`)
 
