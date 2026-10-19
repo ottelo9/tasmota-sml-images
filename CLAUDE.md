@@ -87,16 +87,9 @@ PEMs (DER + RSA CRT components).
 
 ## Own patches in gemu's overlays
 
-Copying gemu's `xdrv_124_tinyc.ino` over the overlay drops these — check
-whether gemu has taken them, else re-apply:
-
-- **Version date in the repository list** (18.10.2026, asked gemu).
-  `tcOpt(s,f,n,u,v)` in the `/tc` page script appends ` · dd.MM.yy` from
-  index.json's `"version"` (`YYYYMMDD_HHMM`, date only - the time would cut
-  the closed select on a phone); `tcFill` passes `e.version`.
-
-Everything else is plain gemu since `5651c41b3` (18.10.2026). He took over
-what was ours: the `spawnTask` worker sharing the primary's heap, `"ordered"`/`{"sep":1}`
+None: `xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` are plain gemu copies
+(since `5651c41b3`, 18.10.2026; the version date in the repository list,
+`SML Chart · 14.10.26`, since `a40299982`). He took over what was ours: the `spawnTask` worker sharing the primary's heap, `"ordered"`/`{"sep":1}`
 in index.json, the name-only repository list, and the slot row with name,
 version (`// @version: YYYYMMDD_HHMM`, .tcb header TLV 3, `"version"` in
 index.json) and the 🔄 update button. tasmota-sml-script's build.html derives

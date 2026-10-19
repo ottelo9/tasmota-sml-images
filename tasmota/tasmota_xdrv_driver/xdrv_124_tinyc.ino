@@ -3067,11 +3067,13 @@ static void HandleTinyCPage(void) {
             // e-Dateien. Die IDE-Liste „Repo Examples" bildet dasselbe Etikett aus index.json.
             "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
             "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n:f}"
-            // ottelo (own patch, 18.10.2026, asked gemu): the version's date after the name, "SML Chart · 14.10.26"
-            // - only the date, the time would cut the closed select on a phone; the slot row shows the full version.
+            // ottelo's wish (18.10.2026): the version DATE behind the name, "SML Chart <middle dot> 14.10.26" (no time: the closed
+            // select is cut off on a phone; the full version is in the slot row). No version, or not in the
+            // YYYYMMDD_HHMM form: name only. tcLb (sorting) stays the plain name.
+            "function tcVd(x){var m=(x||'').match(/^(\\d\\d)(\\d\\d)(\\d\\d)(\\d\\d)_\\d{4}$/);return m?m[4]+'.'+m[3]+'.'+m[2]:''}"
             "function tcOpt(s,f,n,u,v){var o=document.createElement('option'),"
-            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f,m=/^\\d\\d(\\d\\d)(\\d\\d)(\\d\\d)_\\d{4}$/.exec(v||'');"
-            "o.value=f;o.textContent=(n?n:b)+(m?' \\u00b7 '+m[3]+'.'+m[2]+'.'+m[1]:'');if(u)o.dataset.u=u;s.appendChild(o)}"
+            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f,d=tcVd(v);"
+            "o.value=f;o.textContent=(n?n:b)+(d?' \\u00b7 '+d:'');if(u)o.dataset.u=u;s.appendChild(o)}"
             // A slot whose program has a NEWER version in this repository's index.json ("version":"YYYYMMDD_HHMM",
             // same file) gets a button "🔄 17.10.26 14:30": it loads that file into the same slot, the way
             // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and saved by the firmware before

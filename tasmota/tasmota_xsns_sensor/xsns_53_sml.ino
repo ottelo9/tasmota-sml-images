@@ -631,6 +631,7 @@ struct METER_DESC {
 #else
   WiFiClient *client;
 #endif // USE_SML_TCP_SECURE
+  uint16_t tcp_tid;     // Modbus TCP: transaction id of the last request, a response must echo it
 
 #endif // USE_SML_TCP
 
@@ -2324,9 +2325,27 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
       if (mp->srcpin == TCP_MODE_FLG) {
         // tcp read
         if (mp->spos >= 6) {
-          uint8_t tlen = (mp->sbuff[4] << 8) | mp->sbuff[5];
+          uint16_t tlen = (mp->sbuff[4] << 8) | mp->sbuff[5];
+          if (tlen == 0 || 6 + tlen > mp->sbsiz) {
+            // implausible MBAP length: we are out of frame sync, drop and wait for the next request
+            mp->spos = 0;
+            if (mp->client) {
+              mp->client->flush();
+            }
+            break;
+          }
           if (mp->spos == 6 + tlen) {
             mp->spos = 0;
+            uint16_t tid = mp->sbuff[0] | (mp->sbuff[1] << 8);   // same byte order as sent in sml_tcp_send
+            if (tid != mp->tcp_tid) {
+              // late answer to an earlier request: decoding it with the current index
+              // would store the value under the wrong register (e.g. voltage as energy counter)
+              AddLog(LOG_LEVEL_DEBUG, PSTR("SML: meter %d, modbus tcp answer id %04x != request %04x, dropped"), meters, tid, mp->tcp_tid);
+              if (mp->client) {
+                mp->client->flush();
+              }
+              break;
+            }
             memmove(mp->sbuff, &mp->sbuff[6], mp->sbsiz - 6);
 #ifdef MODBUS_DEBUG
             AddLog(LOG_LEVEL_INFO, PSTR("meter %d, receive index >> %d"), meters, mp->index);
@@ -5675,6 +5694,13 @@ MODBUS_TCP_HEADER tcph;
   // AddLog(LOG_LEVEL_INFO, PSTR("slen >> %d "),slen);
   if (meter_desc[meter].client) {
     if (meter_desc[meter].client->connected()) {
+      // discard the rest of a late or incomplete answer and restart framing,
+      // only the answer to this request (same transaction id) is decoded
+      while (meter_desc[meter].client->available()) {
+        meter_desc[meter].client->read();
+      }
+      meter_desc[meter].spos = 0;
+      meter_desc[meter].tcp_tid = tcph.T_ID;
       meter_desc[meter].client->write((uint8_t*)&tcph, 7 + slen - 3);
     }
   }
