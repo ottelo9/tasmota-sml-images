@@ -4517,7 +4517,11 @@ static String tc_command_response(const char *cmd) {
 }
 
 static void tc_defer_command(const char *cmd) {
-  if (!Tinyc || Tinyc->deferred_pending) return;  // drop if one is already pending
+  if (!Tinyc) return;
+  if (Tinyc->deferred_pending) {   // ONE waiting place for all slots: drop, but say so (it used to be silent; Andreas, 20.10.2026)
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: deferred command dropped (one is still waiting): %.40s"), cmd);
+    return;
+  }
   strlcpy(Tinyc->deferred_cmd, cmd, sizeof(Tinyc->deferred_cmd));
   Tinyc->deferred_since = millis();
   Tinyc->deferred_pending = true;
@@ -22174,10 +22178,15 @@ static void tc_all_callbacks_id(TcCallbackId cid) {
 
 // Helper: derive .pvs persist filename from .tcb filename
 // e.g. "/ecotracker.tcb" -> "/ecotracker.pvs", "/autoexec.tcb" -> "/autoexec.pvs"
+static void tc_pvs_name(const char *tcb_path, char *pf, size_t pfsz);
 static void TinyCSetPersistFile(TcSlot *s, const char *tcb_path) {
   if (!s) return;
-  char *pf = s->vm.persist_file;
-  const size_t pfsz = sizeof(s->vm.persist_file);
+  tc_pvs_name(tcb_path, s->vm.persist_file, sizeof(s->vm.persist_file));
+}
+
+// The persist file name of a program: the .tcb path with ".pvs" instead of the extension (also used to find the OLD program's
+// persist file when a new version of a script is loaded, see TinyCAdoptPersist).
+static void tc_pvs_name(const char *tcb_path, char *pf, size_t pfsz) {
   if (!tcb_path || tcb_path[0] == '\0') {
     strlcpy(pf, "/autoexec.pvs", pfsz);
     return;

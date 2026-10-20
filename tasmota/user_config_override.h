@@ -376,6 +376,7 @@
 //-- Weiteres optionales
 //#define USE_DISPLAY_TM1621_SONOFF //4KB
 //#define USE_SENDMAIL
+//#define USE_DOMOTICZ   //https://tasmota.github.io/docs/Domoticz/ (ca. 6KB Code; oben per #undef aus, hier einkommentieren; nicht auf ESP8266 1M)
 
 
 //=============================================================================

@@ -87,7 +87,18 @@ PEMs (DER + RSA CRT components).
 
 ## Own patches in gemu's overlays
 
-None: `xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` are plain gemu copies
+- **Domoticz values by unit** (`xsns_53_sml.ino`, 20.10.2026, tested on .132
+  with an MT175, proposed to gemu with the diff). On an adoption merge it with
+  `git merge-file` (base = last adopted gemu blob) - done cleanly onto `0f00561d1`. Only with
+  `USE_DOMOTICZ` (commented out in `user_config_override.h`). `SML_Show()`
+  picks the first `W`/`kW` line as power, the first `kWh`/`MWh`/`Wh` line as
+  import, the second as export, the first `V`/`A` line as voltage/current, and
+  sends `DZ_POWER_ENERGY` (power;import Wh), `DZ_P1_SMART_METER` (import;0;
+  export;0;cons;prod) and voltage/current. gemu's code took values 1..4 as
+  energy/power/voltage/current - wrong for our descriptors (1 = power,
+  2 = import, 3 = export, L1..L3, then maybe V/A). Copying gemu's file drops it.
+
+`xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` are plain gemu copies
 (since `5651c41b3`, 18.10.2026; the version date in the repository list,
 `SML Chart · 14.10.26`, since `a40299982`). He took over what was ours: the `spawnTask` worker sharing the primary's heap, `"ordered"`/`{"sep":1}`
 in index.json, the name-only repository list, and the slot row with name,

@@ -3580,6 +3580,14 @@ void SML_Show(boolean json) {
   char *mp = (char*)sml_globs.meter_p;
   char *cp, nojson = 0;
   bool group_open = false;
+#ifdef USE_DOMOTICZ
+  // ottelo (own patch, 20.10.2026): Domoticz values by UNIT, not by position - the first W/kW line is the
+  // power, the first kWh line the import, the second the export, the first V / A line voltage / current.
+  // The old code took values 1..4 as energy, power, voltage, current, which fits no common descriptor
+  // (ours: 1 = power, 2 = import, 3 = export, then L1..L3).
+  int16_t dz_pw = -1, dz_imp = -1, dz_exp = -1, dz_v = -1, dz_a = -1;   // value index, -1 = none
+  double dz_pwf = 1, dz_impf = 1, dz_expf = 1;                          // to W / Wh
+#endif
   //char b_mqtt_data[MESSZ];
   //b_mqtt_data[0]=0;
 
@@ -3708,6 +3716,24 @@ void SML_Show(boolean json) {
               DOUBLE2CHAR(sml_globs.meter_vars[index], dp, tpowstr);
             }
 
+#ifdef USE_DOMOTICZ
+            if (json && !mid && sml_globs.dvalid[index]) {
+              double ef = !strcmp_P(unit, PSTR("kWh")) ? 1000 : !strcmp_P(unit, PSTR("MWh")) ? 1000000 :
+                          !strcmp_P(unit, PSTR("Wh")) ? 1 : 0;
+              if (dz_pw < 0 && (!strcmp_P(unit, PSTR("W")) || !strcmp_P(unit, PSTR("kW")))) {
+                dz_pw = index; dz_pwf = (unit[0] == 'k') ? 1000 : 1;
+              } else if (ef && dz_imp < 0) {
+                dz_imp = index; dz_impf = ef;
+              } else if (ef && dz_exp < 0) {
+                dz_exp = index; dz_expf = ef;
+              } else if (dz_v < 0 && !strcmp_P(unit, PSTR("V"))) {
+                dz_v = index;
+              } else if (dz_a < 0 && !strcmp_P(unit, PSTR("A"))) {
+                dz_a = index;
+              }
+            }
+#endif
+
             if (json) {
               if (!sml_globs.dvalid[index] && !(sml_globs.sml_options & SML_OPTIONS_JSON_ALL)) {
                 // skip values not yet received from meter (SML_OPTIONS_JSON_ALL keeps them, see above)
@@ -3770,12 +3796,23 @@ void SML_Show(boolean json) {
 #ifdef USE_DOMOTICZ
   if (json && !TasmotaGlobal.tele_period) {
     char str[16];
-    DOUBLE2CHAR(sml_globs.meter_vars[0], 1, str);
-    DomoticzSensorPowerEnergy(sml_globs.meter_vars[1], str);  // PowerUsage, EnergyToday
-    DOUBLE2CHAR(sml_globs.meter_vars[2], 1, str);
-    DomoticzSensor(DZ_VOLTAGE, str);  // Voltage
-    DOUBLE2CHAR(sml_globs.meter_vars[3], 1, str);
-    DomoticzSensor(DZ_CURRENT, str);  // Current
+    if (dz_pw >= 0 || dz_imp >= 0) {
+      // Wh like Tasmota's energy driver; P1 = the Domoticz type for a two-way meter (tariff 2 unused)
+      int pw = (dz_pw >= 0) ? (int)round(sml_globs.meter_vars[dz_pw] * dz_pwf) : 0;
+      char ex[16];
+      dtostrfd((dz_imp >= 0) ? sml_globs.meter_vars[dz_imp] * dz_impf : 0, 1, str);
+      dtostrfd((dz_exp >= 0) ? sml_globs.meter_vars[dz_exp] * dz_expf : 0, 1, ex);
+      DomoticzSensorPowerEnergy(pw, str);                                // power + import counter
+      DomoticzSensorP1SmartMeter(str, (char*)"0", ex, (char*)"0", pw);  // import, export, power
+    }
+    if (dz_v >= 0) {
+      dtostrfd(sml_globs.meter_vars[dz_v], Settings->flag2.voltage_resolution, str);
+      DomoticzSensor(DZ_VOLTAGE, str);
+    }
+    if (dz_a >= 0) {
+      dtostrfd(sml_globs.meter_vars[dz_a], Settings->flag2.current_resolution, str);
+      DomoticzSensor(DZ_CURRENT, str);
+    }
   }
 #endif  // USE_DOMOTICZ
 
@@ -5019,7 +5056,9 @@ next_line:
         }
 
 #ifdef ESP8266
-        if (mp->meter_ss->begin(mp->params)) {
+        // pass the serial config on: TasmotaSerial takes stop bits (8N2 for Modbus), parity is only emulated by an extra
+        // stop bit there. Without it software serial always ran 8N1 and "m2" / "mN2" had no effect (@RaphaelSquair, Tasmota #7004)
+        if (mp->meter_ss->begin(mp->params, smode)) {
           mp->meter_ss->flush();
         }
         if (mp->meter_ss->hardwareSerial()) {
