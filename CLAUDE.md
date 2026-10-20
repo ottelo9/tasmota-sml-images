@@ -98,7 +98,14 @@ PEMs (DER + RSA CRT components).
   energy/power/voltage/current - wrong for our descriptors (1 = power,
   2 = import, 3 = export, L1..L3, then maybe V/A). Copying gemu's file drops it.
 
-`xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` are plain gemu copies
+- **OTA wiped heap-persist arrays** (20.10.2026, proposed to gemu). OTA start
+  stops every slot (TinyCStopVM saves, frees the heap, sets `torn_down`),
+  then FUNC_SAVE_BEFORE_RESTART saved the loaded slots again: every array
+  > 16 elements went out as 0 (chart day/week bars, curves). Fix: that loop
+  skips `torn_down` slots (.ino), and `tc_persist_save()` refuses to write
+  while a heap entry has no heap (vm.h, log line).
+
+Apart from that `xdrv_124_tinyc_vm.h` / `xdrv_124_tinyc.ino` are plain gemu copies
 (since `5651c41b3`, 18.10.2026; the version date in the repository list,
 `SML Chart · 14.10.26`, since `a40299982`). He took over what was ours: the `spawnTask` worker sharing the primary's heap, `"ordered"`/`{"sep":1}`
 in index.json, the name-only repository list, and the slot row with name,

@@ -8865,10 +8865,14 @@ bool Xdrv124(uint32_t function) {
 #endif
       // Call user's CleanUp() callback on all active slots (like scripter's >R section)
       tc_all_callbacks_id(TC_CB_CLEAN_UP);
-      // Save persist variables for all loaded slots
+      // Save persist variables for all loaded slots - but not a slot that is already torn
+      // down: OTA start stops every slot (TinyCStopVM saved it then and freed its heap), and
+      // a second save here wrote every heap-persist array (> 16 elements) as zeros over the
+      // good file. Every OTA cleared the day/week bars and curves of the chart programs
+      // while the scalars and small arrays survived (ottelo, 20.10.2026).
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
         TcSlot *s = Tinyc->slots[i];
-        if (s && s->loaded) {
+        if (s && s->loaded && !s->torn_down) {
           tc_persist_save(&s->vm);
         }
       }

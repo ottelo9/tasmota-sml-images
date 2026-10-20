@@ -19146,6 +19146,18 @@ static bool tc_persist_name_eq(TcVM *vm, uint16_t name_off, const uint8_t *other
 static void tc_persist_save(TcVM *vm) {
   if (vm->persist_count == 0 || vm->persist_file[0] == '\0') return;
 #ifdef USE_UFILESYS
+  // Never write while a heap-persist array has no heap behind it (VM torn down): it would
+  // go out as zeros over the good file. The file keeps its last good state instead
+  // (ottelo, 20.10.2026 - OTA start + FUNC_SAVE_BEFORE_RESTART saved twice).
+  for (uint8_t i = 0; i < vm->persist_count; i++) {
+    if (vm->persist[i].index & 0x8000) {
+      uint16_t n = 0;
+      if (!tc_persist_slot(vm, vm->persist[i].index, &n)) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist %s not saved - heap array gone"), vm->persist_file);
+        return;
+      }
+    }
+  }
   bool named = (vm->persist[0].name_off != 0xFFFF);   // new compiler emits names → PVS3
 
   // Size — PVS3: 'P','V','3',count + per entry [nameLen][name][slotCount u16][data].
