@@ -19,7 +19,6 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
 | tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
 | tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4, p4r3 (solo1, s3, p4, p4r3 mit Ethernet Support) |
-| tasmota32x_ottelo-safeboot       |  |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! In den entsprechenden komprimiert Ordnern sind die Scripte ohne Kommentare, sie können 1:1 kopiert werden. |
