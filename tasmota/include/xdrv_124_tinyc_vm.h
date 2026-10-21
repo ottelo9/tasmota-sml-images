@@ -361,7 +361,7 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
 // The IDE banner takes TC_RELEASE automatically (idesrc/bundle.py fills
 // __TC_RELEASE__ in index.html) -- rebundle the IDE after a bump.
-#define TC_RELEASE         "1.6.73"     // release notes: tasmota/tinyc/CHANGELOG.md
+#define TC_RELEASE         "1.6.74"     // release notes: tasmota/tinyc/CHANGELOG.md
 
 // Default malloc() PSRAM limit on every PSRAM build (TinyCPsram). The framework
 // bakes CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096 into its heap: every malloc()
@@ -1875,6 +1875,10 @@ struct TcSlot {
                                   // so its teardown-save can't read the already-freed heap and
                                   // write zeros over the .pvs's heap-persist arrays. Cleared
                                   // when tc_vm_load() installs a fresh VM.
+  bool     started;               // the program has run since it was loaded (TinyCStartVM). A program
+                                  // that was loaded but never started holds only its default values —
+                                  // saving those would overwrite the .pvs (IDE upload + stop, Andreas
+                                  // 21.10.2026). Cleared on every load, set in TinyCStartVM.
   bool     running;
   bool     autoexec;              // auto-run on boot
   bool     web_nocard;            // webCard(0) sets this — suppress this slot's main-page card frame (0 = carded)
@@ -19261,7 +19265,12 @@ static void tc_persist_load(TcVM *vm, bool heap_phase) {
 #ifdef USE_UFILESYS
   File f;
   if (ufsp) f = ufsp->open(vm->persist_file, "r");
-  if (!f && ffsp && ffsp != ufsp) f = ffsp->open(vm->persist_file, "r");
+  if (!f && ffsp && ffsp != ufsp) {
+    f = ffsp->open(vm->persist_file, "r");
+    if (f) {   // a copy on the flash is older or newer than the one on the SD card, never the same: say where the values came from
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist %s not on the SD card - read from the FLASH file system"), vm->persist_file);
+    }
+  }
   if (!f) return;
 
   uint16_t fsize = f.size();
@@ -22266,8 +22275,16 @@ static void TinyCStopVM(TcSlot *s) {
   tc_output_flush();
   tc_current_slot = nullptr;
 
-  // Auto-save persist variables before clearing VM
-  tc_persist_save(&s->vm);
+  // Auto-save persist variables before clearing VM — but only if the program ran since it was loaded.
+  // An IDE upload loads the new program without reading its .pvs, and the IDE sends a stop before
+  // "run": saving here wrote the program's DEFAULT values over the .pvs (also over one taken over
+  // from the previous version). Measured on the SteuVE, Andreas 21.10.2026.
+  if (s->started) {
+    tc_persist_save(&s->vm);
+  } else if (s->vm.persist_count > 0) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist not saved - %s was loaded but never started"), s->filename);
+  }
+  s->started = false;
 
   s->running = false;
   s->vm.running = false;
@@ -22415,6 +22432,7 @@ static bool TinyCStartVM(TcSlot *s) {
   TinyCSetPersistFile(s, s->filename);
   tc_persist_load(&s->vm, false);   // phase 0: global scalars
   tc_persist_load(&s->vm, true);    // phase 1: heap-persist arrays (pre-allocated above)
+  s->started = true;                // from here the VM holds the saved values — a stop may save them again
 
   // Register UDP global variables (V5: auto-update from packets)
   if (s->vm.udp_global_count > 0) {

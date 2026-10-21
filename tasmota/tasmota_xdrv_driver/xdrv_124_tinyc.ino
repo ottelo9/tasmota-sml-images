@@ -1019,6 +1019,12 @@ static void TinyCInit(void) {
   // Slots allocated on demand (upload, load, run API)
 
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: TinyC v" TC_RELEASE " initialized (%d bytes, %d free)"), needed, ESP_getFreeHeap());
+#ifdef USE_UFILESYS
+  // Which file system programs and .pvs files are read from at this boot. With an SD card that failed to mount at boot this
+  // says "flash": scripts, settings and pages then come from (or go to) a different copy than on the card (Andreas, 20.10.2026).
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: user file system = %s%s"), (ufsp && ffsp && ufsp != ffsp) ? "SD card" : "flash",
+         (ufsp && ffsp && ufsp != ffsp) ? ", flash as fallback" : "");
+#endif
 
   // Load slot config from /tinyc.cfg (loads files + auto-runs marked slots)
 #ifdef USE_UFILESYS
@@ -2101,6 +2107,7 @@ static uint32_t TinyCUnloadSlot(uint8_t slot_num) {
   if (s->vm.const_data) { free(s->vm.const_data); }
   memset(&s->vm, 0, sizeof(TcVM));
   s->torn_down = false;           // the VM is gone; a later load starts clean
+  s->started = false;             // nothing has run in the next program yet
   if (s->program) { free(s->program); s->program = nullptr; }
   s->program_size = 0;
   s->loaded = false;
@@ -2495,6 +2502,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   int err = tc_vm_load(&s->vm, s->program, fsize);
   if (err == TC_OK) {
     s->loaded = true;
+    s->started = false;   // loaded, not yet run: a stop before the first start must not save defaults
     strlcpy(s->filename, path, sizeof(s->filename));
     strlcpy(Tinyc->slot_config[slot_num].filename, path, sizeof(Tinyc->slot_config[slot_num].filename));
     TinyCSetPersistFile(s, path);
@@ -4281,10 +4289,16 @@ static void HandleTinyCUpload(void) {
       s->program_size = Tinyc->upload_received;
       Tinyc->upload_buf = nullptr;
 
+      // The program this slot ran before — for carrying its persist values over to a new version, as in
+      // TinyCLoadFile (the IDE loads through this upload, not through TinyCLoadFile; Andreas 21.10.2026).
+      char prev_tcb[TC_FILENAME_MAX];
+      strlcpy(prev_tcb, s->filename[0] ? s->filename : Tinyc->slot_config[slot_num].filename, sizeof(prev_tcb));
+
       // Try to load
       int err = tc_vm_load(&s->vm, s->program, s->program_size);
       if (err == TC_OK) {
         s->loaded = true;
+        s->started = false;   // loaded, not yet run (see TcSlot::started)
         strlcpy(s->filename, Tinyc->upload_filename, sizeof(s->filename));
         strlcpy(Tinyc->slot_config[slot_num].filename, s->filename, sizeof(Tinyc->slot_config[slot_num].filename));
         TinyCSetPersistFile(s, s->filename);
@@ -4310,6 +4324,7 @@ static void HandleTinyCUpload(void) {
           WcInterrupt(1);
 #endif
           AddLog(LOG_LEVEL_INFO, PSTR("TCC: Saved to %s"), saveName);
+          TinyCAdoptPersist(prev_tcb, saveName);   // after the save: it reads the new .tcb's @name from the file
         }
         TinyCSaveSettings();
 #endif
@@ -8872,7 +8887,7 @@ bool Xdrv124(uint32_t function) {
       // while the scalars and small arrays survived (ottelo, 20.10.2026).
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
         TcSlot *s = Tinyc->slots[i];
-        if (s && s->loaded && !s->torn_down) {
+        if (s && s->loaded && !s->torn_down && s->started) {   // never-started program: only defaults (21.10.2026)
           tc_persist_save(&s->vm);
         }
       }
