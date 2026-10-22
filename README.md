@@ -8,6 +8,19 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 [Download Statistik](https://tooomm.github.io/github-release-stats/?username=ottelo9&repository=tasmota-sml-images)  
 [ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
+### Features
+| Feature | Was es macht | Hilfe |
+| ------------- | ------------- | ------------- |
+| 📊 **Strom zählen und anzeigen** | Verbrauch und Einspeisung in Echtzeit, Diagramme für die letzten Minuten und 24 Stunden, Balken für Tage, Wochen, Monate und Jahre | [Diagramme](https://ottelo9.github.io/tasmota-sml-script/sml/#charts) |
+| 🔢 **Über 140 Zähler zur Auswahl** | Zähler im Menü auswählen, Lesekopf-Pins einstellen, fertig - auch für Gas- und Wasserzähler | [Zähler](https://ottelo9.github.io/tasmota-sml-script/sml/#meter), [Gas/Wasser](https://ottelo9.github.io/tasmota-sml-script/sml/#gaswater) |
+| 🔌 **Schnittstellen: MQTT, Home Assistant, HTTP, Modbus TCP** | Werte per MQTT (auch geglättet), in Home Assistant über die Tasmota-Integration, per HTTP (`/pwr`) und als Modbus-TCP-Server | [MQTT/HTTP](https://ottelo9.github.io/tasmota-sml-script/sml/#telemetry), [Modbus TCP](https://ottelo9.github.io/tasmota-sml-script/sml/#modbus) |
+| 🔋 **Für viele PV-Akkus und Steuerungen** | Marstek, Hoymiles, Growatt NOAH u. a. über die Emulatoren; openDTU-OnBattery, AhoyDTU und andere holen sich die Netzleistung per HTTP, MQTT oder Modbus TCP | [Werte abfragen](https://ottelo9.github.io/tasmota-sml-script/sml/#vars) |
+| ☀️ **PV-Überschuss-Schalter** | Schaltet ein anderes Tasmota-Gerät (z. B. Heizstab, Steckdose) bei Überschuss ein und wieder aus | [PV-Schalter](https://ottelo9.github.io/tasmota-sml-script/sml/#pvswitch) |
+| 💾 **FTP-Backup** | Sichert Zählerstände und Diagrammdaten jede Nacht auf eine FRITZ!Box oder ein NAS | [FTP-Backup](https://ottelo9.github.io/tasmota-sml-script/sml/#ftp) |
+| 🚗 **go-e Charger: E-Auto mit PV-Überschuss laden** | Das Zusatzprogramm MQTT-Push schickt die Netzleistung alle paar Sekunden per MQTT an die go-e-Wallbox, die damit nur mit Überschuss lädt | [MQTT-Push](https://ottelo9.github.io/tasmota-sml-script/sml/#mqttpush) |
+| 🔋 **Shelly / EcoTracker Emulator (Nulleinspeisung)** | Der ESP gibt sich als Shelly Pro 3EM oder EcoTracker aus. Smarte Akkus (z. B. Marstek, Hoymiles, Growatt NOAH) speisen dann genau so viel ein, wie gerade verbraucht wird | [EcoTracker / Shelly](https://ottelo9.github.io/tasmota-sml-script/eco_shelly/) |
+| 🔋 **Marstek CT002 / CT003 Emulator (Nulleinspeisung)** | Der ESP gibt sich als Marstek-Zähler CT002/CT003 aus, für Marstek-Akkus (Venus, Jupiter, B2500), mehrere Akkus gleichzeitig | [Marstek CT002](https://ottelo9.github.io/tasmota-sml-script/ct002/) |
+
 ### Welches Image (Firmware Binary) für welchen ESP?
 
 **Wichtig — Varianten-Suffix:** Jedes ESP32-Image gibt es in zwei Varianten (ESP8266 nur `_tas`):
