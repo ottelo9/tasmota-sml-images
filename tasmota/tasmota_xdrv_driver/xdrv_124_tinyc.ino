@@ -431,6 +431,7 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
  *   ,0
  *   ,0
  *   Last line (optional): _info,<0|1>   (show_info flag)
+ *   Optional: _logname,<0|1> (TinyCLogName), _psram,<limit> (TinyCPsram)
 \*********************************************************************************************/
 
 #define TC_CFG_FILE "/tinyc.cfg"
@@ -482,6 +483,7 @@ static void TinyCSaveSettings(void) {
   }
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
+  if (tc_log_name != (TINYC_LOG_NAME != 0)) f.printf("_logname,%d\n", tc_log_name ? 1 : 0);   // only when it differs from the build default
 #ifdef ESP32
   // And the malloc() PSRAM limit (TinyCPsram) -- only when it differs from the
   // build default; an explicit 0 (framework 4096) IS written, or the default
@@ -769,6 +771,10 @@ static void TinyCLoadSettings(void) {
       Tinyc->show_info = (autoexec != 0);
       continue;
     }
+    if (fname == "_logname") {         // TinyCLogName
+      tc_log_name = (autoexec != 0);
+      continue;
+    }
 #ifdef ESP32
     // _psram,<limit>: the malloc() PSRAM limit (TinyCPsram) -- applied right
     // here, before any slot loads, so the slots' own allocations follow it too.
@@ -1010,7 +1016,6 @@ static void TinyCInit(void) {
   // ESP32-C3 to find — see MEMORY.md "tcpAvailable() crashes when polled
   // from a periodic callback" entry for the diagnostic walk.
   new (&Tinyc->tcp_client) WiFiClient();
-  Tinyc->tcp_cli_slot = 0;
   Tinyc->instr_per_tick = TC_INSTR_PER_TICK;
   // Init SPI CS pins to -1 (unused)
   for (int i = 0; i < TC_SPI_MAX_CS; i++) { Tinyc->spi.cs[i] = -1; }
@@ -1189,6 +1194,11 @@ void CmndTinyCHttpRx(void);
 void CmndTinyCUnload(void);
 void CmndTinyCUdp(void);
 void CmndTinyCStrict(void);
+void CmndTinyCLogName(void);
+#ifdef ESP32
+void CmndTinyCTlsCert(void);
+void CmndTinyCTlsGueltig(void);
+#endif
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -1197,9 +1207,9 @@ void CmndMatterCryptoTest(void);
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp|Strict"
+  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp|Strict|LogName"
 #ifdef ESP32
-  "|Chkpt|Stack|HttpRx|Heap|Psram"
+  "|Chkpt|Stack|HttpRx|Heap|Psram|TlsCert|TlsGueltig"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
@@ -1215,9 +1225,10 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
   &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload, &CmndTinyCUdp,
-  &CmndTinyCStrict
+  &CmndTinyCStrict, &CmndTinyCLogName
 #ifdef ESP32
-  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
+  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram, &CmndTinyCTlsCert,
+  &CmndTinyCTlsGueltig
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
@@ -2192,6 +2203,80 @@ void CmndTinyCStrict(void) {
   ResponseCmndNumber(tc_strict ? 1 : 0);
 }
 
+// TinyCLogName 0 / 1: the lines a script writes with addLog() / addLogLvl() start with its `// @name:` in
+// brackets, "TCC: [Name] text" (0, default: unchanged). Saved in /tinyc.cfg; takes effect at once.
+void CmndTinyCLogName(void) {
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+    tc_log_name = (XdrvMailbox.payload == 1);
+    TinyCSaveSettings();
+  }
+  ResponseCmndNumber(tc_log_name ? 1 : 0);
+}
+
+#ifdef ESP32
+// TinyCTlsCert <certfile> <keyfile>  load a TLS client certificate that tlsConnect() then shows when the server
+//                                    asks for one (format: see tc_clcert_load in xdrv_124_tinyc_vm.h)
+// TinyCTlsCert 0                     off (tlsConnect without client certificate, as before)
+// TinyCTlsCert                       state only. The answer never contains key material.
+// 08.11.2026 (Andreas): HAN interface of smart meter gateways that authenticate by certificate.
+// 09.11.2026 (Andreas, patch 0013, remark by gemu): tls_mini shows the certificate only when built with
+// USE_MQTT_CLIENT_CERT. Without it nothing is loaded and the answer says so, instead of "loaded":1.
+void CmndTinyCTlsCert(void) {
+#ifndef USE_MQTT_CLIENT_CERT
+  tc_clcert_clear();
+  Response_P(PSTR("{\"%s\":{\"loaded\":0,\"error\":\"needs USE_MQTT_CLIENT_CERT\"}}"), XdrvMailbox.command);
+#else
+  if (XdrvMailbox.data_len > 0) {
+    char arg[260];
+    strlcpy(arg, XdrvMailbox.data, sizeof(arg));
+    char *a = arg;
+    while (*a == ' ') a++;
+    if (!strcmp(a, "0")) {
+      tc_clcert_clear();
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: TLS client certificate off"));
+    } else {
+      char *b = strchr(a, ' ');
+      if (!b) { ResponseCmndChar_P(PSTR("usage: TinyCTlsCert <certfile> <keyfile> | 0")); return; }
+      *b++ = 0;
+      while (*b == ' ') b++;
+      const char *err = tc_clcert_load(a, b);
+      if (err) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: TLS client certificate not loaded: %s"), err);
+        Response_P(PSTR("{\"%s\":{\"loaded\":0,\"error\":\"%s\"}}"), XdrvMailbox.command, err);
+        return;
+      }
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: TLS client certificate loaded (%u bytes, %s)"), tc_clcert_len,
+             (tc_clcert_curve == BR_EC_secp384r1) ? "P-384" : "P-256");
+    }
+  }
+  if (tc_clcert_curve) {
+    Response_P(PSTR("{\"%s\":{\"loaded\":1,\"curve\":\"%s\",\"bytes\":%u}}"), XdrvMailbox.command,
+               (tc_clcert_curve == BR_EC_secp384r1) ? "P-384" : "P-256", tc_clcert_len);
+  } else {
+    Response_P(PSTR("{\"%s\":{\"loaded\":0}}"), XdrvMailbox.command);
+  }
+#endif  // USE_MQTT_CLIENT_CERT
+}
+
+// TinyCTlsGueltig   certificate the peer sent on the LAST tlsConnect (or other unverified TLS connect of this
+//                   device): {"host","von","bis" (UTC),"fuer" (subject CN),"seriennr" (decimal),"seriennr_hex"}.
+// 11.11.2026 (Andreas): validity of a smart meter gateway's TLS certificate = date by which the gateway must be
+// replaced (TRuDI shows it as "Zertifikat der TLS-Verbindung"). Read right after the session; empty before.
+// "fuer" shows only the last 4 characters (rest '*'): the answer always ends up in the log (RSL: RESULT), and the
+// subject of a gateway certificate is its device ID - like the .secret files it is used, never printed.
+void CmndTinyCTlsGueltig(void) {
+  const char *von, *bis, *fuer, *snr_hex, *snr_dez, *host;
+  BearSSL::TlsPeerCertInfo(&von, &bis, &fuer, &snr_hex, &snr_dez, &host);
+  char fuer4[65];
+  size_t n = strlen(fuer);
+  if (n >= sizeof(fuer4)) { n = sizeof(fuer4) - 1; }
+  for (size_t i = 0; i < n; i++) { fuer4[i] = (i + 4 < n) ? '*' : fuer[i]; }
+  fuer4[n] = 0;
+  Response_P(PSTR("{\"%s\":{\"host\":\"%s\",\"von\":\"%s\",\"bis\":\"%s\",\"zeit\":\"UTC\",\"fuer\":\"%s\",\"seriennr\":\"%s\",\"seriennr_hex\":\"%s\"}}"),
+             XdrvMailbox.command, host, von, bis, fuer4, snr_dez, snr_hex);
+}
+#endif  // ESP32
+
 void CmndTinyCUdp(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
 #ifdef ESP32
@@ -2331,7 +2416,10 @@ void CmndTinyCHeap(void) {
       (unsigned)ps.total_free_bytes, (unsigned)ps.largest_free_block,
       (unsigned)ps.allocated_blocks, (unsigned)ps.free_blocks);
   }
-  ResponseAppend_P(PSTR(",\"psram_limit\":%u}}"), (unsigned)(Tinyc ? Tinyc->psram_limit : 0));
+  // What the structures cost (RAM per slot is sizeof(TcSlot) + the VM task stack + the program; Tinyc is allocated once at start).
+  ResponseAppend_P(PSTR(",\"psram_limit\":%u,\"sizeof\":{\"TcSlot\":%u,\"TcVM\":%u,\"TINYC\":%u,\"locals_block\":%u}}}"),
+                   (unsigned)(Tinyc ? Tinyc->psram_limit : 0), (unsigned)sizeof(TcSlot), (unsigned)sizeof(TcVM),
+                   (unsigned)sizeof(struct TINYC), (unsigned)(TC_MAX_LOCALS * sizeof(int32_t)));
 }
 
 // ── TinyCPsram <limit>: where malloc() goes ─────────────────────────────────
@@ -3410,6 +3498,7 @@ static void HandleTinyCPage(void) {
   WSContentEnd();
 }
 
+static bool tc_ext_path_blocked(const char *path, bool read);   // defined below, before HandleTinyCApi
 // Set by HandleTinyCUpload when the file name is longer than a slot can carry; HandleTinyCUploadDone then says why.
 static bool tc_upload_name_error = false;
 
@@ -3518,11 +3607,16 @@ static void HandleTinyCUploadCORS(void) {
                                      // the stop there; keep it for heap-tight C3/.104 +
                                      // a tight S3 bridge. Override -DTC_FS_STOP_MINBLK=N.
 #endif
-void TinyCFsWritePause(uint32_t fsize) {
+void TinyCFsWritePause(uint32_t fsize, bool to_flash) {
   // Size-gate: skip the VM stop for small writes (the common case — config /
   // small .tc / data files). fsize==0 means the client didn't declare a size
   // (?fsz=) so assume it could be large and protect.
   if (fsize > 0 && fsize < TC_FS_BIG_WRITE) return;
+  // Target gate: the deadlock above comes from the SPI-flash cache being disabled
+  // for each erase/program, which only the internal LittleFS does. A write to the
+  // SD card never touches it, so it must not stop the slots (Andreas, HEMS P4:
+  // a 505 kB upload to SD stopped all five slots once the largest block was < 24 kB).
+  if (!to_flash) return;
   tc_global_pause = true;             // also gates main-loop callbacks (see Xdrv124)
   if (!Tinyc) return;
 #ifdef ESP32
@@ -3561,13 +3655,17 @@ void TinyCFsWritePause(uint32_t fsize) {
            PSTR("TC: ufsu big-write — heap healthy (PSRAM, maxblk %u) — keeping slots live"),
            (unsigned)maxblk);
   } else {
+    uint8_t stopped = 0;
     for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
       TcSlot *s = Tinyc->slots[i];
       if (s && s->loaded) {
         s->fs_was_running = true;
         TinyCStopVM(s);               // reaps spawn workers + stops the VM task
+        stopped++;
       }
     }
+    AddLog(LOG_LEVEL_INFO, PSTR("TC: flash big-write (%u B) — stopped %u slot(s), largest block %u B"),
+           (unsigned)fsize, (unsigned)stopped, (unsigned)maxblk);
   }
 #endif
 }
@@ -3880,7 +3978,7 @@ static int tc_fetch_ide_fs(FS *fs, uint32_t fstype, const char *url) {
              (unsigned)free_kb, (unsigned)need_kb, woher);
     }
   }
-  TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
+  TinyCFsWritePause(0x40000, fs == ffsp);           // big write: quiesce VM tasks (flash only)
   File f = fs->open(target, "w");
   int written = 0; bool magic = false; bool write_err = false;
   if (f) {
@@ -4096,6 +4194,16 @@ static void HandleTinyCUpload(void) {
              upload.filename.c_str(), (unsigned)strlen(upload.filename.c_str()), (unsigned)(sizeof(Tinyc->upload_filename) - 2));
       return;
     }
+
+    // Same list as the file ways on port 82/83 and /tc_api: a key or settings file must not be replaced by a program
+    // uploaded under its name (the name is the one the sender chose).
+    { char chk[sizeof(Tinyc->upload_filename) + 1];
+      snprintf_P(chk, sizeof(chk), PSTR("/%s"), upload.filename.c_str());
+      if (tc_ext_path_blocked(chk, false)) {
+        Web.upload_error = 1;
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload refused (protected file): %s"), upload.filename.c_str());
+        return;
+      } }
 
     // ⚠️ Web.upload_error is a GLOBAL and nobody clears it for us. One failed
     // upload (a malloc that could not be served, an oversize file) therefore
@@ -4385,8 +4493,35 @@ static void HandleTinyCUpload(void) {
 
 // ---- API endpoint for browser IDE (JSON + CORS) ----
 // GET /tc_api?cmd=run|stop|status&slot=N
+// Files that must not leave (or be changed through) the unauthenticated file ways:
+// port 82 download, port 83 upload and /tc_api readfile/writefile/deletefile.
+// Matches the base name only (so "/ufs/ffs/../eebus_key.der" and the SD copy are covered),
+// ignores an "@from_to" range suffix. read=true: secrets that must never be readable.
+// read=false: additionally files whose content decides who the device trusts or talks to.
+// VM scripts are not affected (they are the owner's code and use tc_file_path directly).
+[[maybe_unused]] static bool tc_ext_path_blocked(const char *path, bool read) {
+  const char *b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  char n[32];
+  size_t i = 0;
+  for (; b[i] && ('@' != b[i]) && (i < sizeof(n) - 1); i++) { n[i] = (char)tolower((unsigned char)b[i]); }
+  n[i] = '\0';
+  if (strstr_P(path, PSTR("/.."))) { return true; }
+  { size_t bl = strcspn(b, "@");                              // on the whole name: n[] is cut at 31 characters
+    if ((bl > 7) && !strncasecmp_P(b + bl - 7, PSTR(".secret"), 7)) { return true; } }   // convention: credentials a project keeps in its own files
+  if (!strcmp_P(n, PSTR("eebus_key.der")) || !strcmp_P(n, PSTR("tlskey")) ||
+      !strncmp_P(n, PSTR(".settings"), 9) || !strncmp_P(n, PSTR(".drvset"), 7) ||
+      !strncmp_P(n, PSTR(".snsset"), 7)) { return true; }
+  if (read) { return false; }
+  return !strcmp_P(n, PSTR("eebus_cert.der")) || !strcmp_P(n, PSTR("eebus_peer.txt")) ||
+         !strcmp_P(n, PSTR("eebus_cs_trust.txt")) || !strcmp_P(n, PSTR("eebus_cs_typ.txt")) ||
+         !strcmp_P(n, PSTR("eebus_cs.txt")) ||   // SteuVE failsafe limit (W and seconds)
+         !strcmp_P(n, PSTR("eebus_hems_down.txt"));
+}
+
 static void HandleTinyCApi(void) {
   TCSendCORS("GET, POST, OPTIONS");
+  if (!HttpCheckPriviledgedAccess()) { return; }   // 04.11.2026: web password (if set) also protects /tc_api, like /tc_ui and the file manager
 
   if (!Tinyc) {
     WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"not initialized\"}"));
@@ -4593,6 +4728,10 @@ static void HandleTinyCApi(void) {
       WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
       return;
     }
+    if (tc_ext_path_blocked(fpath.c_str(), false)) {
+      WSSendJSON_P(403, PSTR("{\"ok\":false,\"error\":\"protected file\"}"));
+      return;
+    }
     bool deleted = false;
     if (ufsp) deleted = ufsp->remove(fpath.c_str());
     if (!deleted && ffsp && ffsp != ufsp) deleted = ffsp->remove(fpath.c_str());
@@ -4609,6 +4748,10 @@ static void HandleTinyCApi(void) {
     String fpath = Webserver->arg(F("path"));
     if (fpath.length() == 0 || fpath[0] != '/') {
       WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"missing path\"}"));
+      return;
+    }
+    if (tc_ext_path_blocked(fpath.c_str(), true)) {
+      WSSendJSON_P(403, PSTR("{\"ok\":false,\"error\":\"protected file\"}"));
       return;
     }
     if (!ufsp) {
@@ -4802,6 +4945,10 @@ static void HandleTinyCApi(void) {
     }
     if (!ufsp) {
       WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
+      return;
+    }
+    if (tc_ext_path_blocked(fpath.c_str(), false)) {
+      WSSendJSON_P(403, PSTR("{\"ok\":false,\"error\":\"protected file\"}"));
       return;
     }
     String body = Webserver->arg(F("plain"));
@@ -6269,7 +6416,9 @@ static const char TC_BUSY_HTML[] PROGMEM =
 
 static void HandleTinyCWebOn(uint8_t handler_num) {
   if (!Tinyc) { Webserver->send(503, "text/plain", "TinyC not ready"); return; }
-  TcSlot *s = Tinyc->slots[0];
+  // The program that registered this URL answers it (webOn(n, url) from slot 2 used to call slot 0).
+  uint8_t hidx = handler_num - 1;
+  TcSlot *s = Tinyc->slots[Tinyc->web_handler_slot[hidx] < TC_MAX_VMS ? Tinyc->web_handler_slot[hidx] : 0];
   if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
     Webserver->send(503, "text/plain", "TinyC not ready");
     return;
@@ -6288,7 +6437,7 @@ static void HandleTinyCWebOn(uint8_t handler_num) {
     Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
     return;
   }
-  Tinyc->current_web_handler = handler_num;
+  Tinyc->current_web_handler = Tinyc->web_handler_num[hidx];   // the program's own number
   Tinyc->web_content_begun   = 0;
   Tinyc->web_raw_active      = 0;
   // A webOn handler serves a whole page of its own, so WebChart() has to start
@@ -6916,6 +7065,18 @@ static void tc_download_task(void *param) {
   // "/ufs/ffs/backup.csv" -> flash, "/ufs/sdfs/x" -> SD, else ufsp. Lets a Flash
   // backup be downloaded back for md5-verify without a global dir switch. (Done
   // AFTER the @-range split so the prefix sees the clean path.)
+  if (tc_ext_path_blocked(path, true)) {
+    req->client.print(F("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n\r\nProtected file\r\n"));
+    delay(20);
+    req->client.stop();
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: DL refused (protected file): %s"), path);
+    delete req;
+    Tinyc->dl_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
   FS *fsp = tc_file_path(path);
   if (!fsp) fsp = ufsp;
   File file = fsp->open(path, "r");
@@ -7395,6 +7556,10 @@ static void tc_ul_handle(WiFiClient &client) {
     tc_ul_reply(client, "404 Not Found", "path must be /ufs/<file>"); return;
   }
   char *path = target + 4;          // "/ufs/SND/x.mp3" -> "/SND/x.mp3"
+  if (tc_ext_path_blocked(path, false)) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: upload refused (protected file): %s"), path);
+    tc_ul_reply(client, "403 Forbidden", "protected file"); return;
+  }
   // Resolve the TARGET filesystem from the path prefix, same convention the VM
   // file syscalls use (tc_file_path): "/ufs/ffs/backup.csv" -> flash (ffsp),
   // "/ufs/sdfs/x" -> SD (ufsp), anything else -> ufsp (active/SD). This gives a
@@ -7421,7 +7586,13 @@ static void tc_ul_handle(WiFiClient &client) {
   // active UFS. A 0 reading means "unknown" -> don't block; also naturally
   // rejects a garbage Content-Length.
   extern uint32_t UfsInfo(uint32_t sel, uint32_t type);
+#ifdef USE_USB_HOST_MSC
+  extern FS *usbfsp;
+  extern FS *usb2fsp;
+  uint32_t free_kb = UfsInfo(1, (fsp == ffsp) ? 1 : ((fsp == usbfsp) ? 2 : ((fsp == usb2fsp) ? 3 : 0)));
+#else
   uint32_t free_kb = UfsInfo(1, (fsp == ffsp) ? 1 : 0);
+#endif
   if (free_kb && (fsize / 1024 + 16) > free_kb) {
     char m[64]; snprintf_P(m, sizeof(m), PSTR("no space: need %u kB, free %u kB"),
                            (unsigned)(fsize / 1024), (unsigned)free_kb);
@@ -7437,11 +7608,26 @@ static void tc_ul_handle(WiFiClient &client) {
   // --- quiesce the VM tasks around the big flash write (same proven coordination
   // as /ufsu: on a heap-tight device it stops+restarts the slots; on healthy PSRAM
   // it keeps them live). Balanced with the single Resume below on every exit. ---
-  extern void TinyCFsWritePause(uint32_t);
+  extern void TinyCFsWritePause(uint32_t, bool);
   extern void TinyCFsWriteResume(void);
-  TinyCFsWritePause(fsize);
+  TinyCFsWritePause(fsize, fsp == ffsp);
 
-  File f = fsp->open(path, "w");
+  // Receive into "<path>.tmp" and swap it in only after the whole body arrived, so an aborted
+  // upload keeps the old file (Andreas: a failed upload left no file at all). The old file is
+  // still there while the new one is written, so it needs room for both; if it doesn't fit,
+  // fall back to writing in place.
+  char wpath[170];
+  snprintf_P(wpath, sizeof(wpath), PSTR("%s.tmp"), path);
+  bool use_tmp = true;
+  if (free_kb) {
+    uint32_t old_kb = 0;
+    File of = fsp->open(path, "r");
+    if (of) { old_kb = (uint32_t)(of.size() / 1024); of.close(); }
+    if ((fsize / 1024 + 16 + old_kb) > free_kb) { use_tmp = false; }
+  }
+  if (!use_tmp) { strlcpy(wpath, path, sizeof(wpath)); }
+
+  File f = fsp->open(wpath, "w");
   bool ok = false;
   const char *err = "open failed";
   uint32_t written = 0;
@@ -7476,7 +7662,16 @@ static void tc_ul_handle(WiFiClient &client) {
       if (ok && written != fsize) { ok = false; err = "short body"; }
     }
     f.close();
-    if (!ok) fsp->remove(path);   // don't leave a truncated file behind
+    if (!ok) { fsp->remove(wpath); }   // don't leave a truncated file behind
+    else if (use_tmp) {
+      // FAT cannot rename over an existing file, so remove the old one first
+      fsp->remove(path);
+      if (!fsp->rename(wpath, path)) {
+        // keep the complete new file under its temp name: the old one is gone already, deleting this too would lose both
+        ok = false; err = "rename failed";
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: upload complete but rename failed, new file kept as %s"), wpath);
+      }
+    }
   }
 
   TinyCFsWriteResume();
@@ -7492,15 +7687,35 @@ static void tc_ul_handle(WiFiClient &client) {
   }
 }
 
-// Dedicated task: accept + service upload connections. WiFiServer serializes them
-// (one accepted client at a time), so uploads never overlap.
-static void tc_upload_server_task(void *param) {
-  for (;;) {
-    WiFiClient client = tc_ul_server->available();
-    if (!client) { vTaskDelay(pdMS_TO_TICKS(25)); continue; }
-    tc_ul_handle(client);
-    delay(30);          // let the reply drain before FIN
-    client.stop();
+// One upload connection per task: the task (and its 8 KB stack) exists only while a file arrives. It used to be a task that lived forever and
+// polled the listener every 25 ms - 8 KB of internal RAM for a feature that is used a few times a day (measured on the WAVE ROVER, 12.11.2026:
+// stack 8192 B, high-water mark 1000 B). Uploads never overlap (tc_ul_busy), a second connection waits in the listener's backlog.
+static volatile bool tc_ul_busy = false;
+
+static void tc_upload_conn_task(void *param) {
+  WiFiClient *cp = (WiFiClient *)param;
+  tc_ul_handle(*cp);
+  delay(30);            // let the reply drain before FIN
+  cp->stop();
+  delete cp;
+  tc_ul_busy = false;
+  vTaskDelete(NULL);
+}
+
+// Called from the main loop (TC_DLServerLoop): a pending connection on port 83 gets its own short-lived task.
+static void tc_ul_poll(void) {
+  if (!tc_ul_server || tc_ul_busy) { return; }
+  WiFiClient c = tc_ul_server->available();
+  if (!c) { return; }
+  WiFiClient *cp = new (std::nothrow) WiFiClient(c);
+  if (!cp) { c.stop(); return; }
+  tc_ul_busy = true;
+  if (xTaskCreatePinnedToCore(tc_upload_conn_task, "TCUL", 8192, cp, 3, NULL, 1) != pdPASS) {   // needs 8 KB contiguous: a fragmented heap may refuse
+    tc_ul_reply(*cp, "503 Service Unavailable", "FAIL no memory for the upload task");
+    cp->stop();
+    delete cp;
+    tc_ul_busy = false;
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: upload task: out of memory (largest block %u)"), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   }
 }
 
@@ -7522,7 +7737,6 @@ static void TC_DLServerInit(void) {
     if (tc_ul_server) {
       tc_ul_server->begin();
       tc_ul_server->setNoDelay(true);
-      xTaskCreatePinnedToCore(tc_upload_server_task, "TCUL", 8192, NULL, 3, NULL, 1);
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload server started on port %d"), TC_ULPORT);
     }
   }
@@ -7532,6 +7746,7 @@ static void TC_DLServerInit(void) {
 static void TC_DLServerLoop(void) {
   if (Tinyc && Tinyc->dl_server) {
     Tinyc->dl_server->handleClient();
+    tc_ul_poll();
   }
 }
 
@@ -7777,6 +7992,16 @@ void CmndTinyCStack(void) {
   }
   Response_P(PSTR("{\"" D_PRFX_TINYC "Stack\":{\"VmTaskStack\":%d,\"Default\":%d"),
              (int)tc_vm_stack_bytes, (int)TC_VM_TASK_STACK);
+  // The FreeRTOS idle task of each core -- a stack canary on IDLE0/IDLE1 was seen on
+  // an S3 (2026-11-01); this shows how much of CONFIG_FREERTOS_IDLE_TASK_STACKSIZE is
+  // really left. Same unit (bytes) as StackFreeMin below.
+  for (int c = 0; c < portNUM_PROCESSORS; c++) {
+    TaskHandle_t ih = xTaskGetIdleTaskHandleForCore(c);
+    if (ih) {
+      ResponseAppend_P(PSTR(",\"IDLE%d\":{\"Size\":%d,\"StackFreeMin\":%u}"),
+                       c, (int)CONFIG_FREERTOS_IDLE_TASK_STACKSIZE, (uint32_t)uxTaskGetStackHighWaterMark(ih));
+    }
+  }
   // The VM tasks themselves -- exactly the number the size is chosen from.
   if (Tinyc) {
     for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
@@ -7796,7 +8021,28 @@ void CmndTinyCStack(void) {
                      e->name, e->slot_idx, freeb);
   }
   tc_spawn_pool_unlock();
-  ResponseAppend_P(PSTR("}}"));
+  ResponseAppend_P(PSTR("}"));
+  // Every FreeRTOS task with its stack (size = the heap block the stack lives in) and the stack never used (high-water mark): where the RAM of
+  // the tasks goes, and which stack could be smaller. 12.11.2026, found while sizing the RAM of the rover (needs the FreeRTOS trace facility).
+#if (configUSE_TRACE_FACILITY == 1)
+  {
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    TaskStatus_t *ts = (TaskStatus_t *)malloc(n * sizeof(TaskStatus_t));
+    if (ts) {
+      n = uxTaskGetSystemState(ts, n, nullptr);
+      uint32_t total = 0;
+      ResponseAppend_P(PSTR(",\"Tasks\":["));
+      for (UBaseType_t i = 0; i < n; i++) {
+        uint32_t sz = (uint32_t)heap_caps_get_allocated_size((void *)ts[i].pxStackBase);
+        total += sz;
+        ResponseAppend_P(PSTR("%s{\"n\":\"%s\",\"stk\":%u,\"free\":%u}"), i ? "," : "", ts[i].pcTaskName, (unsigned)sz, (unsigned)ts[i].usStackHighWaterMark);
+      }
+      ResponseAppend_P(PSTR("],\"TaskStackTotal\":%u"), (unsigned)total);
+      free(ts);
+    }
+  }
+#endif
+  ResponseAppend_P(PSTR("}"));
 }
 
 // TinyCHttpRx [bytes] — TLS receive buffer for httpGet()/httpPost() from a
@@ -8838,7 +9084,7 @@ bool Xdrv124(uint32_t function) {
         for (int i = 0; i < Tinyc->web_handler_count && i < TC_MAX_WEB_HANDLERS; i++) {
           if (Tinyc->web_handler_url[i][0]) {
             Webserver->on(Tinyc->web_handler_url[i], TinyCWebOnHandlers[i]);
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered (deferred)"), i + 1, Tinyc->web_handler_url[i]);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered (deferred)"), Tinyc->web_handler_num[i], Tinyc->web_handler_url[i]);
           }
         }
       }

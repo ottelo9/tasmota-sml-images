@@ -1719,6 +1719,44 @@ void ebus_dump_arb_byte(uint8_t iob) {
 }
 #endif // USE_SML_EBUS_ARB
 
+// eBUS master address: both nibbles out of {0,1,3,7,F}
+static bool ebus_is_master(uint8_t addr) {
+  uint8_t hi = addr >> 4, lo = addr & 0x0f;
+  return (hi == 0 || hi == 1 || hi == 3 || hi == 7 || hi == 0x0f) &&
+         (lo == 0 || lo == 1 || lo == 3 || lo == 7 || lo == 0x0f);
+}
+
+// Check the slave part of a telegram whose master CRC already passed. The measured value sits in
+// the slave reply, so without this a disturbed or missing reply is decoded as if it were valid
+// (single-telegram spikes: 0, 96 C air intake, 9732 l/h). tlen = raw offset of the master CRC.
+// Raw (still escaped) buffer: ... CRC ACK NN2 data.. CRC2 ACK. Broadcasts and master-master
+// telegrams have no reply. NAK/repeat frames are rejected as well: the fixed x-offsets of the
+// descriptors would point into the first, bad copy.
+// *noreply is set when nothing at all follows the master part (device scans to absent addresses, a
+// silent slave): that is normal bus traffic and only logged at debug level by the caller.
+static bool ebus_slave_part_ok(struct METER_DESC *mp, uint16_t tlen, bool *noreply) {
+  uint8_t zz = mp->sbuff[1];
+  *noreply = false;
+  if (zz == 0xfe || ebus_is_master(zz)) { return true; }
+  uint16_t pos = tlen + ((mp->sbuff[tlen] == EBUS_ESC) ? 2 : 1);   // slave ACK
+  if (pos >= mp->spos) { *noreply = true; return false; }          // no reply at all
+  if (mp->sbuff[pos] != 0x00) { return false; }                    // NAK
+  pos++;                                                            // NN2
+  if (pos >= mp->spos || mp->sbuff[pos] == EBUS_ESC) { return false; }
+  uint16_t start = pos;
+  uint8_t nn = mp->sbuff[pos++];
+  for (uint8_t l = 0; l < nn && pos < mp->spos; l++) {
+    pos += (mp->sbuff[pos] == EBUS_ESC) ? 2 : 1;
+  }
+  if (pos >= mp->spos) { return false; }                            // reply cut off
+  uint8_t rcrc = mp->sbuff[pos];
+  if (rcrc == EBUS_ESC) {
+    if (pos + 1 >= mp->spos) { return false; }
+    rcrc = (uint8_t)(EBUS_ESC + mp->sbuff[pos + 1]);
+  }
+  return rcrc == ebus_CalculateCRC(&mp->sbuff[start], pos - start);
+}
+
 // Passive eBUS frame accumulator (refactored out of case 'e' so the enhanced-protocol
 // de-framer can feed it too). Returns 1 when iob was a SYNC (frame boundary), else 0.
 uint8_t ebus_feed_byte(uint32_t meters, uint8_t iob) {
@@ -1753,8 +1791,14 @@ uint8_t ebus_feed_byte(uint32_t meters, uint8_t iob) {
       }
       uint8_t ccrc = (tlen < mp->spos) ? ebus_CalculateCRC(mp->sbuff, tlen) : 0xff;
       if (tlen < mp->spos && wcrc == ccrc) {
-        ebus_esc(mp->sbuff, mp->spos);
-        SML_Decode(meters);
+        bool noreply;
+        if (ebus_slave_part_ok(mp, tlen, &noreply)) {
+          ebus_esc(mp->sbuff, mp->spos);
+          SML_Decode(meters);
+        } else {
+          AddLog(noreply ? LOG_LEVEL_DEBUG : LOG_LEVEL_INFO, PSTR("ebus slave crc error QQ=%02x ZZ=%02x PB=%02x SB=%02x NN=%u tlen=%u spos=%u"),
+                 mp->sbuff[0], mp->sbuff[1], mp->sbuff[2], mp->sbuff[3], mp->sbuff[4], tlen, mp->spos);
+        }
       } else {
         // Enriched so a reject can be pinned to one telegram (Andreas eBUS debugging):
         // QQ ZZ PB SB + NN, where the master CRC was read (tlen) vs the buffer end
@@ -2197,13 +2241,32 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
 			uint16_t len;
 			uint8_t *payload;
 			if (mp->hp->readHanPort(&payload, &len, mp->crypflags)) {
-				if (len > mp->sbsiz) {
-					len = mp->sbsiz;
-				}
-				memmove(mp->sbuff, payload, len);
-				mp->spos = len;   // expose the decrypted block to the script (sml(-1,2)/SML_Read); SML_Decode/OBIS ignore spos
 				AddLog(LOG_LEVEL_DEBUG, PSTR("SML: decrypted block: %d bytes"), len);
-				SML_Decode(meters);
+				if (mp->type == 'o' && len > 0 && payload[0] == '/') {
+					// decrypted ASCII DSMR telegram (e.g. Sagemcom T210-D): the whole telegram sits in one buffer, but an 'o' descriptor
+					// is only compared with the start of it, so feed the decoder one line at a time (belveder79/austrian_dsmr_tasmota)
+					uint16_t lstart = 0;
+					for (uint16_t cnt = 0; cnt < len; cnt++) {
+						if (payload[cnt] == '\n' || cnt == len - 1) {
+							uint16_t llen = cnt - lstart + 1;
+							if (llen > mp->sbsiz - 1) {
+								llen = mp->sbsiz - 1;
+							}
+							memmove(mp->sbuff, payload + lstart, llen);
+							mp->sbuff[llen] = 0;
+							mp->spos = llen;   // the script sees the line that is being decoded
+							SML_Decode(meters);
+							lstart = cnt + 1;
+						}
+					}
+				} else {
+					if (len > mp->sbsiz) {
+						len = mp->sbsiz;
+					}
+					memmove(mp->sbuff, payload, len);
+					mp->spos = len;   // expose the decrypted block to the script (sml(-1,2)/SML_Read); SML_Decode/OBIS ignore spos
+					SML_Decode(meters);
+				}
 			}
 		}
 		return;

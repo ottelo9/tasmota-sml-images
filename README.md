@@ -31,7 +31,7 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 | ------------- | ------------- |
 | **ESP32 Images:**    | **tasmota32xx_ottelo.zip** |
 | tasmota32_ottelo_tas / _tc       | Generic ESP32, mit Ethernet Support |
-| tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4, p4r3 (solo1, s3, p4, p4r3 mit Ethernet Support) |
+| tasmota32x_ottelo_tas / _tc      | ESP32 Variante z.B. c3, c6, s2, s3, solo1, p4, p4r3 (solo1, s3, p4, p4r3 mit Ethernet Support; p4r3 nur als _tc) |
 | | |
 | **ESP8266 Images:** | **tasmota8266_bundle_ottelo.zip** |
 | Hinweis: | Ab V15.1.0 können nur die Scripte im Ordner [ESP8266](https://github.com/ottelo9/tasmota-sml-script/tree/main/ESP8266) verwendet werden! In den entsprechenden komprimiert Ordnern sind die Scripte ohne Kommentare, sie können 1:1 kopiert werden. |
@@ -174,7 +174,6 @@ ESP32 (Scripter-Variante `_tas`):
 `pio run -e tasmota32c6_ottelo_tas`  
 `pio run -e tasmota32solo1_ottelo_tas`   (für ESP32-S1 Single Core z.B. WT32-ETH01 v1.1)  
 `pio run -e tasmota32p4_ottelo_tas`  
-`pio run -e tasmota32p4r3_ottelo_tas`   (ESP32-P4 ab Revision 3)  
 
 ESP32 (TinyC-Variante `_tc`):  
 `pio run -e tasmota32_ottelo_tc`  
@@ -184,7 +183,7 @@ ESP32 (TinyC-Variante `_tc`):
 `pio run -e tasmota32c6_ottelo_tc`  
 `pio run -e tasmota32solo1_ottelo_tc`  
 `pio run -e tasmota32p4_ottelo_tc`  
-`pio run -e tasmota32p4r3_ottelo_tc`  
+`pio run -e tasmota32p4r3_ottelo_tc`   (ESP32-P4 ab Revision 3, nur _tc)  
 
 ESP8266:  
 `pio run -e tasmota1m_ottelo_tas`        ( = 1M Flash, nur Scripter)  

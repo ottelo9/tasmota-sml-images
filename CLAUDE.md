@@ -51,6 +51,12 @@ IDE. ESP8266 builds are `_tas` only.
    fallback for the WT32-ETH01 reboots of issue #53) breaks the build of every
    env with Ethernet: `ETH_CMD_S_ALL_MULTICAST` in `xdrv_124_tinyc_vm.h`
    needs IDF 5.5 and would have to go behind an `ESP_IDF_VERSION` check.
+5. **No `custom_sdkconfig` for now:** it makes PlatformIO build the ESP-IDF
+   itself, and that fails on the owner's PlatformIO 6.2.0 with
+   `No module named 'SCons.Tool.FortranCommon'` (the same error the ESP8266
+   builds hit). `[bt_off]` in `platformio_tasmota_cenv.ini` (Bluetooth out of
+   the SDK, ~36 KB heap on a classic ESP32 per gemu) is prepared but not used
+   by any env until that build works.
 
 ## CT002 registration page (ESP8266, Scripter)
 
@@ -72,8 +78,12 @@ not copy gemu's `src/` or the other `test/` files on an adoption.
 
 - `tasmota/tasmota_xdrv_driver/xdrv_82_esp32_ethernet.ino`: the 15.5.0 file
   plus Tasmota PR #25051 (WT32-ETH01 init: `eth_type` read before the module
-  defaults were set, issue #25043). Drop this overlay when the Tasmota base is
-  a release that contains the PR — it would otherwise replace a newer driver.
+  defaults were set, issue #25043), plus our own fix: the WT32-ETH01 branch
+  writes `Settings->eth_type = 0` instead of `ETH_PHY_LAN8720` — since IDF 5.4
+  `ETH_PHY_GENERIC` comes first, so `ETH_PHY_LAN8720` is 1 = TLK110/IP101 in
+  Tasmota's index (no Ethernet, `EthType` back to 1 on every boot, images
+  issue #68). Upstream `development` still had it on 25.10.2026. Drop this
+  overlay only when the Tasmota base contains both fixes.
 
 ## Marsrelay (own driver, not from gemu)
 
@@ -99,6 +109,23 @@ version (`// @version: YYYYMMDD_HHMM`, .tcb header TLV 3, `"version"` in
 index.json) and the 🔄 update button. tasmota-sml-script's build.html derives
 the version from `sml_vers`.
 
+## gemu's fork is on Tasmota 16, we are on 15.5.0
+
+Since `0fc40e045` (merge of arendst/development, 25.10.2026) the fork is a
+Tasmota 16 tree. Its TinyC files barely changed for that (only `TC_RELEASE`),
+so they still go into the 15.5.0 overlay as plain copies — last taken
+`d1aafa5b5` (13.11.2026, TinyC 1.6.80): `xdrv_124_tinyc_vm.h`,
+`xdrv_124_tinyc.ino`, `xdrv_124_tinyc_usb.h`, the new
+`xdrv_124_tinyc_espnow.h` and `xdrv_124_tinyc_pcnt.h` (both included
+unconditionally, their code behind `USE_TINYC_ESPNOW` / `USE_TINYC_PCNT`), `tls_mini` (the VM calls `setRSAOnly`,
+`setClientECCert`, `TlsPeerCertInfo`) and `xsns_53_sml.ino`. Not taken:
+`xdrv_50_filesystem.ino` - the fork's copy carries Tasmota 16 changes. Only
+gemu's hunk of `b8ff22f4f` is in ours: `TinyCFsWritePause(ufs_fsz, dfsp == ffsp)`
+(the second argument is new; without it the link fails). On every further
+adoption check both directions: the functions the new TinyC files call that
+the old ones did not, and the TinyC functions whose parameters changed and
+that other overlay files call (`extern` declarations).
+
 ## ESP32-P4 Rev.3 (`tasmota32p4r3_ottelo_*`)
 
 Official board `esp32p4r3` (16 MB, also fine on 32 MB boards), safeboot from
@@ -106,7 +133,7 @@ the official env `tasmota32p4r3-safeboot`. Own define `TASMOTA32P4R3_OTTELO`
 (same feature set and Ethernet as P4) only for its OTA URL - the P4 image does
 not run on Rev.3. `BOARD_SDMMC_POWER_CHANNEL=4` (SD power LDO of Espressif's
 P4 reference boards). From a user's package (18.10.2026); `_tc` ran on his
-board, `_tas` untested.
+board. There is no `_tas` env for it: README and the zip script (`TC_ONLY`) know that.
 
 ## DFR1154 camera image (`tasmota32s3_dfr1154`)
 

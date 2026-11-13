@@ -54,6 +54,46 @@
 
 #if defined(USE_TINYC_USBSERIAL) && (defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2))
 
+#ifdef USE_USB_HOST_SERIAL
+/*
+  02.11.2026: the FTDI code lives in xdrv_99_usb_host.ino now, on the one shared USB host (stick and audio stick can be
+  attached at the same time, also behind a hub). What is left here is the thin layer the TinyC functions expect: the same
+  names as before, forwarding to the driver. xdrv_99 is compiled AFTER this file, hence the prototypes.
+*/
+bool     UsbHostSerInit(void);
+bool     UsbHostSerOpen(uint32_t baud);
+void     UsbHostSerClose(void);
+uint16_t UsbHostSerAvail(void);
+uint16_t UsbHostSerPull(uint8_t *to, uint16_t max);
+int32_t  UsbHostSerWrite(const uint8_t *d, uint16_t len);
+uint32_t UsbHostSerGet(uint8_t which);
+
+// States as usbState() reports them (same ladder as before)
+#define TC_USB_AUS      0
+#define TC_USB_BEREIT   1
+#define TC_USB_GERAET   2
+#define TC_USB_OFFEN    3
+#define TC_USB_FEHLER   4
+
+// TcUsb.state, .vid, ... are read by the VM as plain members; here each one asks the driver when it is read
+struct TcUsbFeld {
+  uint8_t which;
+  operator int32_t() const { return (int32_t)UsbHostSerGet(which); }
+};
+struct TcUsbAnsicht {
+  TcUsbFeld state{0}, vid{1}, pid{2}, rx{3}, tx{4}, verloren{5};
+} TcUsb;
+
+static inline bool     TcUsbInit(void) { return UsbHostSerInit(); }
+static inline bool     TcUsbOpen(uint32_t baud) { return UsbHostSerOpen(baud); }
+static inline void     TcUsbClose(void) { UsbHostSerClose(); }
+static inline void     TcUsbDeinit(void) { UsbHostSerClose(); }     // the host stays: other devices may use it
+static inline uint16_t TcUsbAvailable(void) { return UsbHostSerAvail(); }
+static inline uint16_t TcUsbPull(uint8_t *to, uint16_t max) { return UsbHostSerPull(to, max); }
+static inline int32_t  TcUsbWrite(const uint8_t *d, uint16_t len) { return UsbHostSerWrite(d, len); }
+
+#else  // old stand-alone version: own host, only FTDI
+
 #include "usb/usb_host.h"
 #include "freertos/semphr.h"
 
@@ -447,5 +487,6 @@ static int32_t TcUsbWrite(const uint8_t *d, uint16_t len) {
   return gesamt;
 }
 
+#endif  // USE_USB_HOST_SERIAL (adapter) / old stand-alone version
 #endif  // USE_TINYC_USBSERIAL && S3/S2
 #endif  // _XDRV_124_TINYC_USB_H_

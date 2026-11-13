@@ -1835,8 +1835,8 @@ bool UfsUploadFileOpen(const char* upload_filename) {
   // Stop TinyC VM tasks before a LARGE internal-flash write: a multi-block
   // LittleFS write while a VM task exists deadlocks a dual-core node. Size-gated
   // inside (small files skip it). The declared size comes from the ?fsz= arg.
-  extern void TinyCFsWritePause(uint32_t fsize);
-  TinyCFsWritePause(ufs_fsz);
+  extern void TinyCFsWritePause(uint32_t fsize, bool to_flash);
+  TinyCFsWritePause(ufs_fsz, dfsp == ffsp);
 #endif
 #ifdef USE_SML_M
   // Keep the SML/eBUS driver off the meter UART for the duration of a big write so no

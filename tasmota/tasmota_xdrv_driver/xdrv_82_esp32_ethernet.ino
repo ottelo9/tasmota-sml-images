@@ -229,7 +229,7 @@ void EthernetInit(void) {
 #if CONFIG_ETH_USE_ESP32_EMAC     // deprecated, please use standard module and template + configuration instead
   if (WT32_ETH01 == TasmotaGlobal.module_type) {
     Settings->eth_address = 1;                    // EthAddress
-    Settings->eth_type = ETH_PHY_LAN8720;         // EthType 0 = LAN8720
+    Settings->eth_type = 0;                       // EthType 0 = LAN8720 (index into eth_type_xtable; ETH_PHY_LAN8720 is 1 since IDF 5.4)
     Settings->eth_clk_mode = 0;                   // EthClockMode 0 = ETH_CLOCK_GPIO0_IN
   }
 #endif  // CONFIG_ETH_USE_ESP32_EMAC

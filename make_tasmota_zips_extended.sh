@@ -136,6 +136,8 @@ ESP32_BOARDS=(
     "tasmota32p4_ottelo"        # ESP32-P4
     "tasmota32p4r3_ottelo"      # ESP32-P4 Rev.3
 )
+# Boards, die es nur als _tc gibt (keine _tas-Umgebung in platformio_tasmota_cenv.ini)
+TC_ONLY=" tasmota32p4r3_ottelo "
 
 # safeboot: Tasmota baut eine pro Chip (tasmota32c3-safeboot.bin, ...). Sie wird
 # je Variante unter dem Namen des Images abgelegt, z.B.
@@ -144,6 +146,7 @@ ESP32_BOARDS=(
 for board in "${ESP32_BOARDS[@]}"; do
     sb_src="${board%_ottelo}-safeboot.bin"
     for variant in tas tc; do
+        if [ "$variant" = tas ] && [[ "$TC_ONLY" == *" $board "* ]]; then continue; fi
         files=("${board}_${variant}.bin" "${board}_${variant}.factory.bin")
         sb="${board}_${variant}-safeboot.bin"
         if [ -f "$sb_src" ]; then

@@ -18,6 +18,12 @@
   You should have received a copy of the GNU Lesser General Public
   License along with this library; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+  Change 08.11.2026 (Andreas, SMGW reader) on top of the state sent to gemu on 07.11.2026 21:30 (md5 31eb173e):
+  _connectSSL, USE_MQTT_CLIENT_CERT block: br_ssl_client_set_single_ec() only if a client certificate was set
+  (_chain_P && _sk_ec_P), and br_ec_all_m15 instead of br_ec_p256_m15 (P-384 keys can sign; P-256 unchanged).
+  Clients that set a certificate (EEBUS Steuerbox/HEMS/SteuVE) behave as before. Check in the test net before
+  the next Box/HEMS build.
 */
 
 #include "tasmota_options.h"
@@ -44,6 +50,7 @@
 #include "lwip/netif.h"
 #if defined(ESP32)
 #include <esp_heap_caps.h>   // heap_caps_malloc / MALLOC_CAP_SPIRAM — route TLS I/O buffers to PSRAM
+#include <lwip/sockets.h>    // lwip_send(..., MSG_DONTWAIT) for setSendWaitMs()
 #endif
 #ifdef ESP8266
   #include <include/ClientContext.h>
@@ -194,6 +201,8 @@ void WiFiClientSecure_light::_clear() {
   _iobuf_out = nullptr;
   setBufferSizes(1024, 1024); // reasonable minimum
   _handshake_done = false;
+  _sendBlockedAt = 0;
+  _sendStuck = false;
   _last_error = 0;
   _recvapp_buf = nullptr;
   _recvapp_len = 0;
@@ -202,6 +211,7 @@ void WiFiClientSecure_light::_clear() {
   _fingerprint_any = true; // by default accept all fingerprints
   _fingerprint1 = nullptr;
   _fingerprint2 = nullptr;
+  memset(_recv_fingerprint, 0, sizeof(_recv_fingerprint)); // don't leave the received fingerprint uninitialized
   _chain_P = nullptr;
   _sk_ec_P = nullptr;
   _ta_P = nullptr;
@@ -410,12 +420,20 @@ int WiFiClientSecure_light::connect(const char* name, uint16_t port) {
 }
 #endif
 
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+static void ShipPkFrei(const void *client);   // 25.10.2026: Platz in der SHIP-Schluesseltabelle freigeben (s. unten)
+#endif
 void WiFiClientSecure_light::_freeSSL() {
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+  ShipPkFrei(this);   // Verbindung beendet/neu: Platz dieses Clients wird frei (sonst nach 8 Aufbauten voll)
+#endif
   _ctx_present = false;
   _recvapp_buf = nullptr;
   _recvapp_len = 0;
   // This connection is toast
   _handshake_done = false;
+  _sendBlockedAt = 0;
+  _sendStuck = false;
 }
 
 bool WiFiClientSecure_light::_clientConnected() {
@@ -472,6 +490,11 @@ size_t WiFiClientSecure_light::_write(const uint8_t *buf, size_t size, bool pmem
   } while (size);
 
   LOG_HEAP_SIZE("_write");
+#if defined(ESP32)
+  // setSendWaitMs only: the bytes are in the engine, but the socket took nothing for _sendWaitMs (peer gone).
+  // Report the write as failed so the caller does not count it as sent. Blocking mode (_sendWaitMs == 0) unchanged.
+  if (_sendWaitMs && _sendStuck) { return 0; }
+#endif
   return sent_bytes;
 }
 
@@ -653,6 +676,31 @@ int WiFiClientSecure_light::_run_until(unsigned target, bool blocking) {
       int wlen;
 
       buf = br_ssl_engine_sendrec_buf(_eng, &len);
+#if defined(ESP32)
+      if (_sendWaitMs) {   // non-blocking: only what the socket takes now, the engine keeps the rest
+        if (_sendStuck) { setLastError(ERR_TLS_TIMEOUT); return -1; }   // ran out before: no new wait
+        int sfd = fd();
+        if (sfd < 0) { return -1; }
+        wlen = lwip_send(sfd, buf, len, MSG_DONTWAIT);
+        if (wlen > 0) {
+          br_ssl_engine_sendrec_ack(_eng, wlen);
+          _sendBlockedAt = 0;   // bytes went out: the wait starts again from zero
+          no_work = 0;
+          continue;
+        }
+        if ((wlen < 0) && (EAGAIN != errno) && (EWOULDBLOCK != errno)) { return -1; }   // socket broken
+        uint32_t now = millis();
+        if (!_sendBlockedAt) { _sendBlockedAt = now ? now : 1; }   // first time full: start counting
+        if ((now - _sendBlockedAt) >= _sendWaitMs) {   // full and nothing moved for _sendWaitMs (peer gone)
+          _sendStuck = true;
+          setLastError(ERR_TLS_TIMEOUT);
+          return -1;
+        }
+        if (!blocking) { return -1; }   // available(): never wait for the socket, try again next call
+        delay(1);
+        continue;
+      }
+#endif
       wlen = WiFiClient::write(buf, len);
       if (wlen <= 0) {
         /*
@@ -751,6 +799,149 @@ static uint8_t htoi (unsigned char c)
   else return 255;
 }
 
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+// EEBUS/SHIP: oeffentlicher Schluessel der Gegenstelle beim TLS-Aufbau als Client (s. ShipPeerPubKey im Header).
+// 24.10.2026 (gemu 23.10.: "Merker je Client haerten"): kleine Tabelle statt EINES Puffers — je Platz ein Client
+// (Zeiger) und sein X.509-Kontext. Der Rueckruf beim Handshake legt den Schluessel beim Platz des passenden
+// Kontexts ab, der Treiber fragt mit SEINEM Client. Kein Klassenfeld -> Klassen-Layout unveraendert.
+// 25.10.2026 (Steuerbox v199: bis zu 6 eigene Verbindungen): 8 Plaetze statt 4, und ein Platz wird wieder frei -
+// beim Freigeben des Clients (_freeSSL: stop, Destruktor, neuer Aufbau) und der X.509-Zeiger, sobald der Kontext
+// freigegeben ist. Vorher blieben Plaetze nach new/delete im Treiber belegt (nach 4 Aufbauten landete jeder neue
+// auf Platz 0), und ein veralteter X.509-Zeiger konnte bei gleicher Adresse den Schluessel in einen fremden Platz lenken.
+#define SHIP_PK_PLAETZE 8
+struct ShipPkPlatz { const void *client; const void *x509; uint8_t key[65]; size_t len; };
+static ShipPkPlatz ship_pk[SHIP_PK_PLAETZE];
+
+// Platz fuer diesen Client: vorhandener, sonst freier, sonst der erste (wird neu belegt)
+static ShipPkPlatz *ShipPkPlatzFuer(const void *client) {
+  for (int i = 0; i < SHIP_PK_PLAETZE; i++) { if (ship_pk[i].client == client) { return &ship_pk[i]; } }
+  for (int i = 0; i < SHIP_PK_PLAETZE; i++) { if (nullptr == ship_pk[i].client) { return &ship_pk[i]; } }
+  return &ship_pk[0];
+}
+
+static void ShipPkFrei(const void *client) {
+  for (int i = 0; i < SHIP_PK_PLAETZE; i++) {
+    if (client && (ship_pk[i].client == client)) { ship_pk[i].client = nullptr; ship_pk[i].x509 = nullptr; ship_pk[i].len = 0; }
+  }
+}
+// X.509-Kontext wird freigegeben: Zeiger aus der Tabelle nehmen (der Schluessel bleibt fuer ShipPeerPubKey stehen)
+static void ShipPkX509Weg(const void *x509) {
+  for (int i = 0; i < SHIP_PK_PLAETZE; i++) { if (x509 && (ship_pk[i].x509 == x509)) { ship_pk[i].x509 = nullptr; } }
+}
+
+const uint8_t *ShipPeerPubKey(const void *client, size_t *len) {
+  for (int i = 0; i < SHIP_PK_PLAETZE; i++) {
+    if (client && (ship_pk[i].client == client)) {
+      if (len) { *len = ship_pk[i].len; }
+      return ship_pk[i].key;
+    }
+  }
+  if (len) { *len = 0; }
+  return ship_pk[0].key;
+}
+#endif
+
+// 11.11.2026 (Andreas, SMGW reader): validity, subject (CN) and serial number of the FIRST certificate the peer
+// sent on the last TLS connect through the unverified path (setInsecure / fingerprint decoder) - e.g. the
+// self-signed TLS certificate of a smart meter gateway (what TRuDI shows as "Zertifikat der TLS-Verbindung").
+// Only the first 1024 bytes of that certificate are kept (serial, validity and subject come first). Times are
+// UTC as in the certificate ("JJJJ-MM-TT hh:mm:ss"). No class field (class layout unchanged), read-only getter
+// TlsPeerCertInfo() in the header. Nothing in the handshake changes.
+static uint8_t tlspc_buf[1024];
+static size_t  tlspc_len = 0;
+static bool    tlspc_an = false;
+static char    tlspc_von[24], tlspc_bis[24], tlspc_fuer[65], tlspc_snr_hex[44], tlspc_snr_dez[24], tlspc_host[64];
+
+// DER tag + length; p moves to the start of the value. Bounds of the value are checked by the caller.
+static bool tlspc_tl(const uint8_t *&p, const uint8_t *e, uint8_t &tag, size_t &len) {
+  if (p + 2 > e) { return false; }
+  tag = *p++;
+  uint8_t l = *p++;
+  if (l < 0x80) { len = l; return true; }
+  int n = l & 0x7f;
+  if (n < 1 || n > 3 || p + n > e) { return false; }
+  len = 0;
+  while (n--) { len = (len << 8) | *p++; }
+  return true;
+}
+
+static void tlspc_zeit(const uint8_t *p, size_t len, uint8_t tag, char *out) {
+  char d[16];
+  size_t n = (len < 15) ? len : 15;
+  memcpy(d, p, n); d[n] = 0;
+  char j[5];
+  const char *s;
+  if (tag == 0x17 && n >= 12) {          // UTCTime YYMMDDhhmmssZ
+    bool alt = (d[0] >= '5');
+    j[0] = alt ? '1' : '2'; j[1] = alt ? '9' : '0'; j[2] = d[0]; j[3] = d[1]; j[4] = 0; s = d + 2;
+  } else if (tag == 0x18 && n >= 14) {   // GeneralizedTime YYYYMMDDhhmmssZ
+    memcpy(j, d, 4); j[4] = 0; s = d + 4;
+  } else { out[0] = 0; return; }
+  // The server controls these bytes and the result goes into a JSON answer and the log: digits only (UTCTime has 12 before the 'Z', GeneralizedTime 14).
+  for (size_t i = 0; i < ((tag == 0x17) ? 12u : 14u); i++) { if (d[i] < '0' || d[i] > '9') { out[0] = 0; return; } }
+  snprintf(out, 24, "%s-%.2s-%.2s %.2s:%.2s:%.2s", j, s, s + 2, s + 4, s + 6, s + 8);
+}
+
+static void tlspc_auswerten(void) {
+  tlspc_von[0] = tlspc_bis[0] = tlspc_fuer[0] = tlspc_snr_hex[0] = tlspc_snr_dez[0] = 0;
+  const uint8_t *p = tlspc_buf, *e = tlspc_buf + tlspc_len;
+  uint8_t t; size_t l;
+  if (!tlspc_tl(p, e, t, l) || t != 0x30) { return; }               // Certificate
+  if (!tlspc_tl(p, e, t, l) || t != 0x30) { return; }               // TBSCertificate
+  if (!tlspc_tl(p, e, t, l)) { return; }
+  if (t == 0xA0) { p += l; if (!tlspc_tl(p, e, t, l)) { return; } } // [0] version
+  if (t != 0x02 || p + l > e) { return; }                           // serialNumber
+  {
+    size_t k = 0; uint64_t dez = 0; size_t sig = 0;
+    for (size_t i = 0; i < l && k + 2 < sizeof(tlspc_snr_hex); i++) {
+      snprintf(tlspc_snr_hex + k, 3, "%02x", p[i]); k += 2;
+      if (p[i] || sig) { sig++; dez = (dez << 8) | p[i]; }
+    }
+    if (sig <= 8) { snprintf(tlspc_snr_dez, sizeof(tlspc_snr_dez), "%llu", (unsigned long long)dez); }
+  }
+  p += l;
+  if (!tlspc_tl(p, e, t, l) || p + l > e) { return; } p += l;       // signature
+  if (!tlspc_tl(p, e, t, l) || p + l > e) { return; } p += l;       // issuer
+  if (!tlspc_tl(p, e, t, l) || t != 0x30 || p + l > e) { return; }  // validity
+  {
+    const uint8_t *q = p, *qe = p + l; uint8_t t2; size_t l2;
+    if (tlspc_tl(q, qe, t2, l2) && q + l2 <= qe) {
+      tlspc_zeit(q, l2, t2, tlspc_von); q += l2;
+      if (tlspc_tl(q, qe, t2, l2) && q + l2 <= qe) { tlspc_zeit(q, l2, t2, tlspc_bis); }
+    }
+  }
+  p += l;
+  if (!tlspc_tl(p, e, t, l) || t != 0x30 || p + l > e) { return; }  // subject: SET { SEQ { OID, value } } ...
+  const uint8_t *se = p + l;
+  while (p < se) {
+    if (!tlspc_tl(p, se, t, l) || p + l > se) { return; }
+    const uint8_t *ae = p + l;
+    while (p < ae) {
+      if (!tlspc_tl(p, ae, t, l) || p + l > ae) { return; }
+      const uint8_t *ve = p + l, *o = p; uint8_t t3; size_t l3;
+      if (tlspc_tl(o, ve, t3, l3) && t3 == 0x06 && l3 == 3 && o + 3 <= ve && o[0] == 0x55 && o[1] == 0x04 && o[2] == 0x03) {  // CN
+        o += l3;
+        if (tlspc_tl(o, ve, t3, l3) && o + l3 <= ve) {
+          size_t n = (l3 < sizeof(tlspc_fuer) - 1) ? l3 : sizeof(tlspc_fuer) - 1;
+          memcpy(tlspc_fuer, o, n); tlspc_fuer[n] = 0;
+          for (size_t i = 0; i < n; i++) { if (tlspc_fuer[i] < 0x20 || tlspc_fuer[i] == '"' || tlspc_fuer[i] == '\\') { tlspc_fuer[i] = '?'; } }
+        }
+      }
+      p = ve;
+    }
+  }
+}
+
+void TlsPeerCertInfo(const char **von, const char **bis, const char **fuer, const char **snr_hex,
+                     const char **snr_dez, const char **host) {
+  if (von) { *von = tlspc_von; }
+  if (bis) { *bis = tlspc_bis; }
+  if (fuer) { *fuer = tlspc_fuer; }
+  if (snr_hex) { *snr_hex = tlspc_snr_hex; }
+  if (snr_dez) { *snr_dez = tlspc_snr_dez; }
+  if (host) { *host = tlspc_host; }
+}
+
 extern "C" {
 
   // see https://stackoverflow.com/questions/6357031/how-do-you-convert-a-byte-array-to-a-hexadecimal-string-in-c
@@ -796,8 +987,9 @@ extern "C" {
     // Don't process anything but the first certificate in the chain
     if (!xc->done_cert) {
       br_x509_decoder_init(&xc->ctx, nullptr, nullptr, nullptr, nullptr);
+      tlspc_len = 0; tlspc_an = true;   // 11.11.2026: keep the first certificate for TlsPeerCertInfo()
+      strlcpy(tlspc_host, server_name ? server_name : "", sizeof(tlspc_host));
     }
-    (void)server_name; // ignore server name
   }
 
   // Callback for each certificate present in the chain (but only operates
@@ -813,12 +1005,18 @@ extern "C" {
     // Don't process anything but the first certificate in the chain
     if (!xc->done_cert) {
       br_x509_decoder_push(&xc->ctx, (const void*)buf, len);
+      if (tlspc_an && tlspc_len < sizeof(tlspc_buf)) {   // 11.11.2026: first 1024 bytes for TlsPeerCertInfo()
+        size_t n = sizeof(tlspc_buf) - tlspc_len;
+        if (n > len) { n = len; }
+        memcpy(tlspc_buf + tlspc_len, buf, n); tlspc_len += n;
+      }
     }
   }
 
   // Callback on individual cert end.
   static void pubkeyfingerprint_end_cert(const br_x509_class **ctx) {
     br_x509_pubkeyfingerprint_context *xc = (br_x509_pubkeyfingerprint_context *)ctx;
+    if (!xc->done_cert && tlspc_an) { tlspc_auswerten(); tlspc_an = false; }   // 11.11.2026
     xc->done_cert = true; // first cert already processed
   }
 
@@ -874,6 +1072,16 @@ extern "C" {
       sha1_update_len(&shactx, eckey.q, eckey.qlen);       // public point
 
       br_sha1_out(&shactx, xc->pubkey_recv_fingerprint); // copy to fingerprint
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+      // EEBUS/SHIP: den Punkt fuer den Treiber aufheben (beim Platz DIESES X.509-Kontexts), die SKI bildet der Treiber
+      for (int i = 0; i < SHIP_PK_PLAETZE; i++) {
+        if ((ship_pk[i].x509 == (const void *)xc) && (eckey.qlen <= sizeof(ship_pk[i].key))) {
+          memcpy(ship_pk[i].key, eckey.q, eckey.qlen);
+          ship_pk[i].len = eckey.qlen;
+          break;
+        }
+      }
+#endif
     }
   #endif
     else {
@@ -942,7 +1150,7 @@ extern "C" {
   static const uint16_t suites_RSA_ONLY[] = {
     BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
   };
-#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)   // SHIP-TLS fuer alle EEBUS-Treiber (HEMS v001)
   // Cipher-Reihenfolge fuer SHIP: ECDSA zuerst. 0xC02F (RSA) ist kein SHIP-Cipher, bleibt aber am
   // Ende der Liste — diese Lib bedient auch HTTPS/MQTT zu RSA-Servern.
   static const uint16_t suites_eebus[] = {
@@ -965,7 +1173,7 @@ extern "C" {
     br_ssl_engine_add_flags(&cc->eng, BR_OPT_NO_RENEGOTIATION);
 
     br_ssl_engine_set_versions(&cc->eng, BR_TLS12, BR_TLS12);
-#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)   // SHIP-TLS fuer alle EEBUS-Treiber (HEMS v001)
     // EEBUS-Build: die SHIP-taugliche Liste verwenden (s. suites_eebus oben).
     // ABER _rsa_only MUSS weiter greifen: wer RSA erzwingt, tut das, um einen RSA-Fingerabdruck
     // pruefen zu koennen. Bekaeme er zusaetzlich ECDSA-Suiten angeboten, koennte der Server ECDSA
@@ -996,15 +1204,18 @@ extern "C" {
     br_ssl_engine_set_gcm(&cc->eng, &br_sslrec_in_gcm_vtable, &br_sslrec_out_gcm_vtable);
     br_ssl_engine_set_aes_ctr(&cc->eng, &br_aes_small_ctr_vtable);
     br_ssl_engine_set_ghash(&cc->eng, &br_ghash_ctmul32);
-#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)   // SHIP-TLS fuer alle EEBUS-Treiber (HEMS v001)
     // CBC-Engine registrieren: SHIP 9.1 fuehrt 0xC023 als Pflicht-Cipher, 0xC02B (GCM) nur als
     // Option. Rein additiv — GCM bleibt registriert, HTTPS/MQTT zu RSA-Servern unberuehrt.
     br_ssl_engine_set_cbc(&cc->eng, &br_sslrec_in_cbc_vtable, &br_sslrec_out_cbc_vtable);
     br_ssl_engine_set_aes_cbc(&cc->eng, &br_aes_small_cbcenc_vtable, &br_aes_small_cbcdec_vtable);
 #endif
 
-    // we support only P256 EC curve for AWS IoT, no EC curve for Letsencrypt unless forced
-    br_ssl_engine_set_ec(&cc->eng, &br_ec_p256_m15);
+    // Use all supported EC curves (P-256, P-384, P-521, Curve25519) for ECDHE key exchange.
+    // Some servers (e.g. with ECDSA P-384 certificates) refuse P-256 for key exchange
+    // and abort the handshake with SSL3_ALERT_HANDSHAKE_FAILURE (error 296).
+    // `br_ec_all_m15` is already linked for X509 ECDSA validation, so no flash size impact.
+    br_ssl_engine_set_ec(&cc->eng, &br_ec_all_m15);
 #if defined(ESP32) || (defined(ESP8266) && defined(USE_MQTT_TLS_ECDSA))
     br_ssl_engine_set_ecdsa(&cc->eng, &br_ecdsa_i15_vrfy_asn1);
 #endif
@@ -1056,7 +1267,7 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
     _eng = &_sc->eng; // Allocation/deallocation taken care of by the _sc shared_ptr
 
     br_ssl_client_base_init(_sc.get(), _rsa_only);
-#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE)   // SHIP-TLS fuer beide EEBUS-Treiber
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)   // SHIP-TLS fuer alle EEBUS-Treiber (HEMS v001)
     // Suite-Liste NACH der Basis-Initialisierung ueberschreiben, nur fuer markierte Clients —
     // andere TLS-Nutzer bleiben unberuehrt.
     if (_ship_ciphers) {
@@ -1076,6 +1287,14 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
     //x509_insecure = std::unique_ptr<br_x509_pubkeyfingerprint_context>(new br_x509_pubkeyfingerprint_context);
     if (!x509_insecure) break;
     br_x509_pubkeyfingerprint_init(x509_insecure, _fingerprint1, _fingerprint2, _recv_fingerprint, _fingerprint_any);
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+    {   // EEBUS: Platz dieses Clients belegen, Schluessel der Gegenstelle neu aufnehmen (ShipPeerPubKey)
+      ShipPkPlatz *pk = ShipPkPlatzFuer(this);
+      pk->client = this;
+      pk->x509 = (const void *)x509_insecure;
+      pk->len = 0;
+    }
+#endif
     br_ssl_engine_set_x509(_eng, &x509_insecure->vtable);
 
     if (!_insecure) {
@@ -1107,10 +1326,15 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
   #if defined(USE_MQTT_CLIENT_CERT)
     // ============================================================
     // Set the EC Private Key, only USE_MQTT_CLIENT_CERT
-    // limited to P256 curve
-    br_ssl_client_set_single_ec(_sc.get(), _chain_P, 1,
-                                _sk_ec_P, _allowed_usages,
-                                _cert_issuer_key_type, &br_ec_p256_m15, br_ecdsa_sign_asn1_get_default());
+    // 08.11.2026 (Andreas): only when a certificate was actually set - before, a client without certificate
+    // registered an empty chain and a server that asks for a client certificate (e.g. a smart meter gateway,
+    // optional request) got a broken Certificate message. br_ec_all_m15 instead of br_ec_p256_m15 so a P-384
+    // key can sign too (P-256 behaves exactly as before).
+    if (_chain_P && _sk_ec_P) {
+      br_ssl_client_set_single_ec(_sc.get(), _chain_P, 1,
+                                  _sk_ec_P, _allowed_usages,
+                                  _cert_issuer_key_type, &br_ec_all_m15, br_ecdsa_sign_asn1_get_default());
+    }
   #endif // USE_MQTT_CLIENT_CERT
 
     // ============================================================
@@ -1134,6 +1358,9 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
 #endif // ESP8266
 
     free(x509_minimal);   // safe to call if nullptr
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+    ShipPkX509Weg(x509_insecure);
+#endif
     free(x509_insecure);
     LOG_HEAP_SIZE("_connectSSL after release of Priv Key");
     return ret;
@@ -1147,6 +1374,9 @@ bool WiFiClientSecure_light::_connectSSL(const char* hostName) {
   stack_thunk_light_del_ref();
 #endif
   free(x509_minimal);   // safe to call if nullptr
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+  ShipPkX509Weg(x509_insecure);
+#endif
   free(x509_insecure);
   LOG_HEAP_SIZE("_connectSSL clean_on_error");
   return false;
