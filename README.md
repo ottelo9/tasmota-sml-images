@@ -156,7 +156,7 @@ Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (Tasmota 16.0.0) 
 - TasmotaProjekt/`platformio_tasmota_cenv.ini` — meine Build-Umgebungen (envs) mit `lib_ignore`, Partitionen, `-D`-Flags
 - TasmotaProjekt/`safeboot_alias.py` — holt beim Kompilieren das offizielle Safeboot für die .factory Images (muss mit kopiert werden)
 - TasmotaProjekt/`ccache_wrapper.py` — siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten (muss mit kopiert werden, auch wenn ihr ccache nicht nutzt)
-- TasmotaProjekt/`boards/` — zusätzliche Board-Definition (`esp32c6cdc.json`). Alle anderen Boards bringt das offizielle Tasmota mit.
+- Boards und Partitionstabellen bringt das offizielle Tasmota mit, eigene braucht es nicht mehr.
   Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
 
 **B) Sourcen aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal)** (Scripter / SML / TinyC — im offiziellen Tasmota nicht oder nur älter enthalten)
@@ -496,7 +496,7 @@ USE_WT32_ETH01
 ```
 
 **(6) Features und Treiber die ich deaktiviert habe:**
-Siehe `#undef FEATURE` in der Datei [user_config_override.h](user_config_override.h).
+Siehe `#undef FEATURE` in der Datei [user_config_override.h](tasmota/user_config_override.h).
 
 ## Safeboot aktualisieren (wird i.d.R. nicht benötigt)
 Safeboot ist die kleine Rettungs-Firmware, über die jedes OTA läuft. Sie muss praktisch nie erneuert werden — ein Grund wäre ein OTA, das mit `Upload Failed. Not enough space.` abbricht, obwohl genug Platz da ist oder wenn sie total veraltet ist.

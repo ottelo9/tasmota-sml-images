@@ -17,7 +17,6 @@ base.
 |---|---|
 | `tasmota/`, `lib/` | overlay files (`git ls-files` is the current list) |
 | `platformio_tasmota_cenv.ini` | envs per chip and variant |
-| `boards/`, `partitions/` | extra boards and partition tables (the platform comes from official Tasmota) |
 | `tasmota/user_config_override.h` | feature selection |
 | `make_tasmota_zips_extended.sh` | packs the release ZIPs |
 | `ota_firmware/` | binaries for OTA, tracked |
@@ -122,7 +121,8 @@ G = gemu's HEAD.
   conflicts were resolved for 16.0.0: `_tcpTimeout` stays `uint16_t` (the
   `uint32_t` is a later upstream change), `start_lvgl()` stays `void`.
 - Dropped (16.0.0 already right, or gemu no longer changes them):
-  `xdrv_01_1_webserver_mail.ino`, `boards/esp32s2cdc.json`,
+  `xdrv_01_1_webserver_mail.ino`, `boards/esp32s2cdc.json`, `boards/esp32c6cdc.json`,
+  `partitions/esp32_partition_app3904k_fs11328k.csv` (no env used the last two),
   `platformio_tasmota32.ini` (16.0.0 brings platform `2026.09.50`).
 - gemu's merge of 25.10.2026 kept his older code in `xdrv_01_9_webserver.ino`
   in three places; ours has upstream's again: `HandleRoot` buttons
