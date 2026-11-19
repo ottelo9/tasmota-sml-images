@@ -8,6 +8,29 @@ Eine ausführliche Anleitung dazu findet ihr auf meiner [Homepage](https://ottel
 [Download Statistik](https://tooomm.github.io/github-release-stats/?username=ottelo9&repository=tasmota-sml-images)  
 [ottelo.jimdofree.com](https://ottelo.jimdofree.com/stromz%C3%A4hler-auslesen-tasmota/)
 
+### Inhalt
+- [Features](#features)
+- [Welches Image (Firmware Binary) für welchen ESP?](#welches-image-firmware-binary-für-welchen-esp)
+- [(Factory)Image übertragen / flashen](#factoryimage-übertragen--flashen)
+- [Passende Tasmota Scripte / TinyC Programme](#passende-tasmota-scripte--tinyc-programme)
+- [Projekte, die diese Images nutzen](#projekte-die-diese-images-nutzen)
+- [Shelly / Marstek CT002 / EcoTracker Emulation für smarte Akkus](#shelly--marstek-ct002--ecotracker-emulation-für-smarte-akkus-wie-zb-marstek-venus-ce-jupiter-hoymiles-growatt-noah-2000)
+- [TinyC (löst Script ab!)](#tinyc-löst-script-ab)
+- [Partitionslayout für TinyC-Images](#partitionslayout-für-tinyc-images)
+  - [Partitionen ohne Factory-Flash umstellen — `chkpt`](#partitionen-ohne-factory-flash-umstellen--chkpt)
+- [Tasmota Image selbst erstellen - Anleitung für ESP32 / ESP8266](#tasmota-image-selbst-erstellen---anleitung-für-esp32--esp8266)
+  - [Wie verwenden?](#wie-verwenden)
+  - [Kompilieren](#kompilieren)
+  - [Compile-Zeit reduzieren mit ccache (optional, aber sehr empfohlen)](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen)
+  - [Release-ZIPs erstellen mit `make_tasmota_zips_extended.sh`](#release-zips-erstellen-mit-make_tasmota_zips_extendedsh)
+  - [FAQ](#faq)
+  - [Infos](#infos)
+  - [Testtools](#testtools)
+  - [Debugging](#debugging)
+- [Welche Images welchen Funktionsumfang bieten, könnt ihr anhand dieser Features/Treiber erkennen](#welche-images-welchen-funktionsumfang-bieten-könnt-ihr-anhand-dieser-featurestreiber-erkennen)
+- [Safeboot aktualisieren (wird i.d.R. nicht benötigt)](#safeboot-aktualisieren-wird-idr-nicht-benötigt)
+- [Lizenz](#lizenz)
+
 ### Features
 | Feature | Was es macht | Hilfe |
 | ------------- | ------------- | ------------- |
@@ -114,7 +137,7 @@ In meinen Tasmota Images ist ein Partition-Manager eingebaut — du brauchst kei
 4. Files wieder hochladen.
 
 **Voraussetzungen / Probleme:**
-- **Safeboot darf nicht zu alt sein** Ohne passendes Safeboot lehnt `chkpt p` ab. Die Version des Safeboots erkennt ihr, wenn ich ein Update macht. Tasmota bootet dann in den Safeboot. Ab 15.x sollte `TinyCChkpt` funktionieren. Wie ihr das Safeboot Images aktualisiert findet ihr weiter unten.  
+- **Safeboot darf nicht zu alt sein** Ohne passendes Safeboot lehnt `chkpt p` ab. Die Version des Safeboots erkennt ihr, wenn ihr ein Update macht. Tasmota bootet dann in den Safeboot. Ab 15.x sollte `TinyCChkpt` funktionieren. Wie ihr das Safeboot Images aktualisiert findet ihr weiter unten.  
 - **Neue app0 ≥ laufende Firmware.** Sonst meldet der Befehl `requested size too small for current firmware!` und macht nichts.
 
 **Factory-Flash** brauchst du nur noch, wenn:
@@ -131,9 +154,10 @@ Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (Tasmota 16.0.0) 
 **A) Meine Build-Konfiguration** (die braucht ihr immer)
 - TasmotaProjekt/`tasmota/user_config_override.h` — alle Features/Treiber (#define / #undef) + die `_tas`/`_tc`-Variantenlogik
 - TasmotaProjekt/`platformio_tasmota_cenv.ini` — meine Build-Umgebungen (envs) mit `lib_ignore`, Partitionen, `-D`-Flags
-- TasmotaProjekt/`ccache_wrapper.py` — (optional) siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten
-- TasmotaProjekt/`boards/` — neue Board-Definitionen
-  Die ESP32-S3-Boards (`esp32s3-qio_qspi` usw.) liegen ebenfalls in gemus `boards/`-Ordner. Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
+- TasmotaProjekt/`safeboot_alias.py` — holt beim Kompilieren das offizielle Safeboot für die .factory Images (muss mit kopiert werden)
+- TasmotaProjekt/`ccache_wrapper.py` — siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten (muss mit kopiert werden, auch wenn ihr ccache nicht nutzt)
+- TasmotaProjekt/`boards/` — zusätzliche Board-Definition (`esp32c6cdc.json`). Alle anderen Boards bringt das offizielle Tasmota mit.
+  Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
 
 **B) Sourcen aus der [gemu2015 Repo](https://github.com/gemu2015/Sonoff-Tasmota/tree/universal)** (Scripter / SML / TinyC — im offiziellen Tasmota nicht oder nur älter enthalten)
 - TasmotaProjekt/tasmota/tasmota_xdrv_driver/...
@@ -142,12 +166,13 @@ Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (Tasmota 16.0.0) 
 - TasmotaProjekt/tasmota/...
 - TasmotaProjekt/lib/...
 
-**C) Meine eigenen Patches am offiziellen Tasmota-Code** (optional, rein kosmetisch)
+**C) Meine eigenen Patches am offiziellen Tasmota-Code**
 - TasmotaProjekt/tasmota/`tasmota.ino` — `image_name`-Buffer von 33 auf 64 Bytes erweitert, damit lange `CODE_IMAGE_STR` (z.B. `ESP32-C3 TC ottelo.jimdofree.com`) nicht abgeschnitten werden
-- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` — HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends`
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_01_9_webserver.ino` — HTTP-Footer auf zwei Zeilen aufgeteilt: Zeile 1 `Tasmota <version> <image_name>`, Zeile 2 `Tasmota developed by Theo Arends (Build <Datum>)`
+- TasmotaProjekt/tasmota/tasmota_xdrv_driver/`xdrv_82_esp32_ethernet.ino` — Fix für das Modul WT32-ETH01: Tasmota setzt dort einen falschen EthType, dadurch geht LAN nicht ([Issue 68](https://github.com/ottelo9/tasmota-sml-images/issues/68))
 
 **D) Zum Flashen / Ausliefern**
-- `tinyc/tinyc_ide.html.gz` — die TinyC-IDE, kommt **nicht** ins Projektverzeichnis, sondern via File Upload auf den ESP (Tools > Manage File System)
+- [`tinyc_ide.html.gz`](https://github.com/ottelo9/tasmota-sml-script/blob/main/tinyc/tinyc_ide.html.gz) (in meiner Script-Repo) — die TinyC-IDE, kommt **nicht** ins Projektverzeichnis, sondern via File Upload auf den ESP (Tools > Manage File System)
 - `make_tasmota_zips_extended.sh` — packt nach dem Build die Release-ZIPs, siehe [unten](#release-zips-erstellen-mit-make_tasmota_zips_extendedsh)
 
 > **Hinweis:** Welche gemu2015-Commit-Version ich zuletzt übernommen habe, steht in [`gemu2015 Repo Update.txt`](gemu2015%20Repo%20Update.txt).
@@ -159,6 +184,8 @@ Eine weitere ausführliche Anleitung zum Einrichten von Tasmota und weitere Deta
 Zum Kompilieren unter VSC den passenden Befehl in die Console eingeben: 
 
 Die Safeboot Images (kommen in die .factory Images, wie ein Bootloader) müssen nicht mehr selbst erstellt werden: Beim Kompilieren wird das offizielle Safeboot des Chips automatisch von ota.tasmota.com geladen (`safeboot_alias.py`).
+
+Bei den ESP32-Images mit Bluetooth-Funk (ESP32, C3, C6, S3, SOLO1) ist Bluetooth im SDK abgeschaltet (`[bt_off]` in `platformio_tasmota_cenv.ini`). Dafür baut PlatformIO das ESP-IDF selbst, der erste Build je Chip dauert deshalb ein paar Minuten länger.
 
 Die einzelnen Images werden so erstellt (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
 
@@ -287,19 +314,20 @@ Nach dem Bauen aller Envs liegen die Firmware-Dateien (`*.bin`, `*.factory.bin`,
 1. Script in das Firmware-Output-Verzeichnis kopieren:
    ```bash
    cp /pfad/zu/tasmota-sml-images/make_tasmota_zips_extended.sh \
-      ~/Tasmota-15.4.0/build_output/firmware/
+      ~/Tasmota-16.0.0/build_output/firmware/
    ```
 
 2. Ins Verzeichnis wechseln und ausführen:
    ```bash
-   cd ~/Tasmota-15.4.0/build_output/firmware
+   cd ~/Tasmota-16.0.0/build_output/firmware
    chmod +x make_tasmota_zips_extended.sh
    ./make_tasmota_zips_extended.sh
    ```
 
 3. Die ZIPs landen im Unterordner `tasmota_zips/`:
    - `tasmota8266_bundle_ottelo.zip` — alle ESP8266-Builds gebündelt + tasmota-minimal
-   - `tasmota32<board>_ottelo_tas.zip` / `_tc.zip` — pro ESP32-Plattform jeweils zwei ZIPs (Scripter / TinyC), insgesamt 14 Stück
+   - `tasmota32<board>_ottelo_tas.zip` / `_tc.zip` — pro ESP32-Plattform jeweils zwei ZIPs (Scripter / TinyC), P4 Rev.3 nur TinyC, insgesamt 15 Stück
+   - `tasmota32s3_dfr1154.zip` — das Kamera-Image (DFR1154)
 
 **Verhalten bei fehlenden Builds:** Wenn eine erwartete Datei fehlt (z.B. C6 oder P4 nicht gebaut), meldet das Script `FEHLER: Datei fehlt: …` und überspringt nur dieses eine ZIP — die anderen werden weiterhin erstellt.
 
@@ -330,7 +358,7 @@ da wie bereits oben erwähnt, ESP32 Standard Features wie Berry usw verwendet we
 Siehe auch https://tasmota.github.io/docs/Compile-your-build/#customize-your-build  
 
 Noch eine Info:  
-Immer die neuste Tasmota Platform Framework builds verwenden. D.h. in der platformio_tasmota32.ini bei [core32] platform url aktualisieren  
+Die Platform (ESP32-Framework) kommt aus dem offiziellen Tasmota (`platformio_tasmota32.ini`), dort muss nichts angepasst werden.  
 
 [Offizielle Tasmota Github Seite](https://github.com/arendst/Tasmota)  
 
@@ -500,4 +528,4 @@ Und natürlich beim restlichen [Tasmota Entwickler-Team](https://tasmota.github.
 
 Die Images sind Builds von Tasmota und stehen damit unter der [GPL-3.0](LICENSE).
 
-Der zugehörige Quelltext ist der Zweig `universal` von [gemu2015/Sonoff-Tasmota](https://github.com/gemu2015/Sonoff-Tasmota); den genauen Commit, aus dem die hier abgelegten Images gebaut wurden, nennt `gemu2015 Repo Update.txt`. Die Overlay-Dateien dieser Repo liegen daneben.
+Der zugehörige Quelltext ist das offizielle [Tasmota](https://github.com/arendst/Tasmota) 16.0.0 plus die Overlay-Dateien dieser Repo. Die meisten Overlays stammen aus dem Zweig `universal` von [gemu2015/Sonoff-Tasmota](https://github.com/gemu2015/Sonoff-Tasmota); den genauen Commit nennt `gemu2015 Repo Update.txt`.
