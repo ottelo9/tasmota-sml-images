@@ -150,7 +150,7 @@ const char HTTP_SCRIPT_TEMPLATE2[] PROGMEM =
     "}";
 #endif  // ESP8266
 #ifdef ESP32
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
 const char HTTP_SCRIPT_TEMPLATE2[] PROGMEM =
     "for(i=0;i<" STR(MAX_USER_PINS) ";i++){"
       "sk(g[i],i);"                       // Set GPIO
@@ -221,6 +221,7 @@ const char HTTP_SCRIPT_INFO_END[] PROGMEM =
   #include "./html_compressed/HTTP_HEAD_STYLE2.h"
   #include "./html_compressed/HTTP_HEAD_STYLE3.h"
   #include "./html_compressed/HTTP_HEAD_STYLE_WIFI.h"
+  #include "./html_compressed/HTTP_HEAD_STYLE_TOOLTIP.h"
 #else
   #include "./html_uncompressed/HTTP_HEAD_LAST_SCRIPT.h"
   #include "./html_uncompressed/HTTP_HEAD_LAST_SCRIPT32.h"
@@ -229,9 +230,10 @@ const char HTTP_SCRIPT_INFO_END[] PROGMEM =
   #include "./html_uncompressed/HTTP_HEAD_STYLE2.h"
   #include "./html_uncompressed/HTTP_HEAD_STYLE3.h"
   #include "./html_uncompressed/HTTP_HEAD_STYLE_WIFI.h"
+  #include "./html_uncompressed/HTTP_HEAD_STYLE_TOOLTIP.h"
 #endif
 
-#if defined(USE_ZIGBEE) || defined(USE_LORAWAN_BRIDGE)
+#if defined(USE_ZIGBEE) || defined(USE_LORAWAN_BRIDGE) || defined(USE_MI_ESP32)
 // Styles used for Zigbee and LoRaWan Web UI
 // Battery icon from https://css.gg/battery
 //
@@ -471,7 +473,7 @@ const char kContentTypes[] PROGMEM = "text/html|text/plain|text/xml|text/event-s
 const char kLoggingOptions[] PROGMEM = D_SERIAL_LOG_LEVEL "|" D_WEB_LOG_LEVEL "|" D_MQTT_LOG_LEVEL "|" D_SYS_LOG_LEVEL;
 const char kLoggingLevels[] PROGMEM = D_NONE "|" D_ERROR "|" D_INFO "|" D_DEBUG "|" D_MORE_DEBUG;
 
-const char kEmulationOptions[] PROGMEM = D_NONE "|" D_BELKIN_WEMO "|" D_HUE_BRIDGE;
+const char kEmulationOptions[] PROGMEM = D_NONE "|" D_BELKIN_WEMO "|" D_HUE_BRIDGE "|" D_SHELLY;
 
 const char kUploadErrors[] PROGMEM =
 //  D_UPLOAD_ERR_1 "|" D_UPLOAD_ERR_2 "|" D_UPLOAD_ERR_3 "|" D_UPLOAD_ERR_4 "|" D_UPLOAD_ERR_5 "|" D_UPLOAD_ERR_6 "|" D_UPLOAD_ERR_7 "|" D_UPLOAD_ERR_8 "|" D_UPLOAD_ERR_9;
@@ -1036,9 +1038,11 @@ void WSContentSend_PD(const char* formatP, ...) {  // Content send snprintf_P ch
 
 /*-------------------------------------------------------------------------------------------*/
 
-void WSContentStart_P(const char* title, bool auth) {
+bool WSContentStart_P(const char* title, bool auth = true);
+bool WSContentStart_P(const char* title, bool auth) {
   if (auth && !WebAuthenticate()) {
-    return Webserver->requestAuthentication();
+    Webserver->requestAuthentication();
+    return false;
   }
 
   WSContentBegin(200, CT_HTML);
@@ -1049,12 +1053,7 @@ void WSContentStart_P(const char* title, bool auth) {
       SettingsTextEscaped(SET_DEVICENAME).c_str(), 
       title);
   }
-}
-
-/*-------------------------------------------------------------------------------------------*/
-
-void WSContentStart_P(const char* title) {
-  WSContentStart_P(title, true);
+  return true;
 }
 
 /*-------------------------------------------------------------------------------------------*/
@@ -1098,12 +1097,20 @@ void WSContentSendStyle_P(const char* formatP, ...) {
   WSContentSendRaw_P(HTTP_HEAD_STYLE1);
   WSContentSendRaw_P(HTTP_HEAD_STYLE2);
 
+#if defined(ESP32) || defined(USE_WEB_STATUS_LINE_WIFI)
+  WSContentSendRaw_P(HTTP_HEAD_STYLE_TOOLTIP);
+#endif
+
 #ifdef USE_WEB_STATUS_LINE_WIFI
   WSContentSendRaw_P(HTTP_HEAD_STYLE_WIFI);
 #endif
-#if defined(USE_ZIGBEE) || defined(USE_LORAWAN_BRIDGE)
+#if defined(USE_ZIGBEE) || defined(USE_LORAWAN_BRIDGE) || defined(USE_MI_ESP32)
   WSContentSendRaw_P(HTTP_HEAD_STYLE_ZIGBEE);
 #endif // USE_ZIGBEE
+#if defined(USE_ZIGBEE) || defined(USE_MI_ESP32) || defined(USE_EQ3_ESP32)
+  WSContentSendRaw_P(HTTP_HEAD_STYLE_SSI);
+#endif
+
   if (formatP != nullptr) {
     // This uses char strings. Be aware of sending %% if % is needed
     va_list arg;
@@ -1331,7 +1338,9 @@ void WebRestart(uint32_t type) {
 
   bool reset_only = (HTTP_MANAGER_RESET_ONLY == Web.state);
 
-  WSContentStart_P((type) ? PSTR(D_SAVE_CONFIGURATION) : PSTR(D_RESTART), !reset_only);
+  if (!WSContentStart_P((type) ? PSTR(D_SAVE_CONFIGURATION) : PSTR(D_RESTART), !reset_only)) {
+    return;  // Not authorized
+  }
 #if ((RESTART_AFTER_INITIAL_WIFI_CONFIG) && (AFTER_INITIAL_WIFI_CONFIG_GO_TO_NEW_IP))
   // In case of type 3 (New network has been configured) go to the new device's IP in the new Network
   if (3 == type) {
@@ -1584,11 +1593,12 @@ void HandleRoot(void) {
         uint32_t button_ptr = 0;
         for (uint32_t button_idx = 1; button_idx <= TasmotaGlobal.devices_present; button_idx++) {
           if (bitRead(Web.light_shutter_button_mask, button_idx -1)) { continue; }  // Skip non-sequential light and/or shutter button
-          bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
+          const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
+          bool has_web_button = (web_button[0] != '\0');
           snprintf_P(stemp, sizeof(stemp), PSTR(" %d"), button_idx);
           WSContentSend_P(HTTP_DEVICE_CONTROL, 100 / cols, button_idx, button_idx,
-            (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : (cols < 5) ? PSTR(D_BUTTON_TOGGLE) : "",
-            (set_button) ? "" : (TasmotaGlobal.devices_present > 1) ? stemp : "");
+            (has_web_button) ? HtmlEscape(web_button).c_str() : (cols < 5) ? PSTR(D_BUTTON_TOGGLE) : "",
+            (has_web_button) ? "" : (TasmotaGlobal.devices_present > 1) ? stemp : "");
           button_ptr++;
           if (0 == button_ptr % cols) { WSContentSend_P(PSTR("</tr><tr>")); }
         }
@@ -1619,12 +1629,13 @@ void HandleRoot(void) {
           if (1 == j) { break; }           // Both buttons shown
 
           shutter_button_idx--;            // Right button is previous button (up)
-          bool set_button = ((shutter_button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(shutter_button_idx -1)));
+          const char* web_button = (shutter_button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(shutter_button_idx -1) : "";
+          bool has_web_button = (web_button[0] != '\0');
           snprintf_P(stemp, sizeof(stemp), PSTR("Shutter %d"), shutter_idx +1);
           uint32_t shutter_real_to_percent_position = ShutterRealToPercentPosition(-9999, shutter_idx);
           Web.shutter_slider[shutter_idx] = (shutter_options & 1) ? (100 - shutter_real_to_percent_position) : shutter_real_to_percent_position;
           WSContentSend_P(HTTP_MSG_SLIDER_SHUTTER, 
-            (set_button) ? HtmlEscape(GetWebButton(shutter_button_idx -1)).c_str() : stemp,
+            (has_web_button) ? HtmlEscape(web_button).c_str() : stemp,
             shutter_idx +1,
             Web.shutter_slider[shutter_idx],
             shutter_idx +1);
@@ -1686,18 +1697,18 @@ void HandleRoot(void) {
             Web.slider[2],
             'n', 0);         // n0 - Value id
           WSContentSend_P(PSTR("</tr>"));
-        }
+        } 
 
-        bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
-        char first[2];
-        snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
-        char butt_txt[4];
-        snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"), (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
+        const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
+        bool has_web_button = (web_button[0] != '\0');
+        // web_button non-empty: truncate to max 4 chars or "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
+        // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
+        String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
         char number[8];
         WSContentSend_P(PSTR("<tr>"));
         WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-          butt_txt,
-          (set_button) ? "" : itoa(button_idx, number, 10));
+          butt_text.c_str(),
+          (has_web_button) ? "" : itoa(button_idx, number, 10));
         button_idx++;
 
         Web.slider[3] = Settings->light_dimmer;
@@ -1720,15 +1731,15 @@ void HandleRoot(void) {
           WSContentSend_P(PSTR("<tr>"));
 
           if (button_idx < (light_device + light_devices)) {
-            bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
-            char first[2];
-            snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
-            char butt_txt[4];
-            snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"), (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
+            const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
+            bool has_web_button = (web_button[0] != '\0');
+            // web_button non-empty: truncate to max 4 chars or max "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
+            // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
+            String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
             char number[8];
             WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-              butt_txt,
-              (set_button) ? "" : itoa(button_idx, number, 10));
+              butt_text.c_str(),
+              (has_web_button) ? "" : itoa(button_idx, number, 10));
             button_idx++;
             width = 85;
           }
@@ -1747,17 +1758,16 @@ void HandleRoot(void) {
       } else {  // Settings->flag3.pwm_multi_channels - SetOption68 1 - Enable multi-channels PWM instead of Color PWM
         stemp[0] = 'e'; stemp[1] = '0'; stemp[2] = '\0';  // e0
         for (uint32_t i = 0; i < light_devices; i++) {
-          bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
-          char first[2];
-          snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
-          char butt_txt[4];
-          snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"),
-            (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
+          const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
+          bool has_web_button = (web_button[0] != '\0');
+          // web_button non-empty: truncate to max 4 chars or "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
+          // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
+          String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
           char number[8];
           WSContentSend_P(PSTR("<tr>"));
           WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-            butt_txt,
-            (set_button) ? "" : itoa(button_idx, number, 10));
+            butt_text.c_str(),
+            (has_web_button) ? "" : itoa(button_idx, number, 10));
           button_idx++;
 
           stemp[1]++;        // e1 to e5 - Make unique ids
@@ -2080,9 +2090,10 @@ bool HandleRootStatusRefresh(void) {
 #ifdef USE_WEB_STATUS_LINE_WIFI
   if (Settings->flag4.network_wifi) {
     int32_t rssi = WiFi.RSSI();
-    WSContentSend_P(PSTR("<div class='wifi' title='%s: " D_RSSI " %d%% (%d dBm)'><div class='arc a3%s'></div><div class='arc a2%s'></div><div class='arc a1%s'></div><div class='arc a0'></div></div>"),
-                          SettingsTextEscaped(SET_STASSID1 + Settings->sta_active).c_str(),                      
+    WSContentSend_P(PSTR("<div class='wifi' title='" D_SSID ": %s\n" D_RSSI ": %d%% (%d dBm)\n" D_AP ": %s'><div class='arc a3%s'></div><div class='arc a2%s'></div><div class='arc a1%s'></div><div class='arc a0'></div></div>"),
+                          SettingsTextEscaped(SET_STASSID1 + Settings->sta_active).c_str(),
                           WifiGetRssiAsQuality(rssi), rssi,
+                          WiFi.BSSIDstr().c_str(),
                           rssi < -55 ? " o30" : "",
                           rssi < -70 ? " o30" : "",
                           rssi < -85 ? " o30" : "");
@@ -2296,14 +2307,14 @@ void HandleTemplateConfiguration(void) {
     WSContentBegin(200, CT_PLAIN);
     WSContentSend_P(PSTR("%s}1"), AnyModuleName(module).c_str());  // NAME: Generic
     for (uint32_t i = 0; i < nitems(template_gp.io); i++) {        // 17,148,29,149,7,255,255,255,138,255,139,255,255
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C6
-      // ESP32C2/C3/C6 we always send all GPIOs, Flash are just hidden
+#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+      // ESP32C2/C3/C5/C6/C61 we always send all GPIOs, Flash are just hidden
       WSContentSend_P(PSTR("%s%d"), (i>0)?",":"", template_gp.io[i]);
 #else
       if (!FlashPin(i)) {
         WSContentSend_P(PSTR("%s%d"), (i>0)?",":"", template_gp.io[i]);
       }
-#endif  // CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+#endif  // CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     }
     WSContentSend_P(PSTR("}1%d}1%d"), flag, Settings->user_template_base);  // FLAG: 1  BASE: 17
     WSContentEnd();
@@ -2345,8 +2356,8 @@ void HandleTemplateConfiguration(void) {
                        "<hr>"));
   WSContentSend_P(HTTP_TABLE100);  // "<table style='width:100%%'>"
   for (uint32_t i = 0; i < MAX_GPIO_PIN; i++) {
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
-    // ESP32C2/C3/C6 all gpios are in the template, flash are hidden
+#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+    // ESP32C2/C3/C5/C6/C61 all gpios are in the template, flash are hidden
     bool hidden = FlashPin(i);
     WSContentSend_P(PSTR("<tr%s><td><b><font color='#%06x'>" D_GPIO "%d</font></b></td><td%s><select id='g%d' onchange='ot(%d,this.value)'></select></td>"),
       hidden ? PSTR(" hidden") : "",
@@ -2358,7 +2369,7 @@ void HandleTemplateConfiguration(void) {
         RedPin(i) ? WebColor(COL_TEXT_WARNING) : WebColor(COL_TEXT), i, (0==i) ? PSTR(" style='width:146px'") : "", i, i);
       WSContentSend_P(PSTR("<td style='width:54px'><select id='h%d'></select></td></tr>"), i);
     }
-#endif  // CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+#endif  // CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
   }
   WSContentSend_P(PSTR("</table>"));
 
@@ -2429,7 +2440,7 @@ void TemplateSaveSettings(void) {
     j++;
 #endif  // ESP8266
 #ifdef ESP32
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
     snprintf_P(command, sizeof(command), PSTR("%s%s%d"), command, (i>0)?",":"", WebGetGpioArg(i));
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
     if (22 == i) { j = 33; }    // skip 22-32
@@ -2708,10 +2719,10 @@ void HandleWifiConfiguration(void) {
                   uint8_t rssi_as_quality = WifiGetRssiAsQuality(rssi);
                   uint8_t num_bars = changeUIntScale(rssi_as_quality, 0, 100, 0, 4);
 
-                  WSContentSend_P(PSTR("<div title='%d%% (%d dBm)'>"), rssi_as_quality, rssi);
+                  WSContentSend_P(PSTR("<div>"));
                   if (limitScannedNetworks) {
                     // Print SSID and item
-                    WSContentSend_P(PSTR("<a href='#p' onclick='c(this)'>%s</a><span class='q'><div class='si'>"), HtmlEscape(ssid_copy).c_str());
+                    WSContentSend_P(PSTR("<a href='#p' onclick='c(this)'>%s</a><span title='%d%% (%d dBm)' class='q'><div class='si'>"), HtmlEscape(ssid_copy).c_str(), rssi_as_quality, rssi);
                     ssid_showed++;
                     skipduplicated = true; // For the simplified page, just show 1 SSID if there are many Networks with the same
 #ifdef USE_HIGHLIGHT_CONNECTED_AP
@@ -2719,8 +2730,9 @@ void HandleWifiConfiguration(void) {
 #endif
                   } else {
                     // Print item
-                    WSContentSend_P(PSTR("%s<span class='q'>(%d) <div class='si'>"),
+                    WSContentSend_P(PSTR("%s<span title='%d%% (%d dBm)' class='q'>(%d) <div class='si'>"),
                       WiFi.BSSIDstr(indices[j]).c_str(),
+                      rssi_as_quality, rssi,
                       WiFi.channel(indices[j]));
 #ifdef USE_HIGHLIGHT_CONNECTED_AP
                     HighlightAP = WiFi.BSSIDstr(indices[j]) == WiFi.BSSIDstr();
@@ -2976,7 +2988,7 @@ void HandleOtherConfiguration(void) {
   }
 
 #ifdef USE_EMULATION
-#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE)
+#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE) || defined(USE_EMULATION_SHELLY)
   WSContentSend_P(PSTR("<p></p>"));  // Keep close to Friendlynames so do not use <br>
   WSContentSend_P(HTTP_FIELDSET_LEGEND, PSTR(D_EMULATION));
   WSContentSend_P(PSTR("<p>"));      // Keep close to Friendlynames so do not use <br>
@@ -2987,16 +2999,19 @@ void HandleOtherConfiguration(void) {
 #ifndef USE_EMULATION_HUE
     if (i == EMUL_HUE) { i++; }
 #endif
+#ifndef USE_EMULATION_SHELLY
+    if (i == EMUL_SHELLY) { i++; }
+#endif
     if (i < EMUL_MAX) {
       WSContentSend_P(PSTR("<label><input id='r%d' name='b2' type='radio' value='%d'%s><b>%s</b> %s</label><br>"),  // Different id only used for labels
         i, i,
         (i == Settings->flag2.emulation) ? PSTR(" checked") : "",
         GetTextIndexed(stemp, sizeof(stemp), i, kEmulationOptions),
-        (i == EMUL_NONE) ? "" : (i == EMUL_WEMO) ? PSTR(D_SINGLE_DEVICE) : PSTR(D_MULTI_DEVICE));
+        (i == EMUL_NONE) ? "" : (i == EMUL_HUE) ? PSTR(D_MULTI_DEVICE) : PSTR(D_SINGLE_DEVICE));
     }
   }
   WSContentSend_P(PSTR("</p></fieldset>"));
-#endif  // USE_EMULATION_WEMO || USE_EMULATION_HUE
+#endif  // USE_EMULATION_WEMO || USE_EMULATION_HUE || USE_EMULATION_SHELLY
 #endif  // USE_EMULATION
 
   WSContentSend_P(HTTP_FORM_END);
@@ -3032,9 +3047,9 @@ bool OtherSaveSettings(void) {
   }
 
 #ifdef USE_EMULATION
-#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE)
+#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE) || defined(USE_EMULATION_SHELLY)
   cmnd += AddWebCommand(PSTR(D_CMND_EMULATION), PSTR("b2"), PSTR("0"));
-#endif  // USE_EMULATION_WEMO || USE_EMULATION_HUE
+#endif  // USE_EMULATION_WEMO || USE_EMULATION_HUE || USE_EMULATION_SHELLY
 #endif  // USE_EMULATION
 
   if (tmpl.length() && (tmpl.length() < MQTT_MAX_PACKET_SIZE)) {
@@ -3184,12 +3199,12 @@ void HandleInformation(void) {
       SettingsTextEscaped(SET_FRIENDLYNAME1 +i).c_str());
   }
   WSContentSeparatorIFat();
-#ifdef CONFIG_ESP_WIFI_REMOTE_ENABLED
+#if defined(CONFIG_ESP_WIFI_REMOTE_ENABLED) && !defined(SOC_WIFI_SUPPORTED)
   WSContentSend_P(PSTR("}1" D_HOSTED_MCU "}2%s (%s)"), 
     GetHostedMCU().c_str(),
     GetHostedFwVersion(1).c_str());
   WSContentSeparatorIFat();
-#endif  // CONFIG_ESP_WIFI_REMOTE_ENABLED
+#endif  // CONFIG_ESP_WIFI_REMOTE_ENABLED && !SOC_WIFI_SUPPORTED
   bool show_hr = false;
   if ((WiFi.getMode() >= WIFI_AP) && (static_cast<uint32_t>(WiFi.softAPIP()) != 0)) {
     WSContentSend_P(PSTR("}1" D_MAC_ADDRESS "}2%s"), WiFi.softAPmacAddress().c_str());
@@ -3528,8 +3543,11 @@ void HandleUpgradeFirmwareStart(void) {
 void HandleUploadDone(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
+  uint32_t upload_file_type = Web.upload_file_type;
+  Web.upload_file_type = UPL_NONE;
+
 #if defined(USE_ZIGBEE_EZSP)
-  if ((UPL_EFR32 == Web.upload_file_type) && !Web.upload_error && BUpload.ready) {
+  if ((UPL_EFR32 == upload_file_type) && !Web.upload_error && BUpload.ready) {
     BUpload.ready = false;  //  Make sure not to follow thru again
     // GUI xmodem
     ZigbeeUploadStep1Done(FlashWriteStartSector(), BUpload.spi_hex_size);
@@ -3546,7 +3564,7 @@ void HandleUploadDone(void) {
   WSContentStart_P(PSTR(D_INFORMATION));
   if (!Web.upload_error) {
     WSContentSend_P(HTTP_SCRIPT_RELOAD_TIME, 
-      (UPL_TASMOTA == Web.upload_file_type) ? HTTP_OTA_RESTART_RECONNECT_TIME : HTTP_RESTART_RECONNECT_TIME);  // Refesh main web ui after OTA upgrade
+      (UPL_TASMOTA == upload_file_type) ? HTTP_OTA_RESTART_RECONNECT_TIME : HTTP_RESTART_RECONNECT_TIME);  // Refesh main web ui after OTA upgrade
   }
   WSContentSendStyle();
   WSContentSend_P(PSTR("<div style='text-align:center;'><b>" D_UPLOAD " <font color='#"));
@@ -3607,7 +3625,8 @@ void HandleUploadLoop(void) {
   static uint32_t upload_size;
   static bool upload_error_signalled;
 
-  if (HTTP_USER == Web.state) { return; }
+  if (!HttpCheckPriviledgedAccess(false)) { return; }
+  if (UPL_NONE == Web.upload_file_type) { return; }  // Invalid or no file type so bail out
 
   if (Web.upload_error) {
     if (!upload_error_signalled) {
@@ -4395,16 +4414,21 @@ void CmndWebTime(void) {
 /*-------------------------------------------------------------------------------------------*/
 
 void CmndEmulation(void) {
-#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE)
-#if defined(USE_EMULATION_WEMO) && defined(USE_EMULATION_HUE)
+#if defined(USE_EMULATION_WEMO) || defined(USE_EMULATION_HUE) || defined(USE_EMULATION_SHELLY)
+#if defined(USE_EMULATION_WEMO) && defined(USE_EMULATION_HUE) && defined(USE_EMULATION_SHELLY)
   if ((XdrvMailbox.payload >= EMUL_NONE) && (XdrvMailbox.payload < EMUL_MAX)) {
 #else
-#ifndef USE_EMULATION_WEMO
-  if ((EMUL_NONE == XdrvMailbox.payload) || (EMUL_HUE == XdrvMailbox.payload)) {
+  if ((EMUL_NONE == XdrvMailbox.payload)
+#ifdef USE_EMULATION_WEMO
+      || (EMUL_WEMO == XdrvMailbox.payload)
 #endif
-#ifndef USE_EMULATION_HUE
-  if ((EMUL_NONE == XdrvMailbox.payload) || (EMUL_WEMO == XdrvMailbox.payload)) {
+#ifdef USE_EMULATION_HUE
+      || (EMUL_HUE == XdrvMailbox.payload)
 #endif
+#ifdef USE_EMULATION_SHELLY
+      || (EMUL_SHELLY == XdrvMailbox.payload)
+#endif
+     ) {
 #endif
     Settings->flag2.emulation = XdrvMailbox.payload;
     TasmotaGlobal.restart_flag = 2;

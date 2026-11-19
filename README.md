@@ -126,12 +126,11 @@ In meinen Tasmota Images ist ein Partition-Manager eingebaut — du brauchst kei
 In der user_config_override.h findet ihr eine Liste mit Features/Treibern (#define bzw. #undef), die ich für meine ESP Tasmota Images/Firmware verwende und auf ottelo.jimdofree.com zum Download anbiete. Die hier hochgeladenen Dateien können euch dabei helfen, ein eigenes angepasstes Tasmota Image für euren ESP mit Gitpod (oder Visual Studio) zu erstellen, wenn ihr mit dem ESP ein Stromzähler über ein Lesekopf auslesen wollt (SML) oder eine smarte Steckdose mit Energiemessfunktion (SonOff, Gosund, Shelly) habt und ihr die Liniendiagramme (Google Chart Script) für den Verbrauch haben wollt. Das passende Script findet ihr in meinem anderen Repo https://github.com/ottelo9/tasmota-sml-script.  
 
 ### Wie verwenden?
-Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (z.B. Tasmota 15.5.0) von Visual Studio Code kopieren und überschreiben!! Basis ist der offizielle [Tasmota Source](https://github.com/arendst/Tasmota) in der jeweiligen Release-Version. (Liste kann unvollständig sein)
+Die Dateien aus meinem Repo in euer Tasmota Projektverzeichnis (Tasmota 16.0.0) von Visual Studio Code kopieren und überschreiben!! Basis ist der offizielle [Tasmota Source](https://github.com/arendst/Tasmota) in der jeweiligen Release-Version. (Liste kann unvollständig sein)
 
 **A) Meine Build-Konfiguration** (die braucht ihr immer)
 - TasmotaProjekt/`tasmota/user_config_override.h` — alle Features/Treiber (#define / #undef) + die `_tas`/`_tc`-Variantenlogik
 - TasmotaProjekt/`platformio_tasmota_cenv.ini` — meine Build-Umgebungen (envs) mit `lib_ignore`, Partitionen, `-D`-Flags
-- TasmotaProjekt/`platformio_tasmota32.ini` — **eigener Patch:** pinnt eine ältere ESP32-Platform-Version, siehe [Issue 52](https://github.com/ottelo9/tasmota-sml-images/issues/52) / [Issue 53](https://github.com/ottelo9/tasmota-sml-images/issues/53). Bei Problemen mit der neuesten Platform hier die Zeile `platform = ...` umschalten
 - TasmotaProjekt/`ccache_wrapper.py` — (optional) siehe [ccache](#compile-zeit-reduzieren-mit-ccache-optional-aber-sehr-empfohlen) weiter unten
 - TasmotaProjekt/`boards/` — neue Board-Definitionen
   Die ESP32-S3-Boards (`esp32s3-qio_qspi` usw.) liegen ebenfalls in gemus `boards/`-Ordner. Bei PSRAM-Problemen auf dem S3 auf `esp32s3-qio` umstellen, siehe [Issue 32](https://github.com/ottelo9/tasmota-sml-script/issues/32) (Kommentar dazu steht in `platformio_tasmota_cenv.ini`)
@@ -159,12 +158,9 @@ Eine weitere ausführliche Anleitung zum Einrichten von Tasmota und weitere Deta
 ### Kompilieren
 Zum Kompilieren unter VSC den passenden Befehl in die Console eingeben: 
 
-Für die ESP32 Images muss man als erstes die Safeboot Images erstellen (die werden dann in die .factory Images eingefügt, wie ein Bootloader) z.B. `pio run -e tasmota32-safeboot`.  
+Die Safeboot Images (kommen in die .factory Images, wie ein Bootloader) müssen nicht mehr selbst erstellt werden: Beim Kompilieren wird das offizielle Safeboot des Chips automatisch von ota.tasmota.com geladen (`safeboot_alias.py`).
 
-Um alle gleichzeitig zu erstellen:  
-`pio run -e tasmota32-safeboot -e tasmota32c3-safeboot -e tasmota32c6-safeboot -e tasmota32s2-safeboot -e tasmota32s3-safeboot -e tasmota32solo1-safeboot -e tasmota32p4-safeboot -e tasmota32p4r3-safeboot`
-
-Nun können die einzelnen Images erstellt werden (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
+Die einzelnen Images werden so erstellt (landen dann im Ordner build_output). Suffix `_tas` = Scripter, `_tc` = TinyC:  
 
 ESP32 (Scripter-Variante `_tas`):  
 `pio run -e tasmota32_ottelo_tas`        (Generic ESP32)  
@@ -477,19 +473,21 @@ Siehe `#undef FEATURE` in der Datei [user_config_override.h](user_config_overrid
 ## Safeboot aktualisieren (wird i.d.R. nicht benötigt)
 Safeboot ist die kleine Rettungs-Firmware, über die jedes OTA läuft. Sie muss praktisch nie erneuert werden — ein Grund wäre ein OTA, das mit `Upload Failed. Not enough space.` abbricht, obwohl genug Platz da ist oder wenn sie total veraltet ist.
 
-Die passende Datei liegt bereits in [`ota_firmware`](ota_firmware) neben den jeweiligem _tc Image.
+Es wird das offizielle Safeboot von Tasmota genommen (dasselbe steckt auch in meinen .factory Images). `Upgrade 2` lädt die Datei `<Name aus der OTA-Url>-safeboot.bin`, deshalb wird die OTA-Url dafür kurz auf das offizielle Image eures Chips gestellt.
 
-1. **Firmware Upgrade** öffnen und bei **Use web server** prüfen, ob die Url zu eurem Image passt. Für das Safeboot Update muss am Ende der URL _tc stehen und nicht _tas (ansonsten ändern). Nach erfolgreichem Update könnt ihr es wieder auf euer Image (_tc oder _tas) anpassen:
+1. **Firmware Upgrade** öffnen und unter **Use web server** eure aktuelle Url notieren (die braucht ihr in Schritt 3). Dann die offizielle Url eures Chips eintragen, z.B. für den ESP32-C3:
    ```
-   .../ota_firmware/ESP32/tasmota32c3_ottelo_tc.bin
+   http://ota.tasmota.com/tasmota32/release/tasmota32c3.bin
    ```
-   ⚠️ Den Knopf darunter **nicht** drücken, der macht das normale Firmware-Update. Ein Speichern Button gibt es nicht, beim Verlassen wird automatisch gespeichert.
+   Für andere Chips `tasmota32c3` ersetzen durch `tasmota32` (ESP32), `tasmota32s2`, `tasmota32s3`, `tasmota32c6`, `tasmota32solo1`, `tasmota32p4` oder `tasmota32p4r3`.  
+   ⚠️ Den Knopf darunter **nicht** drücken, der macht das normale Firmware-Update (und würde das offizielle Tasmota installieren). Ein Speichern Button gibt es nicht, beim Verlassen wird automatisch gespeichert.
 2. In der **Console** folgendes eingeben (startet Safeboot Update):
    ```
    Upgrade 2
    ```
+3. ⚠️ Danach unter **Firmware Upgrade → Use web server** wieder eure eigene Url aus Schritt 1 eintragen. Sonst holt das nächste normale Update das offizielle Tasmota statt meines Images.
 
-Das Gerät startet danach normal neu. Bricht der Download ab, passiert nichts Schlimmes — das Gerät bootet weiter wie bisher und `Upgrade 2` kann wiederholt werden.
+Das Gerät startet nach `Upgrade 2` normal neu. Bricht der Download ab, passiert nichts Schlimmes — das Gerät bootet weiter wie bisher und `Upgrade 2` kann wiederholt werden.
 
 Sollte ein Gerät doch mal in Safeboot hängenbleiben (reduzierte Oberfläche, kein SML), holt es `http://<ip>/u4?u4=ota` zurück.
 

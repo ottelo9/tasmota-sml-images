@@ -95,6 +95,12 @@ FS *ufsp;
 FS *ffsp;
 // Local pointer for file managment
 FS *dfsp;
+#ifdef USE_USB_HOST_MSC
+// USB flash drive (FAT) mounted as /usb by xdrv_99_usb_host; nullptr while none is mounted
+FS *usbfsp = nullptr;
+FS *usb2fsp = nullptr;   // second USB drive (card reader next to a stick), mount point /usb2
+#include "esp_vfs_fat.h"
+#endif  // USE_USB_HOST_MSC
 
 char ufs_path[UFS_FILENAME_SIZE];
 File ufs_upload_file;
@@ -273,6 +279,11 @@ void UfsCheckSDCardInit(void) {
       // AddLog(LOG_LEVEL_DEBUG, "UFS: trying SDIO 1-bit clk=%i cmd=%i d0=%i", sdio_clk, sdio_cmd, sdio_d0);
       SD_MMC.setPins(sdio_clk, sdio_cmd, sdio_d0);
     }
+#if defined(SOC_GP_LDO_SUPPORTED) && defined(SOC_SDMMC_IO_POWER_EXTERNAL)
+    if (!LdoEnabled(4)) {
+      SD_MMC.setPowerChannel(4);  // SD card IO power if not set by command Ldo4 (deprecated)
+    }
+#endif
     if (SD_MMC.begin("/sd", !bit_4_mode /*mode 1 bit*/, false /*format_if_failed*/)) {    // mount under "/sd" to be consistent with SD SPI
       ufsp = &SD_MMC;
 
@@ -292,6 +303,18 @@ void UfsCheckSDCardInit(void) {
 
 uint32_t UfsInfo(uint32_t sel, uint32_t type) {
   uint64_t result = 0;
+#ifdef USE_USB_HOST_MSC
+  if (2 == type) {                                          // 2 = USB flash drive
+    uint64_t total = 0, freeb = 0;
+    if (usbfsp && (ESP_OK == esp_vfs_fat_info("/usb", &total, &freeb))) { result = sel ? freeb : total; }
+    return result / 1024;
+  }
+  if (3 == type) {                                          // 3 = second USB drive (/usb2)
+    uint64_t total = 0, freeb = 0;
+    if (usb2fsp && (ESP_OK == esp_vfs_fat_info("/usb2", &total, &freeb))) { result = sel ? freeb : total; }
+    return result / 1024;
+  }
+#endif  // USE_USB_HOST_MSC
   FS *ifsp = ufsp;
   uint8_t itype = ufs_type;
   if (type) {
@@ -374,12 +397,17 @@ uint32_t UfsInfo(uint32_t sel, uint32_t type) {
   return result / 1024;
 }
 
+// which file system the file manager shows: 0 = the active one (SD), 1 = flash, 2 = USB flash drive
+uint32_t UfsDirInfoType(void) {
+  return (ufs_dir == 4) ? 3 : ((ufs_dir == 3) ? 2 : ((ufs_dir == 2) ? 1 : 0));
+}
+
 uint32_t UfsSize(void) {
-  return UfsInfo(0, ufs_dir == 2 ? 1:0);
+  return UfsInfo(0, UfsDirInfoType());
 }
 
 uint32_t UfsFree(void) {
-  return UfsInfo(1, ufs_dir == 2 ? 1:0);
+  return UfsInfo(1, UfsDirInfoType());
 }
 
 #if USE_LONG_FILE_NAMES>0
@@ -957,7 +985,7 @@ char* UfsFilename(char* fname, char* fname_in) {
 }
 
 const char kUFSCommands[] PROGMEM = "Ufs|"  // Prefix
-  "|Type|Size|Free|Delete|Rename|Run|List"
+  "|Type|Size|Free|Delete|Rename|Run|List|Mkdir"
 #ifdef UFILESYS_STATIC_SERVING
   "|Serve"
 #endif
@@ -967,7 +995,7 @@ const char kUFSCommands[] PROGMEM = "Ufs|"  // Prefix
   ;
 
 void (* const kUFSCommand[])(void) PROGMEM = {
-  &UFSInfo, &UFSType, &UFSSize, &UFSFree, &UFSDelete, &UFSRename, &UFSRun, &UFSList
+  &UFSInfo, &UFSType, &UFSSize, &UFSFree, &UFSDelete, &UFSRename, &UFSRun, &UFSList, &UFSMkdir
 #ifdef UFILESYS_STATIC_SERVING
   ,&UFSServe
 #endif
@@ -1040,10 +1068,56 @@ void UFSRename(void) {
       UfsFilename(fname_old, fname1);
       char fname_new[UFS_FILENAME_SIZE];
       UfsFilename(fname_new, fname2);
-      if (ffs_type && (ffs_type != ufs_type) && (2 == XdrvMailbox.index)) {
+      // Same prefixes as UfsMkdir (/ffs/, /sdfs/, /usb/): both names must carry the same one
+      FS *rfs = nullptr;
+      char *ro = fname_old, *rn = fname_new;
+      if (!strncmp_P(ro, PSTR("/ffs/"), 5) && !strncmp_P(rn, PSTR("/ffs/"), 5))        { rfs = ffsp;  ro += 4; rn += 4; }
+      else if (!strncmp_P(ro, PSTR("/sdfs/"), 6) && !strncmp_P(rn, PSTR("/sdfs/"), 6)) { rfs = ufsp;  ro += 5; rn += 5; }
+#ifdef USE_USB_HOST_MSC
+      else if (!strncmp_P(ro, PSTR("/usb/"), 5) && !strncmp_P(rn, PSTR("/usb/"), 5))   { rfs = usbfsp; ro += 4; rn += 4; }
+      else if (!strncmp_P(ro, PSTR("/usb2/"), 6) && !strncmp_P(rn, PSTR("/usb2/"), 6)) { rfs = usb2fsp; ro += 5; rn += 5; }
+#endif  // USE_USB_HOST_MSC
+      if (rfs) {
+        result = rfs->rename(ro, rn);
+      } else if (ffs_type && (ffs_type != ufs_type) && (2 == XdrvMailbox.index)) {
         result = TfsRenameFile(fname_old, fname_new);
       } else {
         result = (ufs_type && ufsp->rename(fname_old, fname_new));
+      }
+    }
+    if (!result) {
+      ResponseCmndFailed();
+    } else {
+      ResponseCmndDone();
+    }
+  }
+}
+
+// UfsMkdir <path>   creates the folder and any missing parents. The path may start with /ffs/, /sdfs/ or
+// /usb/ (same prefixes as the TinyC file functions); without one the SD card (or flash) is used.
+void UFSMkdir(void) {
+  if (XdrvMailbox.data_len > 0) {
+    char path[UFS_FILENAME_SIZE];
+    UfsFilename(path, XdrvMailbox.data);
+    FS *fsp = ufsp;
+    char *p = path;
+    if (!strncmp_P(p, PSTR("/ffs/"), 5))       { fsp = ffsp;  p += 4; }
+    else if (!strncmp_P(p, PSTR("/sdfs/"), 6)) { fsp = ufsp;  p += 5; }
+#ifdef USE_USB_HOST_MSC
+    else if (!strncmp_P(p, PSTR("/usb/"), 5))  { fsp = usbfsp; p += 4; }
+    else if (!strncmp_P(p, PSTR("/usb2/"), 6)) { fsp = usb2fsp; p += 5; }
+#endif  // USE_USB_HOST_MSC
+    bool result = false;
+    if (fsp) {
+      result = true;
+      for (char *c = p + 1; ; c++) {              // every prefix of the path, ending with the whole of it
+        if ('/' == *c || 0 == *c) {
+          char keep = *c;
+          *c = 0;
+          if (!fsp->exists(p) && !fsp->mkdir(p)) { result = false; }
+          *c = keep;
+          if (!keep) { break; }
+        }
       }
     }
     if (!result) {
@@ -1482,8 +1556,19 @@ void UfsDirectory(void) {
     ufs_dir = atoi(stmp.c_str());
   }
 
+#ifdef USE_USB_HOST_MSC
+  if (ufs_dir == 3 && !usbfsp) { ufs_dir = 2; }              // the stick was pulled
+  if (ufs_dir == 4 && !usb2fsp) { ufs_dir = 2; }
+#endif  // USE_USB_HOST_MSC
+
   if (ufs_dir == 1) {
     dfsp = ufsp;
+#ifdef USE_USB_HOST_MSC
+  } else if (ufs_dir == 3) {
+    dfsp = usbfsp;
+  } else if (ufs_dir == 4) {
+    dfsp = usb2fsp;
+#endif  // USE_USB_HOST_MSC
   } else {
     if (ffsp) {
       dfsp = ffsp;
@@ -1523,14 +1608,31 @@ void UfsDirectory(void) {
   WSContentSend_P(HTTP_FIELDSET_LEGEND, PSTR(D_MANAGE_FILE_SYSTEM));
 
   char ts[FLOATSZ];
-  dtostrfd((float)UfsInfo(0, ufs_dir == 2 ? 1:0) / 1000, 3, ts);
+  dtostrfd((float)UfsInfo(0, UfsDirInfoType()) / 1000, 3, ts);
   char fs[FLOATSZ];
-  dtostrfd((float)UfsInfo(1, ufs_dir == 2 ? 1:0) / 1000, 3, fs);
+  dtostrfd((float)UfsInfo(1, UfsDirInfoType()) / 1000, 3, fs);
   WSContentSend_PD(UFS_FORM_FILE_UPGc, WebColor(COL_TEXT), ts, fs);
 
-  if (ufs_dir) {
+  if (ufs_dir && (ufs_dir != 3) && (ufs_dir != 4)) {
     WSContentSend_P(UFS_FORM_FILE_UPGc1, (ufs_dir == 1)?2:1, (ufs_dir == 1)?PSTR("SDCard"):PSTR("FlashFS"));
   }
+#ifdef USE_USB_HOST_MSC
+  if (usbfsp || usb2fsp) {                                    // links between the file systems while a USB drive is mounted
+    if (ufs_dir >= 3) {
+      WSContentSend_P(UFS_FORM_FILE_UPGc1, 2, PSTR("FlashFS"));
+      if (ufsp != ffsp) { WSContentSend_P(UFS_FORM_FILE_UPGc1, 1, PSTR("SDCard")); }
+      if (usbfsp && usb2fsp) {
+        if (ufs_dir == 3) { WSContentSend_P(UFS_FORM_FILE_UPGc1, 4, PSTR("USB2")); WSContentSend_P(PSTR(" &nbsp;&nbsp;[USB]")); }
+        else              { WSContentSend_P(UFS_FORM_FILE_UPGc1, 3, PSTR("USB")); WSContentSend_P(PSTR(" &nbsp;&nbsp;[USB2]")); }
+      } else {
+        WSContentSend_P(PSTR(" &nbsp;&nbsp;[%s]"), (ufs_dir == 3) ? PSTR("USB") : PSTR("USB2"));
+      }
+    } else {
+      if (usbfsp)  { WSContentSend_P(UFS_FORM_FILE_UPGc1, 3, PSTR("USB")); }
+      if (usb2fsp) { WSContentSend_P(UFS_FORM_FILE_UPGc1, 4, PSTR("USB2")); }
+    }
+  }
+#endif  // USE_USB_HOST_MSC
   WSContentSend_P(UFS_FORM_FILE_UPGc2);
 
 #ifdef USE_TINYC
@@ -1628,14 +1730,14 @@ void UfsListDir(char *path, uint8_t depth) {
         for (uint8_t cnt = 0; cnt<depth; cnt++) {
           *cp++ = '-';
         }
+        snprintf(cp, sizeof(name) - (cp - name), format, ep);
 
         String pp_escaped_string = UrlEscape(pp);
         String ep_escaped_string = UrlEscape(ep);
         const char* ppe = pp_escaped_string.c_str();    // this can't be merged on a single line otherwise the String object can be freed
         const char* epe = ep_escaped_string.c_str();
-        sprintf(cp, format, ep);
 #ifdef GUI_TRASH_FILE
-        char delpath[128+UFS_FILENAME_SIZE];
+        char delpath[128+UFS_FILENAME_SIZE+(2*strlen(ppe))];
         ext_snprintf_P(delpath, sizeof(delpath), UFS_FORM_SDC_HREFdel, ppe, epe, ppe[0]?ppe:"/");
 #else
         char delpath[2] = " ";

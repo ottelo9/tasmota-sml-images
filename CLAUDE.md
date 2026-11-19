@@ -17,7 +17,7 @@ base.
 |---|---|
 | `tasmota/`, `lib/` | overlay files (`git ls-files` is the current list) |
 | `platformio_tasmota_cenv.ini` | envs per chip and variant |
-| `platformio_tasmota32.ini`, `boards/` | platform settings, extra boards |
+| `boards/`, `partitions/` | extra boards and partition tables (the platform comes from official Tasmota) |
 | `tasmota/user_config_override.h` | feature selection |
 | `make_tasmota_zips_extended.sh` | packs the release ZIPs |
 | `ota_firmware/` | binaries for OTA, tracked |
@@ -46,17 +46,16 @@ IDE. ESP8266 builds are `_tas` only.
 
    A wrong entry makes the next diff silently miss or repeat files.
 
-4. **Platform:** this repo builds with platform `2026.05.50` like gemu
-   (Arduino 3.3.8 / IDF 5.5.4). Going back to `2026.02.30` (IDF 5.3.4, the
-   fallback for the WT32-ETH01 reboots of issue #53) breaks the build of every
-   env with Ethernet: `ETH_CMD_S_ALL_MULTICAST` in `xdrv_124_tinyc_vm.h`
-   needs IDF 5.5 and would have to go behind an `ESP_IDF_VERSION` check.
-5. **No `custom_sdkconfig` for now:** it makes PlatformIO build the ESP-IDF
-   itself, and that fails on the owner's PlatformIO 6.2.0 with
-   `No module named 'SCons.Tool.FortranCommon'` (the same error the ESP8266
-   builds hit). `[bt_off]` in `platformio_tasmota_cenv.ini` (Bluetooth out of
-   the SDK, ~36 KB heap on a classic ESP32 per gemu) is prepared but not used
-   by any env until that build works.
+4. **Platform:** the one of official Tasmota 16.0.0 (`2026.09.50`), no own
+   `platformio_tasmota32.ini` any more. Anything older than IDF 5.5 breaks the
+   envs with Ethernet: `ETH_CMD_S_ALL_MULTICAST` in `xdrv_124_tinyc_vm.h`.
+5. **`[bt_off]`** (`custom_sdkconfig`, Bluetooth out of the SDK) in every env
+   with a BT radio: ESP32, C3, C6, S3, SOLO1 (`_tas`/`_tc`), DFR1154 and
+   Marsrelay (sets up the battery over WiFi, no BT). Not in S2/P4 (no BT).
+   PlatformIO then builds the
+   ESP-IDF itself - works since platform `2026.09.50` (the old
+   `SCons.Tool.FortranCommon` error is gone). Measured 19.11.2026: C3 no heap
+   gain (7 KB less flash), classic ESP32 about 4.5 KB more heap - not gemu's 36 KB.
 
 ## CT002 registration page (ESP8266, Scripter)
 
@@ -76,9 +75,8 @@ not copy gemu's `src/` or the other `test/` files on an adoption.
 
 ## Backports from official Tasmota (not from gemu)
 
-- `tasmota/tasmota_xdrv_driver/xdrv_82_esp32_ethernet.ino`: the 15.5.0 file
-  plus Tasmota PR #25051 (WT32-ETH01 init: `eth_type` read before the module
-  defaults were set, issue #25043), plus our own fix: the WT32-ETH01 branch
+- `tasmota/tasmota_xdrv_driver/xdrv_82_esp32_ethernet.ino`: the 16.0.0 file
+  (contains Tasmota PR #25051) plus our own fix: the WT32-ETH01 branch
   writes `Settings->eth_type = 0` instead of `ETH_PHY_LAN8720` — since IDF 5.4
   `ETH_PHY_GENERIC` comes first, so `ETH_PHY_LAN8720` is 1 = TLK110/IP101 in
   Tasmota's index (no Ethernet, `EthType` back to 1 on every boot, images
@@ -109,22 +107,44 @@ version (`// @version: YYYYMMDD_HHMM`, .tcb header TLV 3, `"version"` in
 index.json) and the 🔄 update button. tasmota-sml-script's build.html derives
 the version from `sml_vers`.
 
-## gemu's fork is on Tasmota 16, we are on 15.5.0
+## Tasmota 16.0.0 base
 
-Since `0fc40e045` (merge of arendst/development, 25.10.2026) the fork is a
-Tasmota 16 tree. Its TinyC files barely changed for that (only `TC_RELEASE`),
-so they still go into the 15.5.0 overlay as plain copies — last taken
-`d1aafa5b5` (13.11.2026, TinyC 1.6.80): `xdrv_124_tinyc_vm.h`,
-`xdrv_124_tinyc.ino`, `xdrv_124_tinyc_usb.h`, the new
-`xdrv_124_tinyc_espnow.h` and `xdrv_124_tinyc_pcnt.h` (both included
-unconditionally, their code behind `USE_TINYC_ESPNOW` / `USE_TINYC_PCNT`), `tls_mini` (the VM calls `setRSAOnly`,
-`setClientECCert`, `TlsPeerCertInfo`) and `xsns_53_sml.ino`. Not taken:
-`xdrv_50_filesystem.ino` - the fork's copy carries Tasmota 16 changes. Only
-gemu's hunk of `b8ff22f4f` is in ours: `TinyCFsWritePause(ufs_fsz, dfsp == ffsp)`
-(the second argument is new; without it the link fails). On every further
-adoption check both directions: the functions the new TinyC files call that
-the old ones did not, and the TinyC functions whose parameters changed and
-that other overlay files call (`extern` declarations).
+The base is the official v16.0.0 release (a copy in `E:\Tasmota-16.0.0`, tag
+`v16.0.0` in the fork's `upstream` remote). gemu's fork sits on arendst
+`development` of 25.10.2026 (16.0.0.1, merge-base `63c38614e`), 37 commits
+after the release. For every overlay file: O = v16.0.0, U = that merge-base,
+G = gemu's HEAD.
+
+- O equal to U (most files): G as a plain copy.
+- O differs from U: 3-way merge, O plus gemu's own changes (G - U), via
+  `git merge-file`: `HttpClientLight.cpp/.h`, `tasmota_lv_conf.h`,
+  `support_wifi.ino`, `xdrv_01_9_webserver.ino`, `xdrv_54_lvgl.ino`. Two
+  conflicts were resolved for 16.0.0: `_tcpTimeout` stays `uint16_t` (the
+  `uint32_t` is a later upstream change), `start_lvgl()` stays `void`.
+- Dropped (16.0.0 already right, or gemu no longer changes them):
+  `xdrv_01_1_webserver_mail.ino`, `boards/esp32s2cdc.json`,
+  `platformio_tasmota32.ini` (16.0.0 brings platform `2026.09.50`).
+- gemu's merge of 25.10.2026 kept his older code in `xdrv_01_9_webserver.ino`
+  in three places; ours has upstream's again: `HandleRoot` buttons
+  (`Utf8Truncate`, #24482), `HandleUploadDone` (type reset) and the
+  `HandleUploadLoop` checks (`HttpCheckPriviledgedAccess(false)`, `UPL_NONE`;
+  2c2a28cae, f4aa8ed67). Re-check these on every adoption of that file.
+- Ours on top of O: `tasmota.ino` (`image_name[64]`), the footer in
+  `xdrv_01_9_webserver.ino` (`HTTP_END` with build date), and
+  `xdrv_82_esp32_ethernet.ino` (WT32-ETH01 `Settings->eth_type = 0`; 16.0.0
+  still writes `ETH_PHY_LAN8720`).
+
+- `safeboot_alias.py` (pre-script in `tasmota_ottelo_base`): `post_esp32.py`
+  wants `<variants_dir>/<env name>-safeboot.bin` for the `.factory.bin` and
+  since 16.0.0 refuses the failed download of that name; what it merges at
+  0x10000 is the board's `flash_extra_images` file (`tasmota32c6-safeboot.bin`).
+  The script downloads that **official** file once (variants dir =
+  `<project>/variants/tasmota` in 16.0.0) and copies it under the env name.
+  No own safeboot builds (they would overwrite it): the overlays are of no
+  use there, and with them the C6 safeboot did not fit its 832 KB.
+
+Checked: the overlay files use nothing that upstream added after 16.0.0
+(`support_heap_map.ino` etc.). Not checked by a build yet.
 
 ## ESP32-P4 Rev.3 (`tasmota32p4r3_ottelo_*`)
 

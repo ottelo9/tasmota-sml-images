@@ -139,36 +139,21 @@ ESP32_BOARDS=(
 # Boards, die es nur als _tc gibt (keine _tas-Umgebung in platformio_tasmota_cenv.ini)
 TC_ONLY=" tasmota32p4r3_ottelo "
 
-# safeboot: Tasmota baut eine pro Chip (tasmota32c3-safeboot.bin, ...). Sie wird
-# je Variante unter dem Namen des Images abgelegt, z.B.
-# tasmota32_ottelo_tc-safeboot.bin (für ota_firmware/, Safeboot-Update per URL),
-# kommt aber NICHT ins ZIP - die .factory.bin enthält sie schon.
+# Kein eigenes safeboot mehr: die .factory.bin enthält das offizielle
+# (safeboot_alias.py), ein Safeboot-Update geht über die offizielle Url (README).
 for board in "${ESP32_BOARDS[@]}"; do
-    sb_src="${board%_ottelo}-safeboot.bin"
     for variant in tas tc; do
         if [ "$variant" = tas ] && [[ "$TC_ONLY" == *" $board "* ]]; then continue; fi
         files=("${board}_${variant}.bin" "${board}_${variant}.factory.bin")
-        sb="${board}_${variant}-safeboot.bin"
-        if [ -f "$sb_src" ]; then
-            cp -f "$sb_src" "$sb"
-        else
-            echo "HINWEIS: $sb_src fehlt - kein $sb fuer ota_firmware/"
-        fi
         create_zip "${board}_${variant}.zip" "${files[@]}" || true
     done
 done
 
 # =============================================================================
-# DFR1154-Kamera (Env tasmota32s3_dfr1154) — eigenes ZIP, safeboot vom S3
-# (nur als Datei für ota_firmware/, nicht im ZIP).
+# DFR1154-Kamera (Env tasmota32s3_dfr1154) — eigenes ZIP.
 # Ihre OTA_URL zeigt auf ota_firmware/ESP32/tasmota32s3_dfr1154.bin.
 # =============================================================================
 files=("tasmota32s3_dfr1154.bin" "tasmota32s3_dfr1154.factory.bin")
-if [ -f "tasmota32s3-safeboot.bin" ]; then
-    cp -f "tasmota32s3-safeboot.bin" "tasmota32s3_dfr1154-safeboot.bin"
-else
-    echo "HINWEIS: tasmota32s3-safeboot.bin fehlt - kein tasmota32s3_dfr1154-safeboot.bin"
-fi
 create_zip "tasmota32s3_dfr1154.zip" "${files[@]}" || true
 
 echo ""

@@ -139,7 +139,13 @@ const uint8_t eth_type_xtable[] = {
 char eth_hostname[sizeof(TasmotaGlobal.hostname)];
 uint8_t eth_config_change;
 
+// IDF < 6: esp_interface_t / IDF >= 6: wifi_interface_t (esp_interface_t removed)
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR < 6
 extern esp_netif_t* get_esp_interface_netif(esp_interface_t interface);
+#else
+extern esp_netif_t* get_esp_interface_netif(wifi_interface_t interface);
+#endif
 
 void EthernetEvent(arduino_event_t *event);
 void EthernetEvent(arduino_event_t *event) {
@@ -234,8 +240,6 @@ void EthernetInit(void) {
   }
 #endif  // CONFIG_ETH_USE_ESP32_EMAC
 
-  // Read eth_type only after the WT32-ETH01 defaults above are set
-  // (Tasmota PR #25051, 2026-09-22, backported to 15.5.0 by ottelo)
   int32_t eth_type = (Settings->eth_type < sizeof(eth_type_xtable)) ? eth_type_xtable[Settings->eth_type] : 0;    // make sure we don't overflow
   bool eth_uses_spi = (eth_type & ETH_USES_SPI);
   eth_type = eth_type & 0x7F;     // remove SPI flag
